@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$SourceCommit = "8d55683eeef80bc5e360d95abf4692454fafc615",
     [string]$ExpectedVersion = "0.0.11",
@@ -173,6 +173,18 @@ if ($UpdateBundleRs) {
         $mUpdated = [regex]::Replace($mUpdated, 'vendoring = "binary"', 'vendoring = "source-built"')
         $mUpdated | Set-Content -Encoding UTF8 $manifestPath
         Write-Host "Updated executable_sha256 and vendoring in $manifestPath" -ForegroundColor Green
+    }
+
+    $lockPath = Join-Path $RepoRoot "provenance\runtime-lock.json"
+    if (Test-Path $lockPath) {
+        $lockJson = Get-Content $lockPath -Raw | ConvertFrom-Json
+        foreach ($c in $lockJson.components) {
+            if ($c.name -eq "openai-tunnel-client") {
+                $c.sha256 = $newSha256
+            }
+        }
+        $lockJson | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $lockPath
+        Write-Host "Updated sha256 in $lockPath" -ForegroundColor Green
     }
 }
 
