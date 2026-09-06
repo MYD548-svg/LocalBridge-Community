@@ -1,0 +1,81 @@
+﻿name: LocalBridge Community Build
+
+on:
+  push:
+    branches: [ main, "release/*" ]
+    tags: [ "v*.*.*-community.*" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build and Verify on Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          targets: x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install NPM Dependencies
+        run: npm ci
+
+      - name: Build OpenAI Tunnel Client from Source
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts\build-tunnel-client.ps1 -UpdateBundleRs
+
+      - name: Verify Runtime Supply Chain
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts\verify-runtime.ps1
+
+      - name: Run Frontend Tests & Build
+        run: |
+          npm test
+          npm run build
+
+      - name: Run Rust Cargo Tests & Clippy
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+          cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+
+      - name: Build Privileged Broker and LocalBridge App
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bin localbridge-privileged-broker
+          cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bin localbridge
+
+      - name: Generate Checksums and Manifests
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts\generate-checksums.ps1
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: localbridge-community-artifacts
+          path: |
+            SHA256SUMS.txt
+            BUILD-PROVENANCE.json
+            TEST-REPORT.md
+            UPSTREAM-DIFF.md
+            COMMUNITY-VERSION
+            provenance/
+            src-tauri/target/release/localbridge.exe
+            src-tauri/target/release/localbridge-privileged-broker.exe
+            runtime/tunnel-client/tunnel-client.exe
