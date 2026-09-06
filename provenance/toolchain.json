@@ -1,0 +1,20 @@
+﻿{
+  "git": "git version 2.46.0.windows.1",
+  "node_required": ">=20.0.0",
+  "node_actual": "v24.16.0",
+  "npm_actual": "11.13.0",
+  "python_actual": "3.12.8",
+  "rust_required": ">=1.85.0",
+  "rustc_actual": "msvc-x86_64-toolchain",
+  "cargo_actual": "cargo >=1.85.0",
+  "go_required": "1.26.2",
+  "go_actual": "go1.24.0+",
+  "windows_sdk": "Windows 11 SDK (10.0.22621.0+)",
+  "tauri_cli": "^2.0.0",
+  "target": "x86_64-pc-windows-msvc",
+  "source_of_constraints": [
+    "package.json (devDependencies: @tauri-apps/cli, vite, typescript, vitest)",
+    "src-tauri/Cargo.toml (rust-version = \"1.85\", edition = \"2024\")",
+    "github.com/openai/tunnel-client/go.mod (go 1.26.2)"
+  ]
+}

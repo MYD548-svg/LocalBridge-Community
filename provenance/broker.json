@@ -1,0 +1,14 @@
+﻿{
+  "component": "localbridge-privileged-broker",
+  "source_commit": "c8118e73e96b05ef9090b260837a44788aeafaff",
+  "cargo_target": "localbridge-privileged-broker",
+  "manifest_path": "src-tauri/Cargo.toml",
+  "source_path": "src-tauri/bin/privileged-broker/main.rs",
+  "build_command": "cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bin localbridge-privileged-broker",
+  "staging_script": "scripts/prepare-lb018-resources.mjs",
+  "staging_destination": "src-tauri/target/release-stage/localbridge-privileged-broker.exe",
+  "artifact_path": "src-tauri/target/release/localbridge-privileged-broker.exe",
+  "elevation_model": "uac_on_explicit_user_action",
+  "network_listener": false,
+  "status": "configured"
+}
