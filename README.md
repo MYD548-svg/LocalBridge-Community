@@ -52,14 +52,10 @@ LocalBridge 提供编辑、完整和管理员三种权限模式。管理员操�
 
 ## 从源码构建
 
-仅开发者需要准备 Node.js 和 Rust：
+开发者需要 Git、Node.js 24、Rust 1.85.0、MSVC 构建工具及 Windows SDK；社区源码构建还需要 Go 1.26.2。完整流程见 [社区构建说明](docs/COMMUNITY-BUILD.md)：
 
 ```powershell
-npm ci
-node scripts/prepare-lb018-resources.mjs
-npm test
-npm run build
-cargo test --manifest-path src-tauri/Cargo.toml --locked -- --test-threads=1
+node scripts/test/ci-gate.mjs
 ```
 
 ---

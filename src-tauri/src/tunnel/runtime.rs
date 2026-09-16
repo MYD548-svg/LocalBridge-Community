@@ -79,6 +79,8 @@ pub struct PreparedTunnelStart {
     secret: SecretString,
     mcp_guard_bearer: Option<SecretString>,
     health_url_file: PathBuf,
+    #[cfg(test)]
+    isolate_probe_environment: bool,
 }
 
 impl fmt::Debug for PreparedTunnelStart {
@@ -119,6 +121,8 @@ impl PreparedTunnelStart {
             secret,
             mcp_guard_bearer: None,
             health_url_file,
+            #[cfg(test)]
+            isolate_probe_environment: false,
         })
     }
 
@@ -184,6 +188,22 @@ impl PreparedTunnelStart {
             );
         for key in REMOVED_PARENT_ENV {
             spec = spec.env_remove(key).map_err(classify_supervisor)?;
+        }
+        #[cfg(test)]
+        if self.isolate_probe_environment {
+            for key in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                spec = spec.env_remove(key).map_err(classify_supervisor)?;
+            }
+            spec = spec
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .map_err(classify_supervisor)?;
         }
         spec = spec
             .env(API_KEY_ENV, self.secret.expose_secret())
@@ -712,32 +732,119 @@ mod tests {
         }
     }
 
+    // Only redacted facts cross the probe channel, never raw requests or credentials.
+    #[derive(Debug)]
+    struct ProbeObservation {
+        method: String,
+        path: String,
+        has_authorization: bool,
+        matches_authorization: bool,
+        initialized: bool,
+    }
+
+    fn observe_probe_request(request: &str, initialized: bool) -> ProbeObservation {
+        let mut start = request
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace();
+        ProbeObservation {
+            method: start.next().unwrap_or_default().to_owned(),
+            path: start.next().unwrap_or_default().to_owned(),
+            has_authorization: request
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            matches_authorization: request_has_authorization(
+                request,
+                &format!("Bearer {SECRET_TWO}"),
+            ),
+            initialized,
+        }
+    }
+
+    #[test]
+    fn probe_observations_distinguish_routes_and_redact_authorization() {
+        for token in [None, Some("wrong"), Some(SECRET_TWO)] {
+            let header = token
+                .map(|value| format!("Authorization: Bearer {value}\r\n"))
+                .unwrap_or_default();
+            for path in ["/.well-known/oauth-protected-resource", "/mcp"] {
+                let observation =
+                    observe_probe_request(&format!("POST {path} HTTP/1.1\r\n{header}\r\n"), false);
+                assert_eq!(observation.path, path);
+                assert_eq!(observation.matches_authorization, token == Some(SECRET_TWO));
+                assert_eq!(observation.has_authorization, token.is_some());
+                assert!(!format!("{observation:?}").contains(SECRET_TWO));
+            }
+        }
+    }
+
     #[test]
     fn actual_tunnel_discovery_sends_the_authenticated_pep_header() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (request_tx, request_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
         let probe = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut bytes = Vec::new();
-                    let mut byte = [0_u8; 1];
-                    while bytes.len() < 32_768 && !bytes.ends_with(b"\r\n\r\n") {
-                        if stream.read(&mut byte).unwrap_or(0) == 0 {
-                            break;
-                        }
-                        bytes.push(byte[0]);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline && stop_rx.try_recv().is_err() {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                let mut bytes = Vec::new();
+                let mut byte = [0_u8; 1];
+                while bytes.len() < 32_768 && !bytes.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
                     }
-                    let _ = request_tx.send(String::from_utf8_lossy(&bytes).into_owned());
-                    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                    return;
+                    bytes.push(byte[0]);
                 }
-                thread::sleep(Duration::from_millis(10));
+                let headers = String::from_utf8_lossy(&bytes);
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if length > 65_536 {
+                    continue;
+                }
+                let mut body = vec![0; length];
+                if stream.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let message: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let initialize = message["method"] == "initialize";
+                let observation = observe_probe_request(&headers, initialize);
+                let (status, response) = if observation.path != "/mcp" {
+                    ("404 Not Found", String::new())
+                } else if !observation.matches_authorization {
+                    ("401 Unauthorized", String::new())
+                } else if initialize {
+                    (
+                        "200 OK",
+                        serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":{
+                            "protocolVersion":"2025-06-18", "capabilities":{"tools":{}},
+                            "serverInfo":{"name":"localbridge-ci-probe", "version":"1"}
+                        }})
+                        .to_string(),
+                    )
+                } else if message["method"] == "tools/list" {
+                    ("200 OK", serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":{"tools":[]}}).to_string())
+                } else {
+                    ("202 Accepted", String::new())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = request_tx.send(observation);
             }
         });
         let config = TunnelRuntimeConfig::new(
@@ -749,27 +856,87 @@ mod tests {
         .unwrap()
         .with_test_control_plane_base_url("http://127.0.0.1:9")
         .unwrap();
-        let health_dir = config.health_state_dir.clone();
-        let prepared = PreparedTunnelStart::prepare(config, &FakeStore::new([Some(SECRET_ONE)]))
-            .unwrap()
-            .with_mcp_guard_bearer(SecretString::new(SECRET_TWO).unwrap());
+        let prepared = PreparedTunnelStart::prepare(config, &FakeStore::new([Some(SECRET_ONE)]));
+        let mut observations = Vec::new();
+        let mut failure = None;
+        let mut initialized = false;
+        match prepared {
+            Ok(mut prepared) => {
+                prepared.mcp_guard_bearer = Some(SecretString::new(SECRET_TWO).unwrap());
+                prepared.isolate_probe_environment = true;
+                match prepared.spawn() {
+                    Ok(mut runtime) => {
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while Instant::now() < deadline {
+                            match request_rx.recv_timeout(Duration::from_millis(100)) {
+                                Ok(observation) => {
+                                    let bad = observation.path == "/mcp"
+                                        && !observation.matches_authorization;
+                                    initialized |= observation.path == "/mcp"
+                                        && observation.initialized
+                                        && observation.matches_authorization;
+                                    observations.push(observation);
+                                    if bad {
+                                        failure =
+                                            Some("MCP request authentication mismatch".to_string());
+                                        break;
+                                    }
+                                    if initialized
+                                        && observations
+                                            .iter()
+                                            .any(|item| item.path == "/mcp" && !item.initialized)
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            }
+                            match runtime.supervisor.root_is_running() {
+                                Ok(true) => {}
+                                state => {
+                                    failure = Some(format!(
+                                        "Tunnel exited before probe completed: {state:?}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        let process = runtime.supervisor.snapshot();
+                        eprintln!("Tunnel probe process: {process:?}");
+                        if let Err(error) = runtime.stop() {
+                            failure = Some(format!("Tunnel stop failed: {error:?}"));
+                        }
+                    }
+                    Err(error) => failure = Some(format!("Tunnel spawn failed: {error:?}")),
+                }
+            }
+            Err(error) => failure = Some(format!("Tunnel prepare failed: {error:?}")),
+        }
+        let _ = stop_tx.send(());
+        let joined = probe.join();
+        observations.extend(request_rx.try_iter());
+        assert!(joined.is_ok(), "probe server failed");
         assert!(
-            !prepared
-                .command_line_arguments()
-                .join(" ")
-                .contains(SECRET_TWO)
+            failure.is_none(),
+            "{failure:?}; observations={observations:?}"
         );
-        assert!(!format!("{prepared:?}").contains(SECRET_TWO));
-        let mut runtime = prepared.spawn().unwrap();
-        let received = request_rx.recv_timeout(Duration::from_secs(10));
-        runtime.stop().unwrap();
-        probe.join().unwrap();
-        fs::remove_dir_all(health_dir).unwrap();
-        let request = received.expect("real tunnel binary must probe its local MCP target");
-        let expected_value = format!("Bearer {SECRET_TWO}");
         assert!(
-            request_has_authorization(&request, &expected_value),
-            "real tunnel binary omitted the authenticated MCP header"
+            initialized,
+            "no authenticated MCP initialization before deadline; observations={observations:?}"
+        );
+        assert!(
+            observations
+                .iter()
+                .filter(|item| item.path == "/mcp")
+                .all(|item| item.matches_authorization),
+            "MCP authentication mismatch; observations={observations:?}"
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|item| item.path == "/mcp" && item.method == "POST"),
+            "no MCP POST observed"
         );
     }
 

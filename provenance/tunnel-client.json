@@ -1,12 +1,12 @@
-﻿{
+{
   "component": "openai-tunnel-client",
   "source": "https://github.com/openai/tunnel-client",
   "version": "0.0.11",
   "commit": "8d55683eeef80bc5e360d95abf4692454fafc615",
-  "compiler": "go1.26.2",
+  "compiler": null,
   "target": "windows-amd64",
   "cgo": false,
   "sha256": "7d3c7d492ce84b52835e11865a835a8a5bcd4a669dee84e169aa11b314dc952a",
-  "build_origin": "source",
-  "status": "baseline-registered"
+  "build_origin": "unverified-bundled-baseline",
+  "status": "registered-not-source-build-verified"
 }

@@ -1,82 +1,65 @@
 name: LocalBridge Community Build
-
 on:
   push:
-    branches: [ main, "release/*" ]
-    tags: [ "v*.*.*-community.*" ]
+    branches: [main, "release/*"]
+    tags: ["v*.*.*-community.*"]
   pull_request:
-    branches: [ main ]
-
+    branches: [main]
+permissions:
+  contents: read
 jobs:
+  upstream-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: openai/tunnel-client
+          ref: 8d55683eeef80bc5e360d95abf4692454fafc615
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify pinned source and run full upstream suite
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "8d55683eeef80bc5e360d95abf4692454fafc615"
+          go test -mod=readonly -timeout=15m ./...
   build:
     name: Build and Verify on Windows
+    needs: upstream-tests
     runs-on: windows-latest
+    env:
+      LOCALBRIDGE_BUILD_PROFILE: community
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.26.2'
           cache: false
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.85.0
         with:
-          toolchain: 1.85.0
           targets: x86_64-pc-windows-msvc
-          components: clippy, rustfmt
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: 'npm'
-
-      - name: Install NPM Dependencies
-        run: npm ci
-
-      - name: Build OpenAI Tunnel Client from Source
-        run: |
-          powershell -ExecutionPolicy Bypass -File scripts\build-tunnel-client.ps1 -UpdateBundleRs -SkipTests
-
-      - name: Verify Runtime Supply Chain
-        run: |
-          powershell -ExecutionPolicy Bypass -File scripts\verify-runtime.ps1
-
-      - name: Run Frontend Tests & Build
-        run: |
-          npm test
-          npm run build
-
-      - name: Run Rust Cargo Tests & Clippy
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml --locked
-          cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
-
-      - name: Build Privileged Broker and LocalBridge App
-        run: |
-          cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bin localbridge-privileged-broker
-          cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bin localbridge
-
-      - name: Generate Checksums and Manifests
-        run: |
-          powershell -ExecutionPolicy Bypass -File scripts\generate-checksums.ps1
-
-      - name: Upload Build Artifacts
+          node-version: 24
+          cache: npm
+      - name: Shared build and verification gate
+        run: node scripts/test/ci-gate.mjs
+      - name: Upload diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: localbridge-community-artifacts
-          path: |
-            SHA256SUMS.txt
-            BUILD-PROVENANCE.json
-            TEST-REPORT.md
-            UPSTREAM-DIFF.md
-            COMMUNITY-VERSION
-            provenance/
-            src-tauri/target/release/localbridge.exe
-            src-tauri/target/release/localbridge-privileged-broker.exe
-            runtime/tunnel-client/tunnel-client.exe
+          name: community-diagnostics
+          path: tests/artifacts/ci/
+          if-no-files-found: warn
+      - name: Upload verified installer
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: community-verified-installer
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error

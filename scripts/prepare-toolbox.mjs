@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { rejectExtras } from "./test/runtime-integrity.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const target = join(root, "src-tauri", "target");
@@ -55,22 +56,19 @@ const install = async (destination, expected, prepare) => {
   if (!(await valid(destination, expected))) throw new Error(`toolbox executable SHA256 mismatch: ${destination}`);
 };
 
-await rm(stage, { recursive: true, force: true });
+rejectExtras(stage, ["bin/aria2c.exe", "bin/7z.exe", "bin/jq.exe", "bin/curl.cmd"]);
+await mkdir(extract, { recursive: true });
 const bin = join(stage, "bin");
 await mkdir(bin, { recursive: true });
 await install(join(bin, "aria2c.exe"), tools.aria2c.executableSha256, async (destination) => {
   const archive = await download(tools.aria2c);
-  const out = join(extract, "aria2c");
-  await rm(out, { recursive: true, force: true });
-  await mkdir(out, { recursive: true });
+  const out = await mkdtemp(join(extract, "aria2c-"));
   run("tar.exe", ["-xf", archive, "-C", out]);
   await copyFile(join(out, "aria2-1.37.0-win-64bit-build1", "aria2c.exe"), destination);
 });
 await install(join(bin, "7z.exe"), tools.sevenZip.executableSha256, async (destination) => {
   const archive = await download(tools.sevenZip);
-  const out = join(extract, "7z");
-  await rm(out, { recursive: true, force: true });
-  await mkdir(out, { recursive: true });
+  const out = await mkdtemp(join(extract, "7z-"));
   run("tar.exe", ["-xf", archive, "-C", out, "x64/7za.exe"]);
   await copyFile(join(out, "x64", "7za.exe"), destination);
 });

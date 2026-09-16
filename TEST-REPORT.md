@@ -1,68 +1,43 @@
-﻿# LocalBridge Community Build v1 — Test & Gate Report
+# LocalBridge CI repair verification — 2026-09-16
 
-- **Community Version:** `0.1.5-community.1`
-- **Upstream Version:** `0.1.5`
-- **Upstream Commit:** `c8118e73e96b05ef9090b260837a44788aeafaff`
-- **OpenAI tunnel-client Version:** `0.0.11`
-- **OpenAI tunnel-client Commit:** `8d55683eeef80bc5e360d95abf4692454fafc615`
-- **Target Platform:** `x86_64-pc-windows-msvc` / Windows 11 x64
+## Status
 
----
+**LOCAL CHECKS PARTIALLY VERIFIED — NOT CI ACCEPTED / NOT RELEASE READY.**
 
-## 1. Gate Classification Summary
+Base commit: `012adf917b06b8a3866b0d77a564ae481c289b4f`. Repairs are uncommitted local changes. No remote Actions were triggered, no commits were pushed, and no Release was published.
 
-| Gate Category | Total Checks | PASS | FAIL | NOT RUN (Deferred) | Status |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **BUILD_GATE** | 8 | 6 | 0 | 2 (Rust/Go Host Env) | PASS (Pre-release) |
-| **SECURITY_GATE** | 6 | 6 | 0 | 0 | **PASS** |
-| **ENVIRONMENT_GATE** | 4 | 0 | 0 | 4 (OpenAI E2E, UAC) | **NOT RUN** (Pre-release) |
+The earlier report's "Pre-release Ready" and "no BUILD_GATE failed" conclusions are withdrawn. Historical Actions on 2026-09-06 failed: community run `34019155194` lacked toolbox/broker resources; ordinary CI run `34019155218` passed 403 Rust unit tests but failed its real-Tunnel authentication assertion. Earlier run `34017921799` failed upstream Go tests on Windows.
 
----
+## Executed local checks
 
-## 2. BUILD_GATE Status
+| Check | Actual result |
+| --- | --- |
+| Node regression / infrastructure / black-box client / preflight tests | PASS — 21 tests |
+| Existing frontend unit tests | PASS — 18 tests |
+| TypeScript and Vite production build | PASS |
+| Schema44 architecture residue scan | PASS |
+| PowerShell entrypoint syntax | PASS |
+| Changed Rust file formatting, rustfmt 1.85.0 | PASS — syntax/format only, not compilation |
+| Bundled runtime integrity | PASS — Python and Coding Runtime trees, Tunnel and metadata pins |
+| Toolbox preparation, repeated execution | PASS — pinned files reused without directory deletion |
+| Independent real-Tunnel MCP probe with dummy credentials | PASS — 10 sequential runs; MCP initialization and observed headers matched |
+| Complete runtime integrity without fresh broker evidence | Correctly FAILED — missing `broker-build.json`; no false PASS |
+| Shared gate toolchain preflight | FAILED — `spawnSync rustc ENOENT`; later stages recorded NOT_RUN |
 
-| Check Item | Target / Command | Status | Notes |
-| :--- | :--- | :--- | :--- |
-| Git Workspace Cleanliness | `git status --porcelain` | **PASS** | Controlled workspace state |
-| Toolchain Definition | `provenance/toolchain.json` | **PASS** | Toolchain requirements documented |
-| Runtime Supply Chain Integrity | `scripts/verify-runtime.ps1` | **PASS** | All bundled runtimes match `runtime-lock.json` |
-| Checksum Manifest Generation | `scripts/generate-checksums.ps1` | **PASS** | `SHA256SUMS.txt` verified |
-| Frontend Dependencies | `npm install / npm ci` | **PASS** | Packages installed |
-| Frontend Tests | `npm test` (vitest) | **PASS** | Model, UI, and Presentation tests |
-| Frontend Typecheck & Build | `npm run build` (tsc -b && vite build) | **PASS** | Distribution bundle built to `dist/` |
-| Native Tunnel Client Go Build | `scripts/build-tunnel-client.ps1` | **NOT RUN** | Go compiler deferred to CI / Go host environment |
-| Rust Core & Broker Build | `cargo build --release --locked` | **NOT RUN** | Rust MSVC toolchain deferred to CI / MSVC environment |
+Node regressions include exact source selection with stale sibling directories, rejection of mismatched/dirty checkouts, Tunnel-only hash changes, missing/empty/corrupt files, staged toolbox mapping, unexpected executables, broker bootstrap/rebuild/failure and stage fail-fast behavior. Test fixture files are retained for manual cleanup.
 
----
+The independent Node probe is diagnostic evidence for the bundled binary. It does **not** replace execution of the changed Rust authentication test, nor establish the cause of the historical CI failure. That test now captures multiple requests, distinguishes routes, completes MCP initialization and reports redacted facts. A new Guard regression checks missing/wrong/correct Bearer handling.
 
-## 3. SECURITY_GATE Status
+## Not executed
 
-| Check Item | Requirement | Status | Notes |
-| :--- | :--- | :--- | :--- |
-| Forbid Upstream Author Binary | No `*.upstream-localbridge.exe` or `cloudflared*` | **PASS** | Verified by `verify-runtime.ps1` |
-| Fail-Closed Integrity Check | `bundle.rs` SHA256 fail-closed verification | **PASS** | Retained with no bypass |
-| Sensitive Information Scan | No API keys, Bearer tokens, or private secrets in tree | **PASS** | Zero credentials leaked |
-| Non-Network Listener Verification | No public `0.0.0.0` listeners in Broker/Guard | **PASS** | Localhost only (`127.0.0.1`) |
-| Least Privilege Elevation | Normal execution does not bypass UAC | **PASS** | Explicit user action required |
-| Staging Tree Executable Audit | No unregistered `.exe` in `runtime/` staging | **PASS** | Whitelist scan clean |
+- Changed Rust tests, ten repetitions through the Rust harness, complete Rust suite and Clippy: a configured Rust/Cargo/MSVC build environment is unavailable locally. A downloaded standalone formatter was used only for formatting.
+- Source-built Tunnel and complete upstream Go suite: Go is unavailable locally; Linux suite is now a prerequisite of the community Windows workflow.
+- Fresh Broker build, final staged integrity success, NSIS build and final artifact checksums.
+- Repaired ordinary/community Actions on the same commit: not authorized to push or trigger.
+- Live ChatGPT connection, interactive UAC and clean Windows installation: outside this phase.
 
----
+## Acceptance and evidence
 
-## 4. ENVIRONMENT_GATE Status
+The sole gate is `node scripts/test/ci-gate.mjs`; community builds use `scripts/build-community.ps1`. Successful local partial stages must not be reported as a full gate PASS. Per-run reports live in `tests/artifacts/ci/`; successful full runs also produce current provenance and checksums. The root `SHA256SUMS.txt` records baseline repository inputs only and is not an installer checksum manifest.
 
-| Check Item | Requirement | Status | Reason Not Run |
-| :--- | :--- | :--- | :--- |
-| OpenAI Tunnel Client E2E | Connect to `api.openai.com` via tunnel-client | **NOT RUN** | Requires live OpenAI tunnel credentials & API key |
-| MCP Tools Discovery (`tools/list`) | Query MCP server through tunnel | **NOT RUN** | Requires live tunnel connection |
-| Privileged Broker UAC Dialog | Interactive Windows UAC prompt invocation | **NOT RUN** | Non-interactive execution context |
-| Clean VM Installation Audit | Install on bare Windows 11 sandbox | **NOT RUN** | Requires detached VM provisioning |
-
----
-
-## 5. Release Profile Evaluation
-
-According to Section 20 of the implementation specification:
-- **Status:** **Pre-release Ready**
-- All `SECURITY_GATE` checks have passed.
-- No `BUILD_GATE` has failed (deferred compiler gates will execute in GitHub Actions CI with full toolchains).
-- `ENVIRONMENT_GATE` items are documented with explicit deferral reasons.
+Both repaired workflows must pass for the same commit before CI acceptance. NSIS success establishes packaging only. See `docs/COMMUNITY-BUILD.md` for prerequisites, stage selection and failure handling.

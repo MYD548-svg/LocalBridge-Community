@@ -1,72 +1,43 @@
-﻿# LocalBridge Community Build Guide
+# Community build and CI
 
-## Overview
+## Requirements
 
-LocalBridge Community Build is an independent, auditable build of LocalBridge designed to eliminate unverified precompiled binaries while preserving 100% upstream functional and wire-protocol compatibility.
+Windows x64, Git on PATH, Node.js 24 (minimum 22), Rust **1.85.0** with rustfmt/clippy and the MSVC target, Visual C++ build tools and Windows SDK. Community builds additionally require Go **1.26.2**. No administrator shell is required for building.
 
-### Key Objectives
-1. **Source-Built OpenAI Tunnel Client:** Built directly from official OpenAI Go source (`github.com/openai/tunnel-client`).
-2. **Source-Built Privileged Broker:** Built directly from Rust source with explicit UAC elevation semantics.
-3. **Supply Chain Provenance:** Every runtime executable has a pinned SHA256, origin, and lock entry in `provenance/runtime-lock.json`.
-4. **Zero Ambiguous Binaries:** Complete rejection of unverified or unapproved third-party binary artifacts.
-
----
-
-## Prerequisites
-
-- **Operating System:** Windows 11 x64 (or Windows 10 21H2+)
-- **Node.js:** v20.x, v22.x, or v24.x (with npm)
-- **Rust Toolchain:** Rust 1.85+ with MSVC target (`x86_64-pc-windows-msvc`)
-- **Go Toolchain:** Go 1.24+ (target 1.26.2)
-- **Windows SDK:** Windows 10/11 SDK (for C++ build tools)
-
----
-
-## Quick Start: One-Click Community Build
-
-To run the complete automated build pipeline locally, open PowerShell as an administrator or developer console and run:
+The only ordered gate is `scripts/test/ci-gate.mjs`. Both Windows workflows and the local wrapper call it. Never duplicate individual gate commands in a workflow.
 
 ```powershell
+# Bundled Tunnel profile
+node scripts/test/ci-gate.mjs
+
+# Build pinned Tunnel source, then execute the same gate
 .\scripts\build-community.ps1
+
+# List stages or diagnose one stage (reported PARTIAL, not full PASS)
+node scripts/test/ci-gate.mjs --list
+node scripts/test/ci-gate.mjs --only bundled-integrity
 ```
 
-### Script Flags:
-- `-SkipTunnelBuild`: Skips compiling `tunnel-client.exe` if already built.
-- `-SkipRustBuild`: Skips Rust desktop app and broker compilation.
-- `-SkipFrontendBuild`: Skips React/Vite frontend compilation.
-- `-GoPath <dir>`: Adds a custom Go toolchain binary folder to PATH.
-- `-CargoPath <dir>`: Adds a custom Cargo/Rust binary folder to PATH.
+The wrapper accepts `-GoPath` and `-CargoPath`; skip-build switches were removed. Every required command must succeed. Resources are prepared before Cargo tests: pinned toolbox files first, then a broker bootstrap placeholder, release broker compilation, and replacement with the nonempty compiled binary. A failed broker attempt invalidates prior success evidence.
 
----
+## Source and runtime integrity
 
-## Step-by-Step Manual Build
+Tunnel uses the fixed commit in the manifest. Downloads use a unique Git checkout; `-WorkDir` must point to an exact, clean Git repository at that commit. No wildcard directory selection is permitted. `-UpdateBundleRs` registers only the Tunnel binary/hash fields after a successful build. Without that flag, the binary remains an unregistered build artifact. Generated metadata is UTF-8 without BOM.
 
-### 1. Build OpenAI Tunnel Client from Source
-```powershell
-.\scripts\build-tunnel-client.ps1 -UpdateBundleRs
-```
-This downloads OpenAI `tunnel-client` at commit `8d55683eeef80bc5e360d95abf4692454fafc615`, builds it with `-mod=readonly -trimpath -buildvcs=false`, copies it to `runtime/tunnel-client/tunnel-client.exe`, and updates `bundle.rs` SHA256.
+`verify-runtime.ps1 -BundledOnly` verifies repository runtimes only. Without that switch it also requires the actual toolbox stage and broker build evidence. Missing, empty, changed or unexpected required payloads fail verification. Toolboxes are checked at `src-tauri/target/toolbox-stage`, not at a nonexistent repository runtime directory. Python and Coding Runtime trees are checked against both manifest and Rust pins. The existing license inventory stage verifies distribution notices and dependency licenses.
 
-### 2. Verify Bundled Runtime Integrity
-```powershell
-.\scripts\verify-runtime.ps1
-```
+Resource scripts do not recursively delete directories. Valid pinned downloads are reused; extraction uses unique directories. Unexpected staged files stop the build and print their paths for manual cleanup. Regression fixtures are also retained for manual cleanup.
 
-### 3. Build & Test Frontend
-```powershell
-npm ci
-npm test
-npm run build
-```
+## Platform tests and authentication
 
-### 4. Build Privileged Broker and Desktop App
-```powershell
-cargo test --manifest-path src-tauri/Cargo.toml --locked
-cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bin localbridge-privileged-broker
-cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bin localbridge
-```
+The community workflow runs the complete pinned upstream Go suite on Linux before the Windows job. Windows source compilation explicitly reports the upstream suite as not run on Windows; this is not a test PASS. Windows still runs the strict real-Tunnel MCP authentication test ten times, followed by the complete serial Rust suite and Clippy.
 
-### 5. Generate Cryptographic Checksums
-```powershell
-.\scripts\generate-checksums.ps1
-```
+The MCP probe handles multiple connections and completes initialization. It checks actual `/mcp` requests separately from discovery traffic, records only method/path and authentication booleans, isolates inherited proxies, and stops its subprocess on failure. The Guard regression requires HTTP 401 for missing/wrong Bearer and HTTP 200 for a correct initialized request. No production authentication bypass is introduced.
+
+## Output and acceptance
+
+Each invocation writes `tests/artifacts/ci/TEST-REPORT.json` with commit, profile and per-stage PASS/FAIL/NOT_RUN. A partial invocation cannot count as a full build. Successful packaging additionally generates `BUILD-PROVENANCE.json`, `toolchains.json` and `SHA256SUMS.txt` there, covering the installer, binaries, resources and evidence. An old installer cannot satisfy a new run. Root-level provenance/checksums are baseline information, not current release evidence.
+
+Diagnostics upload even on failure. Verified installer uploads run only after success. No Release is published automatically. Full acceptance requires both workflows succeeding for the same repaired commit; local edits alone do not establish this.
+
+Live ChatGPT connection, interactive UAC and clean Windows installation remain separate NOT_RUN acceptance items. A successful NSIS build proves packaging only.

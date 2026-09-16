@@ -7702,6 +7702,60 @@ mod tests {
     }
 
     #[test]
+    fn guard_rejects_missing_and_wrong_bearer_before_mcp_initialization() {
+        let root = repo_root();
+        let workspace = temp_workspace();
+        let coding = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                free_port(),
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
+            Duration::from_secs(10),
+        )
+        .expect("bundled MCP ready");
+        let desired = DesiredStateOwner::default();
+        desired.replace(DesiredState {
+            permission: PermissionMode::Full,
+            workspace: Some(DesiredWorkspace::for_runtime_path(&workspace)),
+            services: ServiceIntent::Enabled,
+            connection: None,
+        });
+        let auth = ClientAuthenticator::generated().unwrap();
+        let correct = auth.test_authorization_header().unwrap();
+        let pep = PolicyEnforcementRuntime::start_inner(
+            coding,
+            policy(&root),
+            PolicyStateSource::Simulated {
+                desired,
+                workspace,
+                connection: None,
+                privileged: None,
+            },
+            None,
+            None,
+            auth,
+        )
+        .expect("authenticated Guard ready");
+        let statuses: Vec<_> = [None, Some("Bearer synthetic-wrong"), Some(correct.as_str())].into_iter().map(|authorization| {
+            let body = json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                "protocolVersion":CURRENT_PROTOCOL_VERSION, "capabilities":{}, "clientInfo":{"name":"auth-regression", "version":"1"}
+            }}).to_string();
+            let mut stream = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, pep.port())).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let header = authorization.map(|value| format!("Authorization: {value}\r\n")).unwrap_or_default();
+            let request = format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n{header}\r\n{body}", body.len());
+            std::io::Write::write_all(&mut stream, request.as_bytes()).unwrap();
+            super::super::test_support::parse_client_response(stream).status
+        }).collect();
+        let mut coding = pep.stop().expect("Guard stops");
+        coding.stop().expect("coding runtime stops");
+        assert_eq!(statuses, [401, 401, 200]);
+    }
+
+    #[test]
     fn schema40_health_probe_remains_authenticated_while_facade_lock_is_held() {
         let root = repo_root();
         let workspace = temp_workspace();

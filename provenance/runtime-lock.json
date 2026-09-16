@@ -1,4 +1,4 @@
-﻿{
+{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "lock_version": "1.0",
   "community_version": "0.1.5-community.1",
@@ -10,7 +10,7 @@
       "source": "https://github.com/openai/tunnel-client",
       "version": "0.0.11",
       "commit": "8d55683eeef80bc5e360d95abf4692454fafc615",
-      "build_type": "source-built",
+      "build_type": "bundled-baseline",
       "runtime_path": "runtime/tunnel-client/tunnel-client.exe",
       "license": "Apache-2.0",
       "license_path": "runtime/tunnel-client/LICENSE",
