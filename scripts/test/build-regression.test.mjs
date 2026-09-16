@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -39,6 +40,24 @@ test("source verification uses only the exact supplied checkout and rejects drif
   assert.throws(() => validateCheckout(exact, commit, fakeGit("b".repeat(40))), /commit mismatch/);
   assert.throws(() => validateCheckout(exact, commit, fakeGit(commit, " M go.mod")), /clean/);
   assert.throws(() => validateCheckout(exact, commit, fakeGit(commit, "", directory)), /exact source/);
+});
+
+test("source verification accepts the 8.3 short form of the same checkout", () => {
+  const directory = fixture(), exact = join(directory, "tunnel-client-pinned");
+  mkdirSync(exact);
+  // GitHub runners expose %TEMP% as C:\Users\RUNNER~1\...; git reports the
+  // canonical long path, so the validator must canonicalize both sides.
+  const probe = spawnSync("cmd.exe", ["/d", "/s", "/c", `for %I in ("${exact}") do @echo %~sI`], { encoding: "utf8", windowsVerbatimArguments: true });
+  const short = (probe.stdout ?? "").trim().split(/\r?\n/).pop();
+  if (probe.status !== 0 || !short || !/~\d/.test(short) || short === exact) return; // 8.3 disabled on this volume
+  const commit = "a".repeat(40);
+  const fakeGit = (args) => {
+    if (args.includes("--show-toplevel")) return exact;
+    if (args.includes("HEAD")) return commit;
+    return "";
+  };
+  assert.equal(validateCheckout(short, commit, fakeGit), exact);
+  assert.throws(() => validateCheckout(short, "b".repeat(40), fakeGit), /commit mismatch/);
 });
 
 test("broker bootstrap, repeated build and failure invalidate old success", () => {
