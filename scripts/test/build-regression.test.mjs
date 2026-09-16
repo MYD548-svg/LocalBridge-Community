@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { stageBroker } from "../prepare-lb018-resources.mjs";
@@ -12,7 +12,9 @@ import { validateCheckout } from "./source-check.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
 // Fixtures are retained: this repository forbids automatic bulk deletion.
-function fixture() { return mkdtempSync(join(tmpdir(), "localbridge-build-regression-")); }
+// Runners expose %TEMP% in 8.3 short form; canonicalize so fixture paths and
+// the validator's canonical output are lexically comparable.
+function fixture() { return realpathSync.native(mkdtempSync(join(tmpdir(), "localbridge-build-regression-"))); }
 function put(root, name, content) { const path = join(root, name); mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, content); return path; }
 
 test("Tunnel hash update preserves every other manifest section", () => {
