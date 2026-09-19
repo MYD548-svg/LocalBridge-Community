@@ -821,13 +821,11 @@ mod tests {
                 let message: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                 let initialize = message["method"] == "initialize";
                 let observation = observe_probe_request(&headers, initialize);
-                let session = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("mcp-session-id")
-                            .then(|| value.trim().to_owned())
-                    });
+                let session = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("mcp-session-id")
+                        .then(|| value.trim().to_owned())
+                });
                 // Mirror the production Guard contract (mcp/server.rs): the
                 // streamable HTTP client probes GET /mcp first and must see the
                 // same rejection the real Guard sends, otherwise it never falls
