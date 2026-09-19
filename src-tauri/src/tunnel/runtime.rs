@@ -769,20 +769,30 @@ mod tests {
     // share one keep-alive HTTP client (tunnel-client pkg/oauth module.go and
     // pkg/mcpclient fxmodule.go). Serving connections serially stalls past
     // those deadlines and the client abandons the initialize, so every
-    // connection is handled on its own thread.
+    // connection is handled on its own thread. A real server also never
+    // answers a connection that has not produced a request: the Go transport
+    // can leave a dialed connection idle, and an unsolicited response here
+    // races the client writing its first request on that connection, which
+    // silently swallows the MCP initialize (connectStartupProbe wraps that
+    // transport failure as ErrRejected and the client never retries it).
+    // Connections without a request are therefore waited on or closed
+    // silently, exactly like an idle keep-alive connection.
     fn serve_probe_connection(
         mut stream: std::net::TcpStream,
         request_tx: mpsc::Sender<ProbeObservation>,
     ) {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+        let idle_deadline = Instant::now() + Duration::from_secs(60);
         let mut bytes = Vec::new();
         let mut byte = [0_u8; 1];
         while bytes.len() < 32_768 && !bytes.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).unwrap_or(0) == 0 {
-                break;
+            match stream.read(&mut byte) {
+                Ok(0) => return, // peer closed without a request: close silently
+                Ok(_) => bytes.push(byte[0]),
+                Err(_) if Instant::now() < idle_deadline => {} // idle connection: keep waiting
+                Err(_) => return,                              // idle past deadline: close silently
             }
-            bytes.push(byte[0]);
         }
         let headers = String::from_utf8_lossy(&bytes);
         let length = headers
@@ -898,7 +908,7 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let probe = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + Duration::from_secs(60);
             while Instant::now() < deadline && stop_rx.try_recv().is_err() {
                 let Ok((stream, _)) = listener.accept() else {
                     thread::sleep(Duration::from_millis(10));
@@ -927,7 +937,10 @@ mod tests {
                 prepared.isolate_probe_environment = true;
                 match prepared.spawn() {
                     Ok(mut runtime) => {
-                        let deadline = Instant::now() + Duration::from_secs(10);
+                        // Runner variance (cold cache, real-time scanning) delays
+                        // client startup far more than the assertions below; the
+                        // window only bounds how long the probe collects facts.
+                        let deadline = Instant::now() + Duration::from_secs(30);
                         while Instant::now() < deadline {
                             match request_rx.recv_timeout(Duration::from_millis(100)) {
                                 Ok(observation) => {
