@@ -506,12 +506,17 @@ impl<'a> DetachedCommand<'a> {
                 self.last_response.body
             );
             self.poll(1_000);
-            assert_eq!(
-                self.status(),
-                Some("running"),
-                "command terminated before emitting {marker:?}: {:#?}",
-                self.last_response.body
-            );
+            match classify_command_poll_response(&self.last_response) {
+                CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
+                CommandPollObservation::Terminal => panic!(
+                    "command terminated before emitting {marker:?}: {:#?}",
+                    self.last_response.body
+                ),
+                CommandPollObservation::Invalid => panic!(
+                    "detached command poll response is neither lifecycle status nor bounded timeout: {:#?}",
+                    self.last_response.body
+                ),
+            }
         }
     }
 
@@ -552,10 +557,6 @@ impl<'a> DetachedCommand<'a> {
         self.observe(response)
     }
 
-    pub(crate) fn status(&self) -> Option<&str> {
-        self.last_response.body["result"]["structuredContent"]["data"]["status"].as_str()
-    }
-
     fn observe(&mut self, response: ClientResponse) -> &ClientResponse {
         self.output.push_str(
             response.body["result"]["structuredContent"]["data"]["output"]
@@ -567,6 +568,93 @@ impl<'a> DetachedCommand<'a> {
     }
 }
 
+/// A command_control response carries either a lifecycle observation in
+/// `data.status` or a typed facade error. The facade keeps the Execution
+/// non-terminal when a poll/write hits its wait budget and answers
+/// `OperationTimedOut` (retryable, transport phase), so that response is a
+/// "keep polling the same session" signal, never a terminal fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandPollObservation {
+    Running,
+    BoundedWaitExpired,
+    Terminal,
+    Invalid,
+}
+
+pub(crate) fn classify_command_poll_response(response: &ClientResponse) -> CommandPollObservation {
+    let content = &response.body["result"]["structuredContent"];
+    if let Some(status) = content["data"]["status"].as_str() {
+        return if status == "running" {
+            CommandPollObservation::Running
+        } else {
+            CommandPollObservation::Terminal
+        };
+    }
+    if content["error"]["code"] == "OperationTimedOut" {
+        return CommandPollObservation::BoundedWaitExpired;
+    }
+    CommandPollObservation::Invalid
+}
+
+#[test]
+fn command_poll_classification_matches_the_facade_response_contract() {
+    let observation = |structured: Value| ClientResponse {
+        status: 200,
+        session: None,
+        body: json!({"result": {"structuredContent": structured}}),
+    };
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": true,
+            "data": {"status": "running", "session_id": "lb-session-x", "output": "chunk"}
+        }))),
+        CommandPollObservation::Running
+    );
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": true,
+            "data": {"status": "completed", "output": "done"}
+        }))),
+        CommandPollObservation::Terminal
+    );
+    // A failed terminal still carries data.status; the error object does not
+    // turn it into a pending observation.
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": false,
+            "data": {"status": "failed"},
+            "error": {"code": "ProcessFailed"}
+        }))),
+        CommandPollObservation::Terminal
+    );
+    // The bounded-wait response has no data.status at all.
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": false,
+            "data": null,
+            "error": {
+                "code": "OperationTimedOut",
+                "cause": "operation_timed_out",
+                "phase": "transport",
+                "retryable": true
+            }
+        }))),
+        CommandPollObservation::BoundedWaitExpired
+    );
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": false,
+            "data": null,
+            "error": {"code": "SessionUnavailable"}
+        }))),
+        CommandPollObservation::Invalid
+    );
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({}))),
+        CommandPollObservation::Invalid
+    );
+}
+
 pub(crate) fn settle_public_command(
     port: u16,
     session: &str,
@@ -575,35 +663,41 @@ pub(crate) fn settle_public_command(
 ) -> (ClientResponse, String) {
     let deadline = Instant::now() + Duration::from_secs(150);
     let mut output = String::new();
+    let mut public_session = String::new();
     loop {
         let data = &response.body["result"]["structuredContent"]["data"];
         output.push_str(data["output"].as_str().unwrap_or_default());
-        match data["status"].as_str() {
-            Some("running") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "public command did not converge: {:#?}",
-                    response.body
-                );
-                let public_session = data["session_id"]
+        match classify_command_poll_response(&response) {
+            CommandPollObservation::Running => {
+                public_session = data["session_id"]
                     .as_str()
                     .expect("running command has PublicSessionId")
                     .to_string();
-                response = public_tool_call(
-                    port,
-                    session,
-                    poll_id,
-                    "command_control",
-                    json!({"action":"poll","session_id":public_session,"wait_ms":1000}),
-                );
-                poll_id = poll_id.saturating_add(1);
             }
-            Some(_) => return (response, output),
-            None => panic!(
-                "public command response has no status: {:#?}",
+            CommandPollObservation::Terminal => return (response, output),
+            CommandPollObservation::BoundedWaitExpired if public_session.is_empty() => panic!(
+                "public command transport timeout before the session identity was delivered: {:#?}",
+                response.body
+            ),
+            CommandPollObservation::BoundedWaitExpired => {}
+            CommandPollObservation::Invalid => panic!(
+                "public command response is neither lifecycle status nor bounded timeout: {:#?}",
                 response.body
             ),
         }
+        assert!(
+            Instant::now() < deadline,
+            "public command did not converge: {:#?}",
+            response.body
+        );
+        response = public_tool_call(
+            port,
+            session,
+            poll_id,
+            "command_control",
+            json!({"action":"poll","session_id":public_session,"wait_ms":1000}),
+        );
+        poll_id = poll_id.saturating_add(1);
     }
 }
 
@@ -624,12 +718,10 @@ pub(crate) fn poll_public_command_to_terminal(
             json!({"action":"poll","session_id":public_session,"wait_ms":1_000}),
         );
         poll_id = poll_id.saturating_add(1);
-        let content = &response.body["result"]["structuredContent"];
-        match content["data"]["status"].as_str() {
-            Some("running") => {}
-            Some(_) => return response,
-            None if content["error"]["code"] == "OperationTimedOut" => {}
-            None => panic!(
+        match classify_command_poll_response(&response) {
+            CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
+            CommandPollObservation::Terminal => return response,
+            CommandPollObservation::Invalid => panic!(
                 "public command returned neither lifecycle status nor bounded timeout: {:#?}",
                 response.body
             ),
