@@ -1,0 +1,39 @@
+name: Upstream Contrast
+
+# Controlled original-snapshot contrast: this workflow runs the exact same
+# gate stages up to rust-test that the current task branch runs, but on the
+# untouched import snapshot. It adds a run condition only; no business code,
+# test, or assertion differs from 5ea0e25.
+on:
+  push:
+    paths:
+      - ".github/workflows/upstream-contrast.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - run: npm ci
+      - run: cargo fetch --manifest-path src-tauri/Cargo.toml --locked
+      - name: Original snapshot through rust-test
+        run: node scripts/test/ci-gate.mjs --through rust-test
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contrast-diagnostics
+          path: tests/artifacts/ci/
+          if-no-files-found: warn
