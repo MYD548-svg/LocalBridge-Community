@@ -365,6 +365,7 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
         command: `echo LB_ABSOLUTE_EQUIVALENCE>"${absoluteTarget}"`,
         shell: "cmd",
         yield_time_ms: 10_000,
+        timeout_ms: 120_000,
       },
       "absolute-redirection",
     );
@@ -382,6 +383,7 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
         shell: "cmd",
         workdir: ".",
         yield_time_ms: 10_000,
+        timeout_ms: 120_000,
       },
       "relative-redirection",
     );
@@ -420,7 +422,7 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
     const directCurrentUser = await toolCall(
       client,
       "exec_command",
-      { command: "sc query EventLog", shell: "cmd", yield_time_ms: 10_000 },
+      { command: "sc query EventLog", shell: "cmd", yield_time_ms: 10_000, timeout_ms: 120_000 },
       "direct-current-user",
     );
     const directCurrentUserTerminal = await settleAcceptedPublicCommand({
@@ -447,6 +449,7 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
         shell: "cmd",
         workdir: ".",
         yield_time_ms: 10_000,
+        timeout_ms: 120_000,
       },
       "descendant-current-user",
     );
@@ -902,6 +905,7 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
         command: "Write-Output LB_STREAM_PROBE",
         shell: "windows_powershell",
         yield_time_ms: 10_000,
+        timeout_ms: 120_000,
       },
       "stream-probe",
     );
@@ -933,7 +937,8 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
     assert.equal(mismatchError.details.expected, "stdout", explain(mismatchedStream));
     assert.equal(mismatchError.details.actual, "stderr", explain(mismatchedStream));
     const stderrInitial = await toolCall(client, "exec_command", {
-      command: "Write-Error LB_RETAINED_STDERR", shell: "windows_powershell", yield_time_ms: 10_000,
+      command: "Write-Error LB_RETAINED_STDERR", shell: "windows_powershell",
+      yield_time_ms: 10_000, timeout_ms: 120_000,
     }, "stderr-primary-handle");
     const stderrTerminal = await settleAcceptedPublicCommand({
       initialResponse: stderrInitial,
