@@ -1,101 +1,202 @@
-# LocalBridge CI repair verification ¡ª 2026-09-26
+# LocalBridge CI repair verification - rewritten 2026-09-26
+
+This report was rewritten from scratch in explicit UTF-8 (ASCII subset): the
+previously committed file was byte-corrupted (124 U+FFFD replacement sequences,
+invalid UTF-8 - the damage was real data loss, not a terminal rendering
+artifact). Facts below were recovered from the code, the CI logs and the
+downloaded artifacts. The running commit chain is deliberately not repeated
+here; history lives in the commit log, current state lives here.
 
 ## Status
 
-**CLOUD ACCEPTANCE IN PROGRESS ¡ª LOCAL NON-LINK CHECKS VERIFIED; LINK-TYPE STAGES CLOUD-ONLY.**
+Branch `codex/fix-ci-validation`, PR #1 -> `main` in `MYD548-svg/LocalBridge-Community`.
+The sole acceptance gate is `node scripts/test/ci-gate.mjs` (19 stages); the
+community workflow runs the same gate with `LOCALBRIDGE_BUILD_PROFILE=community`.
 
-Branch: `codex/fix-ci-validation`, PR #1 ¡ú `main` in `MYD548-svg/LocalBridge-Community`. Commit chain for this repair cycle: `9add3d6` (probe idle-connection handling, prior cycle) ¡ú `ca81c21` (revision46 queue blocker settled through the accepted-command terminal driver) ¡ú `4a5872f` (Rust test support treats bounded command-control timeouts as pending) ¡ú `abae096` (schema27 scenario commands carry explicit degraded-runner budgets) ¡ú `af8bb74` (`wait_for_output` satisfies when the marker arrives with the terminal response) ¡ú `6ea6a84` (this report, first revision) ¡ú `bf54898` (probe double serves repeated requests on one connection like the production Guard) ¡ú `071b5bf` (scenario commands resubmit when their submission wait budget expired) ¡ú `de26450` (report, second revision) ¡ú `70340ec` (the nested workflow retries when its command submission budget expired) ¡ú `d64a1c7` (report, third revision) ¡ú `d3ba9eb` (remaining stall-family promptness bounds widened, still bounded) ¡ú `3089d5f` (report, fourth revision) ¡ú `ad79d6c` (revision46 scenario commands carry explicit degraded-runner budgets) ¡ú this report revision.
+Head `2f3de89` completed all three expected runs with success:
 
-## Original-snapshot contrast verdict (goal ¡ì5, decided 2026-09-26)
+| Workflow | Event | Run | Result |
+| --- | --- | --- | --- |
+| CI | push | 36235265911 | success (19/19 stages PASS) |
+| CI | pull_request | 36235269939 | success (19/19 stages PASS) |
+| LocalBridge Community Build | pull_request | 36235269870 | success (19/19 stages PASS; Linux upstream-tests job PASS) |
 
-Run `36218847261` ("Upstream Contrast", branch `codex/upstream-contrast-5ea0e25` = import snapshot `5ea0e25` plus one workflow-only helper commit) executed `node scripts/test/ci-gate.mjs --through rust-test` on `windows-latest` with the same toolchain versions as the task branch. **The untouched original FAILED at rust-test with the same failure family:**
+PR-event runs checkout the merge ref; its actual checkout SHA is
+`118d12193053f1a5498af0f0adfe2a17fe8db42c` ("Merge 2f3de89... into 012adf9...",
+parents = base `012adf9` + head `2f3de89`, verified via the API). The CI push
+run checked out `2f3de89` itself (provenance `dirty: false`).
 
-| Original-snapshot failure | Signature |
+After this review cycle the branch gained additional commits; the final
+acceptance object is the new head's own three runs. Their run IDs and artifact
+verification results are recorded in the delivery message rather than by
+re-committing this document again.
+
+## Review verdicts on the earlier timing/retry changes
+
+### d3ba9eb - widened promptness bounds (1.5-5 s -> 10-20 s)
+
+Reviewed test by test, looking for whether the widened bounds alone could mask
+the guarded failure. Verdicts:
+
+- `command_control_kill_is_not_blocked_by_unrelated_foreground_work` - still
+  discriminative. The 20 s bounds are hang guards; the discriminating
+  assertions are the outcomes: the poll must observe `status: "running"` (a
+  poll serialized behind the 10 s foreground work would return after the
+  detached command had already terminalized), the kill must still observe a
+  live session, and the foreground work must end `ProcessCancelled`, not
+  completed. All three fail if control requests queue behind foreground work.
+- `task_control_cancel_owns_detached_public_command_session`,
+  `edit_task_control_cancel_reaches_running_filesystem_hash` - still
+  discriminative: they assert the joined call terminates
+  `isError: true` / `ProcessCancelled` with the projection converging to Idle,
+  so a naturally-completing command (inside the widened bound) still fails.
+- `cancellation_reaches_actual_upstream_while_tool_call_is_running` - **was
+  weakened** and is fixed in this cycle: its command completes naturally at
+  ~10 s, which now fits inside the 20 s settle bound, and the test only
+  asserted "some JSON-RPC response arrived". It now also asserts
+  `isError: true`, error code `ProcessCancelled` and terminal
+  `status: "cancelled"` - a cancellation that never reaches the upstream
+  produces a success envelope and fails the test regardless of timing.
+
+### 5ce9004 - blanket `SessionUnavailable` retry in poll helper
+
+Traced to the production call chain. The comment's claimed race is real, but
+the blanket test-side retry masked it instead of fixing it: in
+`control_command_during_work` (`control_plane/command_control.rs`) the
+poll-observation path mapped `ExecutionRegistryError::AlreadyTerminal`
+(concurrent finalizer won the `finish` race) to `ExecutionConflict`, surfaced
+as `SessionUnavailable` with the "terminal-state conflict" message - exactly
+the 9a27919 failure signature. Fixed in production this cycle: when a poll
+loses the finish race it now replays the durable terminal of the same
+execution (mirroring the tolerated path already present for the runtime-error
+finalize path); it never fabricates or overrides a terminal. The test-side
+tolerance was **removed** so genuinely unavailable or unknown sessions surface
+as contract errors again. A deterministic regression test
+(`poll_returns_the_durable_terminal_when_a_concurrent_call_won_the_finish_race`)
+reproduces the race with a concurrent-finalizer runtime mock.
+
+### 071b5bf / 70340ec - resubmission after submission-budget timeout
+
+Traced semantics: a submit that returns `OperationTimedOut` without session
+identity does **not** prove the command was not executed. The facade's private
+call timeout (`private_call_with_timeout`) does not cancel the upstream
+request; the upstream may run the queued/started command later, and the facade
+terminalizes the public session with the error. Every resubmission therefore
+risks a second execution. The resubmitted scenario commands are all
+observation-only (`Write-Output`, `Start-Sleep`, `cd`), so no persistent side
+effect can be doubled, and the workflow retry's failed attempt terminalizes its
+own checkpoint. Made explicit and scoped this cycle: the helper is renamed to
+`submit_side_effect_free_public_command` with the safety condition documented,
+and both inline retry loops carry the same note. A dynamic fixture proving the
+duplicate-execution count empirically (inject timeout, count executions,
+inspect orphan liveness) requires a Rust toolchain - NOT_RUN locally, see
+below; the production-side orphan execution behavior itself is unchanged by
+this cycle and remains a known hazard for non-idempotent client commands.
+
+### 163033f / 2f3de89 - broker attestation and installer content
+
+The staged-broker-vs-evidence check and the config-mapping guard are sound and
+retained; the build-tree copy in `target/release` is deliberately not compared
+to the staged evidence (the build-regression fixture proves that a differing
+build-tree copy does not fail the gate). Negative scenarios now covered by
+tests: tampered staged broker -> `SHA256 mismatch`; evidence not PASS ->
+`broker build incomplete`; evidence missing/empty -> `missing`; emptied
+`bundle.resources` -> `attested staged broker` guard.
+
+But the config pointing at the staged file does not prove what the installer
+carries. Physical verification was performed on all three `2f3de89` installers
+(extracted offline with 7-Zip, no installation executed): **each installer
+declared `localbridge-privileged-broker.exe` twice** - the attested staged
+binary (882 688 bytes) plus a 904 704-byte app-feature-set copy that tauri's
+NSIS template emits from the cargo binary list (`get_binaries` returns every
+`[[bin]]` target; its `{{#each binaries}}` loop runs after the resources loop
+and overwrites the resource at install time). The installed broker was
+therefore never the attested staged binary, and the same class of behavior hit
+the app binary (tauri patches it with bundle-type information at packaging).
+This is fixed in production this cycle: the broker `[[bin]]` is gated behind a
+`privileged-broker` feature (`required-features`), so the bundler's binary list
+no longer includes it while `prepare-lb018-resources.mjs` builds it with that
+feature explicitly; the installer now carries only the attested staged broker.
+The gate itself now opens any existing NSIS installer during
+`runtime-integrity` (package-integrity timing on CI): it rejects duplicate
+entry names (a later same-name entry would silently overwrite an attested
+file) and verifies the carried broker's SHA256 against the staged evidence.
+The new census was validated against all three known-broken `2f3de89`
+installers - all three are rejected - and the carried-broker hash comparison
+was validated by full offline extraction of those installers (79/79 runtime
+payload files matched their attested hashes; only the tauri-patched app binary
+and the overwritten broker differed).
+
+Provenance and manifests distinguish build-tree artifacts
+(`target/release/...`), staged-to-package artifacts (`target/release-stage/...`)
+and the final installer (`target/release/bundle/nsis/...`), and the
+bundled/community evidence is kept separate by profile
+(`bundled-verified-installer` / `ci-diagnostics` vs
+`community-verified-installer` / `community-diagnostics`,
+`BUILD-PROVENANCE.json` `profile` field).
+
+## Original-snapshot contrast (verdict and limits, unchanged)
+
+Run 36218847261 (import snapshot `5ea0e25` + one workflow-only helper commit)
+failed at rust-test with the same failure family as the task branch's early
+heads: `schema27_public_facade_runtime_semantics_are_real_end_to_end`
+(`ProcessTimedOut` family), `task_control_cancel_owns_detached_public_command_session`
+(submission returned without session identity), and
+`actual_tunnel_discovery_sends_the_authenticated_pep_header` (probe race).
+This proves the failure family reproduces in the imported code on this
+infrastructure; it does **not** prove that every later failure had the same
+root cause, that all slowness is runner degradation (its inner cause - why a
+spawned PowerShell produces no output for ~30 s - is not observable from job
+logs and remains stated as uncertainty), or that the two runs had identical
+load. The contrast run is not repeated; no new evidence requires it.
+
+## Ignored tests
+
+None. No `#[ignore]` attributes exist in the Rust suite and every cloud log in
+this cycle reports `0 ignored`; the `chatgpt_black_box` cargo target and the
+JS black-box scenarios execute on the runners. A cargo-test success therefore
+means all compiled tests ran.
+
+## Cloud evidence history (billing blocker kept separate)
+
+| Head | Runs (push / PR / community) | Outcome |
+| --- | --- | --- |
+| 9add3d6 | 35456808403 / 35456809857 / 35456809851 | rust-test FAIL (revision46 assertion; helper panics on bounded timeouts; one real degraded 30 s timeout) |
+| abae096 | 36218255642 / 36218256983 | auth-repeat probe race FAIL |
+| 6ea6a84 | 36218961677 / 36218963630 / 36218963629 | auth-repeat probe race FAIL |
+| de26450 | 36221409446 / 36221412164 / 36221412184 | auth-repeat PASS; one transient schema28 submission timeout |
+| d64a1c7 | 36223868229 / 36223870698 / 36223870794 | one 5 s cancellation-settle exceedance (bound since widened with outcome assertions restored) |
+| 3089d5f | 36226819061 / 36226822441 / 36226822436 | lib suite 407/407; revision46 `Write-Error` scenario hit 30 s default |
+| 9a27919 | 36228890501 / 36228893464 / 36228893382 | terminal-state finish race (fixed in production this cycle) |
+| fae42e7 | 36231334954 / 36231336494 / 36231336476 | rust-test + clippy + NSIS reached; CI failed package-integrity; Community job never started - GitHub billing blocker "recent account payments have failed or your spending limit needs to be increased", both attempts, zero steps executed. User-side account issue, resolved separately by the user; distinct from any code or gate behavior. |
+| 2f3de89 | 36235265911 / 36235269939 / 36235269870 | all three success; artifacts downloaded and physically verified (see broker section) |
+
+## Local checks executed for this cycle
+
+| Check | Result |
 | --- | --- |
-| `schema27_public_facade_runtime_semantics_are_real_end_to_end` | `assertion left == right failed` at server.rs:6340, `state: "failed"` ¡ª the same assert that failed in the 9add3d6 Community run (ProcessTimedOut family) |
-| `task_control_cancel_owns_detached_public_command_session` | panicked `"second detached public session"` ¡ª a submission whose initial response carried no session identity (transport budget expired) |
-| `actual_tunnel_discovery_sends_the_authenticated_pep_header` | panicked at the ORIGINAL pre-fix probe code (runtime.rs:770): `real tunnel binary omitted the authenticated MCP header` |
+| `node --test scripts/test/build-regression.test.mjs` | PASS - 8 tests, including the new negative broker-evidence cases and the installer-census unit test |
+| `node --check` on every changed `.mjs` | PASS |
+| Rust format check (vendored rustfmt 1.85.0, edition 2024) on changed `.rs` files | PASS |
+| Encoding audit of all tracked text files | TEST-REPORT.md was the only corrupted file; rewritten |
 
-Per the goal ¡ì5.4 table this is the "both versions fail with matching signatures" outcome: **the rust-test failures are present in the imported code and reproduce in this environment; they are not introduced by the task branch.** The contrast limitation is documented below (helper workflow commit, stage list of the 5ea0e25 gate).
+## NOT_RUN (must not be claimed as passed)
 
-## Cloud evidence on the fix heads (`abae096` ¡­ `ad79d6c`)
-
-| Head | Run | Workflow | Event | Result |
-| --- | --- | --- | --- | --- |
-| `abae096` | `36218255642` | CI | push | auth-repeat FAIL: `auth-1..auth-6` PASS, `auth-7` probe race (runtime.rs:998, "no authenticated MCP initialization") |
-| `abae096` | `36218256983` | LocalBridge Community Build | pull_request | FAIL (auth-repeat stage) |
-| `6ea6a84` | `36218961677` / `36218963630` / `36218963629` | CI push / CI PR / Community PR | all | auth-repeat FAIL on the first probe round, same signature as `abae096` `auth-7` |
-| `de26450` | `36221409446` / `36221412164` / `36221412184` | CI push / CI PR / Community PR | all | **auth-repeat PASS (10/10, keep-alive probe fix effective)**; rust-test 406/407: one transient failure ¡ª `schema28_public` at server.rs:6981: the nested `agent_workflow` command submission surfaced a retryable `OperationTimedOut` (`request_deadline_expired`) |
-| `d64a1c7` | `36223868229` / `36223870698` / `36223870794` | CI push / CI PR / Community PR | all | **auth-repeat PASS; rust-test 406/407**: `cancellation_reaches_actual_upstream_while_tool_call_is_running` exceeded its 5 s cancellation-settle bound; the workflow retry from `70340ec` passed |
-| `3089d5f` | `36226819061` / `36226822441` / `36226822436` | CI push / CI PR / Community PR | all | **lib suite 407/407 PASS** (timing widening effective); black-box revision46 failed once: the `Write-Error` scenario command (no explicit budget, 30 s default) ran 30 087 ms with zero output and surfaced `ProcessTimedOut` instead of the asserted `ProcessFailed` |
-| `9a27919` | `36228890501` / `36228893464` / `36228893382` | CI push / CI PR / Community PR | all | **lib suite 406/407**: `task_control_cancel_owns_detached_public_command_session` ¡ª the replay poll immediately after an accepted cancellation answered `SessionUnavailable` ("ÃüÁîÖÕÌ¬·¢Éú³åÍ»"): the cancellation finalized the Execution in the registry while the poll was in flight, and the poll's own finish then hit `AlreadyTerminal` |
-| `fae42e7` | `36231334954` / `36231336494` / `36231336476` | CI push / CI PR / Community PR | all | **rust-test PASS in full (407 lib tests + black-box revision46, clippy, NSIS reached for the first time on any head)**; CI runs failed at `package-integrity`: `target/release/localbridge-privileged-broker.exe` hashed differently from the staged evidence. The Community Windows job could not start at all: GitHub rejected it with "The job was not started because recent account payments have failed or your spending limit needs to be increased" (attempt 1 and the re-run attempt 2, zero steps executed) ¡ª **user-side billing blocker** |
-
-Each round since `de26450` has eliminated the previously failing point and surfaced exactly one further timing-sensitive assertion from the same degraded-runner stall family: multi-second stalls of process spawn and private-runtime responses, measured at 20¨C30 s in the 9add3d6 Community run (a trivial `Write-Output` command needed 21 poll rounds before admission; a healthy ~1 s command ran 30 s with zero output). Responses, in order:
-
-1. `70340ec` ¡ª the nested `agent_workflow` invocation in schema28_public retries on the retryable `OperationTimedOut` its command submission surfaced; the failed attempt terminalizes its own checkpoint (`terminalize_legacy_checkpoint_failure`), so each retry starts a fresh workflow and the scenario assertions apply to the successful attempt.
-2. `d3ba9eb` ¡ª the remaining fixed promptness bounds of the stall family are widened in one pass: cancellation transports 2 s ¡ú 10 s, cancellation settles 5 s ¡ú 20 s, "not blocked behind unrelated work" bounds 1.5¨C2.5 s ¡ú 20 s, readiness loops 3 s ¡ú 10 s. No bound was removed and none became meaningless: each still fails on the behaviour it guards against (cancellation lost, operation serialized behind unrelated foreground work that itself lasts up to 10 s, tool stuck non-idle), just no longer on a multi-second runner stall alone.
-3. `ad79d6c` ¡ª the revision46 scenario commands that still inherited the 30 s default declare explicit `timeout_ms: 120_000`, the same measured adjustment already applied to the Rust scenario commands in `abae096`. Nothing asserts a timeout outcome in those scenarios.
-4. `5ce9004` ¡ª `poll_public_command_to_terminal` rides out the terminal-state finish race: a cancellation that finalizes the Execution while a replay poll is in flight answers `SessionUnavailable` (terminal-state conflict) even though the durable terminal is already recorded, so the helper keeps polling within the caller's existing deadline; a permanently lost session still fails at that deadline with the last response. The strict treatment of every other error is unchanged, and the goal's caution against blanket-retrying `SessionUnavailable` is respected by scoping the tolerance to this helper's bounded loop with the full response retained for diagnosis.
-5. `163033f` ¡ª `package-integrity` reached for the first time on any head and exposed a structural defect in this branch's own earlier gate work (`2786aac` added the stage; the upstream snapshot has no such file): the check demanded `target/release/localbridge-privileged-broker.exe` to hash-equal the staged evidence, but `tauri build` legitimately recompiles the broker with the app feature set (`custom-protocol`) after the staging, so the build-tree copy differs by construction while the **installer embeds the staged, evidence-attested binary** (`tauri.conf.json` `bundle.resources` copies it from `target/release-stage`). The fix keeps the supply-chain property and makes it explicit: staged broker == evidence (unchanged), plus a new guard that the installer's broker source of truth is the attested staged binary; the unsatisfiable build-tree comparison is replaced, not the shipped-artifact guarantee.
-
-The poll/submission fixes were all exercised and passed on `de26450`/`d64a1c7`/`3089d5f`; the black-box revision46 blocker fix (`ca81c21`) is exercised whenever the lib suite passes (the cargo test targets run in order) and its remaining exposure is the residual risk listed below.
-
-### Probe race root cause (fixed by `bf54898`, cloud-verified on `de26450`)
-
-The probe failure on `abae096`/`6ea6a84` was a residual test-double race, not a product defect: the observation sequence showed the client's full authenticated startup traffic (OAuth POST probe, session DELETE, sessionless GET, both RFC 9728 discovery GETs) and **no initialize at all** ¡ª the initialize POST was written onto a connection the one-shot double had already closed. Every double response carried `Connection: close`, so the shared keep-alive client opens a fresh connection per request in the clean case (verified by the local reproduction log), but a request written in the closing window of a served connection is swallowed and never retried (`connectStartupProbe` wraps the transport failure as `ErrRejected`). The same swallow existed in the original snapshot's probe (contrast run above). With the keep-alive double, auth-repeat passed 10/10 on every subsequent run.
-
-## Cloud evidence on `9add3d6` (all three expected runs FAIL at rust-test)
-
-| Head | Run | Workflow | Event | Result |
-| --- | --- | --- | --- | --- |
-| `9add3d6` | `35456808403` | CI | push | rust-test FAIL: `revision46_reported_failures_are_rechecked_through_the_external_client` |
-| `9add3d6` | `35456809857` | CI | pull_request | rust-test FAIL: same revision46 assertion |
-| `9add3d6` | `35456809851` | LocalBridge Community Build | pull_request | rust-test FAIL: 402 passed / 4 failed (lib); Linux upstream-tests job PASS |
-
-All stages before `rust-test` passed in every run, including `auth-repeat` on both profiles. `rust-clippy`, `nsis-package`, `package-integrity` and `artifacts` were not reached.
-
-### Failure taxonomy on `9add3d6` (evidence-backed, from the three job logs)
-
-1. **revision46 first-response assertion (both CI runs).** `tests/black-box/chatgpt/revision46.mjs:304` asserted `assertSuccess(await blocker).status === "completed"` on the first response of a `yield_time_ms: 10_000` command. The cloud returned the documented non-terminal `running` (the PowerShell start plus 4 s of work did not fit the yield window on that runner). The scenario already had `settleAcceptedPublicCommand` available and used it in six other places.
-2. **Rust test helpers treated a bounded timeout as terminal (Community run, 3 of 4).** `settle_public_command` (test_support.rs:602) and `DetachedCommand::wait_for_output` (test_support.rs:509) panicked on poll responses whose `structuredContent.data` is null. The production contract (facade.rs:2135 keeps the Execution non-terminal on `OperationTimedOut` for command_control actions; remediation: "poll later to observe the same Execution") makes that response a keep-polling signal: the cloud payloads read `code: OperationTimedOut, phase: transport, retryable: true, data: null`. The helpers' poll budgets (`wait_ms` 25/100/1000) expired whenever the private runtime answered slowly.
-3. **A real process timeout (Community run, 1 of 4).** `schema27_public_facade_runtime_semantics_are_real_end_to_end` observed `ProcessTimedOut` after 30 702 ms with zero output for a command that completes in ~1 s when healthy. `run_bounded_command` starts the timeout clock at `ResumeThread`, so queue/accept time is excluded and the PowerShell process itself ran ~30 s producing nothing. The same degraded window is measured inside the run: a trivial `Write-Output` command needed 21 poll rounds (~20 s+) before admission. Attribution: runner degradation (cold process start / AV / load), not a production-logic defect ¡ª the 30 s default `timeout_ms` was inherited by omission, while sibling scenarios in the same file already pass explicit `timeout_ms: 120000`.
-
-### Fixes (test code only; no production change; no assertion weakened)
-
-1. `ca81c21` ¡ª the revision46 blocker is settled through the existing `settleAcceptedPublicCommand` (stable `session_id` from the initial response, `running`/`OperationTimedOut` both non-terminal, one absolute 60 s deadline), still requires `completed`, now also verifies the expected `LB_QUEUE_BLOCKER_DONE` stdout via the output handle, and keeps the queued-request cancellation and no-file-side-effect assertions. The blocker's `timeout_ms` was raised 20 000 ¡ú 60 000 with the measured degraded-start evidence; nothing asserts a timeout outcome. `command_lifecycle.test.mjs` gained the "already terminal first response settles without polling" case (existing four cases retained).
-2. `4a5872f` ¡ª a pure `CommandPollObservation` classifier (`Running` / `BoundedWaitExpired` / `Terminal` / `Invalid`) derived from the facade response contract is now shared by `settle_public_command`, `DetachedCommand::wait_for_output` and `poll_public_command_to_terminal`. `OperationTimedOut` continues polling the same stable session without resetting the absolute deadline; terminal failures and typed errors still report immediately; a timeout before any session identity was delivered panics explicitly. Unit-tested against payload shapes taken verbatim from the cloud logs. The now-unused `DetachedCommand::status()` was removed.
-3. `abae096` ¡ª the schema27 scenario command and its settle-fed siblings (`quoted`, `powershell_error`, `cmd_cd_switch`, `auto_utf8`, `autoload`) declare explicit `timeout_ms: 120000`, matching the file's existing convention (baseline, r1, schema28_detached); the schema27 poll loop treats a bounded timeout as pending and its convergence deadline is 150 s. Production timeout semantics are unchanged ¡ª no timeout was raised in production code, and `ProcessTimedOut` remains a terminal failure everywhere.
-4. `af8bb74` ¡ª `wait_for_output` treats "marker observed in the terminal response" as satisfied instead of panicking, per the observe-then-classify contract.
-5. `bf54898` ¡ª the probe test double now serves repeated requests on one connection (keep-alive loop, no `Connection: close`), mirroring the production Guard's connection lifecycle; per-request response contracts are unchanged. Idle-connection behavior (wait, never answer) is retained from `9add3d6`.
-6. `071b5bf` ¡ª detached scenario submissions that expire their submission wait budget (facade budget = `yield_time_ms` + 3 s; the response then carries no session identity and the attempt is terminal) are resubmitted with a bounded 60 s deadline in the test support layer: `submit_public_command` for the cancel-ownership test's two submissions and schema27, a retry loop in both r1 session-B threads, and the same tolerance inside `start_detached_command`. The scheduler-readiness waits around those submissions are 3 s ¡ú 10 s. Scenario assertions (ownership, isolation, cancellation, output) are unchanged; a genuinely failing submission still panics with the response dump.
-7. `70340ec` ¡ª see the ordered response list above.
-8. `d3ba9eb` ¡ª see the ordered response list above.
-9. `ad79d6c` ¡ª see the ordered response list above.
-
-## Original-snapshot contrast (goal ¡ì5)
-
-- **A (original):** import snapshot `5ea0e25` on branch `codex/upstream-contrast-5ea0e25`; **B (current):** the task branch. The failing test code is byte-identical between A and B (verified by Git object comparison in the previous cycle for `test_support.rs`, `server.rs` modulo the auth regression test, and `tests/black-box/chatgpt/`).
-- **Method / helper changes:** one helper commit on the contrast branch adds `.github/workflows/upstream-contrast.yml` (run condition only ¡ª no business, test, or assertion change) which runs `node scripts/test/ci-gate.mjs --through rust-test` on `windows-latest` with the same toolchain versions as the task branch's gate. The 5ea0e25 gate's stage list (test-base ¡ú rust-test, 9 stages) is the snapshot's own; the current gate adds stages before rust-test (tunnel-source, bundled-integrity, staged-integrity, auth-repeat), so the contrast has slightly less preceding load. Build outputs are isolated by construction (fresh runner, fresh checkout). The verdict from this run is recorded at the top of this report.
-
-## Executed local checks (2026-09-26, worktree at this head)
-
-| Check | Actual result |
-| --- | --- |
-| `node --test tests/black-box/chatgpt/command_lifecycle.test.mjs` | PASS ¡ª 5 tests (4 retained + 1 new) |
-| `node --check tests/black-box/chatgpt/revision46.mjs` | PASS |
-| Rust format check (vendored rustfmt 1.85.0, `--edition 2024 --check --config skip_children=true`) on every changed Rust file, re-run after each edit | PASS |
-| cargo check (type-level, no linking) | NOT_RUN ¡ª fails at dependency build scripts requiring `link.exe`; MSVC/Windows SDK intentionally not installed locally |
-| Rust unit/black-box test execution locally | NOT_RUN ¡ª no MSVC; covered by the cloud gate |
-
-## Not executed (NOT_RUN ¡ª must not be claimed as passed)
-
-- Local `rust-test`, `auth-repeat`, `rust-clippy`, `nsis-package`, `package-integrity`, `artifacts`: no MSVC/Windows SDK; these establish acceptance only in cloud CI.
-- Live ChatGPT connection, interactive UAC, clean Windows installation: outside this phase (recorded in TEST-REPORT.json `environmentAcceptance`).
-- The inner cause of the degraded-runner stalls (why a spawned PowerShell produces no output for 30 s) is not directly observable from the job logs; the fixes rest on the measured degradation, the timeout-clock investigation, and the original-snapshot contrast. Residual uncertainty is stated rather than resolved.
-- Residual exposure, not yet observed in a cloud run: the JS-side `settleAcceptedPublicCommand` still throws on a submission-level `OperationTimedOut` (no session identity in the response), and `revision46.mjs` `verifyWorkflowExecutionOwnership` (workflow prepare/edit/verify) has no retry because a failed attempt terminalizes the workflow and the edit's patch is not re-applicable without workspace cleanup. Both will be designed against real evidence if a run ever fails there.
-- The stall frequencies are measured from single runs; they are environmental and vary run to run.
-
-## Acceptance and evidence
-
-The sole gate is `node scripts/test/ci-gate.mjs` (19 stages); community builds use `LOCALBRIDGE_BUILD_PROFILE=community`. Successful local partial stages are not a full gate PASS. Final run IDs and links are recorded in the delivery message rather than by re-committing this document; the three expected runs on this head are the acceptance object, and artifact verification (TEST-REPORT.json PASS, provenance, SHA256 manifest, installer checksum match, bundled/community separation) is performed against those runs.
+- Local execution of Rust tests, clippy, NSIS packaging and the full gate: no
+  MSVC/Windows SDK locally; these establish acceptance only in cloud CI.
+- Dynamic duplicate-execution fixture (injected submission timeout with
+  countable side effects, orphan liveness, workflow re-application counts):
+  needs a Rust toolchain; the production orphan-execution hazard is documented
+  from code, not yet demonstrated by a fixture.
+- Live ChatGPT connection, interactive UAC elevation, and a clean Windows
+  installation of the produced installer: outside this phase; recorded
+  NOT_RUN in `TEST-REPORT.json` `environmentAcceptance`.
+- The inner cause of the degraded-runner stalls remains unexplained; fixes
+  rest on measured degradation, the timeout-clock investigation and the
+  contrast run.
+- Residual exposure unchanged from the previous cycle: the JS
+  `settleAcceptedPublicCommand` throws on a submission-level
+  `OperationTimedOut`, and `revision46.mjs` workflow prepare/edit/verify has no
+  retry (a failed attempt terminalizes the workflow; the edit patch is not
+  re-applicable without workspace cleanup). Both are designed against real
+  evidence only if a run fails there.
