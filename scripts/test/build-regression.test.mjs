@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { stageBroker } from "../prepare-lb018-resources.mjs";
 import { updateManifest } from "./update-tunnel.mjs";
-import { verifyRuntime, verifyHash, sha256, rejectExtras } from "./runtime-integrity.mjs";
+import { verifyRuntime, verifyHash, sha256, rejectExtras, installerEntryPaths, rejectDuplicateInstallerEntries } from "./runtime-integrity.mjs";
 import { runStages } from "./process.mjs";
 import { validateCheckout } from "./source-check.mjs";
 
@@ -85,6 +85,20 @@ test("required hash checks reject missing, empty and corrupt files", () => {
   assert.throws(() => rejectExtras(directory, []), /remove manually/);
 });
 
+test("installer payload census rejects duplicate entries that would overwrite attested files", () => {
+  const listing = [
+    "Path = D:/run/src-tauri/target/release/bundle/nsis/LocalBridge_0.1.5_x64-setup.exe",
+    "Path = localbridge.exe",
+    "Path = localbridge-privileged-broker.exe",
+    "Path = runtime/python/python.exe",
+    "Path = localbridge-privileged-broker.exe",
+  ].join("\r\n") + "\r\n";
+  const paths = installerEntryPaths(listing);
+  assert.deepEqual(paths, ["localbridge.exe", "localbridge-privileged-broker.exe", "runtime/python/python.exe", "localbridge-privileged-broker.exe"]);
+  assert.throws(() => rejectDuplicateInstallerEntries(paths), /localbridge-privileged-broker\.exe more than once/);
+  assert.doesNotThrow(() => rejectDuplicateInstallerEntries(installerEntryPaths("Path = archive\r\nPath = a\r\nPath = B\r\n")));
+});
+
 test("complete bundled trees pass; changed runtime source fails", () => {
   assert.equal(verifyRuntime(root, { bundledOnly: true }).status, "PASS");
   const directory = fixture();
@@ -111,6 +125,19 @@ test("complete bundled trees pass; changed runtime source fails", () => {
   put(directory, configPath, JSON.stringify({ ...JSON.parse(config), bundle: { ...JSON.parse(config).bundle, resources: {} } }));
   assert.throws(() => verifyRuntime(directory), /attested staged broker/);
   put(directory, configPath, config);
+  const stagedBrokerPath = "src-tauri/target/release-stage/localbridge-privileged-broker.exe";
+  const evidencePath = "src-tauri/target/release-stage/broker-build.json";
+  const stagedBroker = readFileSync(join(directory, stagedBrokerPath));
+  const evidenceJson = readFileSync(join(directory, evidencePath));
+  put(directory, stagedBrokerPath, "tampered-staged-broker");
+  assert.throws(() => verifyRuntime(directory), /SHA256 mismatch/);
+  put(directory, stagedBrokerPath, stagedBroker);
+  put(directory, evidencePath, JSON.stringify({ ...JSON.parse(evidenceJson), status: "BUILDING" }));
+  assert.throws(() => verifyRuntime(directory), /broker build incomplete/);
+  put(directory, evidencePath, "");
+  assert.throws(() => verifyRuntime(directory), /missing/);
+  put(directory, evidencePath, evidenceJson);
+  assert.equal(verifyRuntime(directory).status, "PASS");
   const aria = "src-tauri/target/toolbox-stage/bin/aria2c.exe";
   put(directory, aria, "corrupt");
   assert.throws(() => verifyRuntime(directory), /mismatch/);

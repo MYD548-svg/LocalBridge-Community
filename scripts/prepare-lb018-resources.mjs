@@ -32,7 +32,7 @@ export function prepareResources() {
   for (const path of ["runtime/python/python.exe", "runtime/coding-tools-mcp/coding_tools_mcp/__init__.py", "runtime/tunnel-client/tunnel-client.exe", "runtime-manifest.toml", "runtime-policy.toml", "LICENSE", "THIRD_PARTY_NOTICES.md"]) requiredFile(resolve(root, path));
   if (/cloudflared|cloudflare managed/i.test(readFileSync(resolve(root, "runtime-manifest.toml"), "utf8"))) throw new Error("obsolete runtime manifest");
   run(process.execPath, ["scripts/prepare-toolbox.mjs"]);
-  stageBroker(root, () => run("cargo", ["+1.85.0", "build", "--manifest-path", "src-tauri/Cargo.toml", "--target-dir", "src-tauri/target", "--locked", "--release", "--bin", "localbridge-privileged-broker"]));
+  stageBroker(root, () => run("cargo", ["+1.85.0", "build", "--manifest-path", "src-tauri/Cargo.toml", "--target-dir", "src-tauri/target", "--locked", "--release", "--features", "privileged-broker", "--bin", "localbridge-privileged-broker"]));
   console.log("LB018_RELEASE_RESOURCES=PASS broker=release toolbox=pinned");
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) prepareResources();

@@ -16,9 +16,18 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 name = "localbridge"
 path = "src/main.rs"
 
+[features]
+# The privileged broker is built and attested standalone by
+# scripts/prepare-lb018-resources.mjs. Gating the [[bin]] behind this feature
+# keeps it out of the bundler's binary list; without the gate, tauri's NSIS
+# template installs the app-feature-set copy from target/release over the
+# resources-mapped attested staged broker.
+privileged-broker = []
+
 [[bin]]
 name = "localbridge-privileged-broker"
 path = "bin/privileged-broker/main.rs"
+required-features = ["privileged-broker"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

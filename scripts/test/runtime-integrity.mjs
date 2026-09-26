@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -40,6 +42,42 @@ export function value(source, key) {
   const matches = [...source.matchAll(new RegExp(`^${key} = "([^"]+)"`, "gm"))];
   if (matches.length !== 1) throw new Error(`expected exactly one field: ${key}`);
   return matches[0][1];
+}
+// The `7z l -slt` header block is followed by one `Path = …` per payload entry;
+// the first Path names the archive itself.
+export function installerEntryPaths(listingText) {
+  return [...listingText.matchAll(/^Path = (.+)$/gm)].map((match) => match[1]).slice(1);
+}
+export function rejectDuplicateInstallerEntries(paths) {
+  const seen = new Set();
+  for (const path of paths) {
+    const key = path.toLowerCase();
+    if (seen.has(key)) {
+      throw new Error(`installer payload declares ${path} more than once; a later entry would silently overwrite the attested file`);
+    }
+    seen.add(key);
+  }
+}
+function verifyInstallerPayload(root, evidence) {
+  const bundleDir = join(root, "src-tauri/target/release/bundle/nsis");
+  if (!existsSync(bundleDir)) return;
+  const installers = filesBelow(bundleDir).filter((name) => name.endsWith("-setup.exe"));
+  if (installers.length === 0) return;
+  if (installers.length > 1) throw new Error(`unexpected installers; remove manually:\n${installers.join("\n")}`);
+  const installer = join(bundleDir, installers[0]);
+  const sevenZip = join(root, "src-tauri/target/toolbox-stage/bin/7z.exe");
+  const listing = spawnSync(sevenZip, ["l", "-slt", installer], { encoding: "utf8", windowsHide: true });
+  if (listing.status !== 0 || !listing.stdout) throw new Error(`installer listing failed (${listing.status ?? listing.error})`);
+  const paths = installerEntryPaths(listing.stdout);
+  rejectDuplicateInstallerEntries(paths);
+  const brokerEntry = paths.find((path) => path.toLowerCase() === "localbridge-privileged-broker.exe");
+  if (!brokerEntry) throw new Error("installer payload does not carry the attested privileged broker");
+  // Extraction is retained: this repository forbids automatic bulk deletion.
+  const extraction = mkdtempSync(join(tmpdir(), "localbridge-installer-verify-"));
+  const unpacked = spawnSync(sevenZip, ["x", "-y", `-o${extraction}`, installer, brokerEntry], { windowsHide: true });
+  if (unpacked.status !== 0) throw new Error(`installer broker extraction failed (${unpacked.status ?? unpacked.error})`);
+  verifyHash(join(extraction, brokerEntry), evidence.sha256);
+  console.log(`installer payload verified; broker extraction retained at ${extraction}`);
 }
 export function verifyRuntime(root, { bundledOnly = false, lockFile = "provenance/runtime-lock.json" } = {}) {
   const manifest = readFileSync(join(root, "runtime-manifest.toml"), "utf8");
@@ -109,6 +147,11 @@ export function verifyRuntime(root, { bundledOnly = false, lockFile = "provenanc
   if (config?.bundle?.resources?.["target/release-stage/localbridge-privileged-broker.exe"] !== "localbridge-privileged-broker.exe") {
     throw new Error("installer must embed the attested staged broker; check bundle.resources");
   }
+  // Config mapping alone does not prove the installer content: when a packaged
+  // NSIS installer already exists in this checkout, open it and verify the
+  // actually carried broker against the same evidence, and that no later
+  // duplicate entry overwrites it.
+  verifyInstallerPayload(root, evidence);
   rejectExtras(dirname(broker), ["localbridge-privileged-broker.exe", "broker-build.json"]);
   }
   return { status: "PASS", coverage: bundledOnly ? "bundled-only" : "bundled-and-staged" };
