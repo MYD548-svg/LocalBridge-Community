@@ -251,7 +251,7 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
         command: "Start-Sleep -Seconds 4; Write-Output LB_QUEUE_BLOCKER_DONE",
         shell: "windows_powershell",
         yield_time_ms: 10_000,
-        timeout_ms: 20_000,
+        timeout_ms: 60_000,
       },
       "queue-blocker",
     );
@@ -301,7 +301,23 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
     );
     assert.ok(cancelledQueued.elapsed_ms < 1_000, explain(cancelledQueued));
     assertToolError(await queued, "ProcessCancelled");
-    assert.equal(assertSuccess(await blocker).status, "completed");
+    const blockerTerminal = await settleAcceptedPublicCommand({
+      initialResponse: await blocker,
+      callTool: (name, args, requestId) => toolCall(client, name, args, requestId),
+      requestPrefix: "queue-blocker-poll",
+    });
+    const blockerData = assertSuccess(blockerTerminal);
+    assert.equal(blockerData.status, "completed", explain(blockerTerminal));
+    const blockerStdout = assertSuccess(await toolCall(
+      client,
+      "command_control",
+      { action: "read", output_ref: blockerData.output_refs.stdout, stream: "stdout" },
+      "queue-blocker-output",
+    ));
+    assert.ok(
+      blockerStdout.content.includes("LB_QUEUE_BLOCKER_DONE"),
+      explain(blockerStdout),
+    );
     assertToolError(
       await toolCall(
         client,

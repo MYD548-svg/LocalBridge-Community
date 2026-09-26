@@ -94,3 +94,20 @@ test("accepted command settlement reuses its stable public session identity", as
   );
   assert.equal(calls[0][1].session_id, "lb-session-initial");
 });
+
+test("already terminal first responses settle without polling", async () => {
+  const completed = response({ status: "completed" });
+  const calls = [];
+  assert.equal(
+    await settleAcceptedPublicCommand({
+      initialResponse: completed,
+      callTool: async (...args) => {
+        calls.push(args);
+        return completed;
+      },
+      requestPrefix: "settle",
+    }),
+    completed,
+  );
+  assert.equal(calls.length, 0);
+});
