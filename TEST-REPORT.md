@@ -1,61 +1,55 @@
-# LocalBridge CI repair verification — 2026-09-20
+# LocalBridge CI repair verification — 2026-09-26
 
 ## Status
 
 **CLOUD ACCEPTANCE IN PROGRESS — LOCAL NON-LINK CHECKS VERIFIED; LINK-TYPE STAGES CLOUD-ONLY.**
 
-Branch: `codex/fix-ci-validation`, PR #1 → `main` in `MYD548-svg/LocalBridge-Community`. Commit chain for this repair cycle: `2786aac` (gate unification, Linux Go prerequisite, probe rewrite, Guard regression, auth-repeat) → `1ca0c35` (source-check realpath normalization for 8.3 runner temp) → `f0269f1` (fixture canonicalization) → `708c6d9` (probe mirrors production Guard streamable-HTTP contract) → `ea1f745` (rustfmt canonical form) → `0423e26` (probe concurrency fix + report) → this commit (probe idle-connection handling + widened test windows).
+Branch: `codex/fix-ci-validation`, PR #1 → `main` in `MYD548-svg/LocalBridge-Community`. Commit chain for this repair cycle: `9add3d6` (probe idle-connection handling, prior cycle) → `ca81c21` (revision46 queue blocker settled through the accepted-command terminal driver) → `4a5872f` (Rust test support treats bounded command-control timeouts as pending) → `abae096` (schema27 scenario commands carry explicit degraded-runner budgets) → `af8bb74` (`wait_for_output` satisfies when the marker arrives with the terminal response) → this report commit.
 
-## Cloud evidence on `ea1f745` and `0423e26` (all runs FAIL at auth-repeat)
+## Cloud evidence on `9add3d6` (all three expected runs FAIL at rust-test)
 
-| Head | Run | Workflow | Event | First failure |
+| Head | Run | Workflow | Event | Result |
 | --- | --- | --- | --- | --- |
-| `ea1f745` | `35446550872` | CI | push | `auth-1` FAIL (exit 101) |
-| `ea1f745` | `35446552469` | CI | pull_request | `auth-1` FAIL after 478.0s (exit 101) |
-| `ea1f745` | `35446552470` | LocalBridge Community Build | pull_request | `auth-1` PASS (345.6s), `auth-2` FAIL after 57.6s (exit 101) |
-| `0423e26` | `35454187616` | CI | push | `auth-1` FAIL after 459.1s (exit 101) |
-| `0423e26` | `35454190068` | CI | pull_request | `auth-1` FAIL (exit 101) |
-| `0423e26` | `35454190097` | LocalBridge Community Build | pull_request | `auth-1` FAIL after 483.8s (exit 101) |
+| `9add3d6` | `35456808403` | CI | push | rust-test FAIL: `revision46_reported_failures_are_rechecked_through_the_external_client` |
+| `9add3d6` | `35456809857` | CI | pull_request | rust-test FAIL: same revision46 assertion |
+| `9add3d6` | `35456809851` | LocalBridge Community Build | pull_request | rust-test FAIL: 402 passed / 4 failed (lib); Linux upstream-tests job PASS |
 
-All preceding gate stages passed in every run, including `format`, `runtime-resources` (859.9s, broker build) and `staged-integrity`. `rust-test`, `rust-clippy`, `nsis-package`, `package-integrity` and `artifacts` have not executed on any head since the stage order places them after `auth-repeat`.
+All stages before `rust-test` passed in every run, including `auth-repeat` on both profiles. `rust-clippy`, `nsis-package`, `package-integrity` and `artifacts` were not reached.
 
-### Evidence-backed root cause (two layers)
+### Failure taxonomy (evidence-backed, from the three job logs)
 
-**Layer 1 — serial probe serving (`ea1f745`).** The failing assertion reports `no authenticated MCP initialization before deadline`. The real client's startup traffic is concurrent: the OAuth WWW-Authenticate probe (POST then GET on the MCP URL, 1s deadline), the RFC 9728 discovery GETs and the MCP initialize POST (2s deadline) share one keep-alive HTTP client (`pkg/oauth/module.go`, `pkg/mcpclient/fxmodule.go` of the pinned client). The probe's test double served connections serially; concurrent connections stalled past those deadlines and the client abandoned the initialize. The intermittent signature (Community run: `auth-1` passed, `auth-2` failed) matches a race, not a product defect: the authorized `POST /mcp` observation confirms the production authentication path itself.
+1. **revision46 first-response assertion (both CI runs).** `tests/black-box/chatgpt/revision46.mjs:304` asserted `assertSuccess(await blocker).status === "completed"` on the first response of a `yield_time_ms: 10_000` command. The cloud returned the documented non-terminal `running` (the PowerShell start plus 4 s of work did not fit the yield window on that runner). The scenario already had `settleAcceptedPublicCommand` available and used it in six other places.
+2. **Rust test helpers treated a bounded timeout as terminal (Community run, 3 of 4).** `settle_public_command` (test_support.rs:602) and `DetachedCommand::wait_for_output` (test_support.rs:509) panicked on poll responses whose `structuredContent.data` is null. The production contract (facade.rs:2135 keeps the Execution non-terminal on `OperationTimedOut` for command_control actions; remediation: "poll later to observe the same Execution") makes that response a keep-polling signal: the cloud payloads read `code: OperationTimedOut, phase: transport, retryable: true, data: null`. The helpers' poll budgets (`wait_ms` 25/100/1000) expired whenever the private runtime answered slowly.
+3. **A real process timeout (Community run, 1 of 4).** `schema27_public_facade_runtime_semantics_are_real_end_to_end` observed `ProcessTimedOut` after 30 702 ms with zero output for a command that completes in ~1 s when healthy. `run_bounded_command` starts the timeout clock at `ResumeThread`, so queue/accept time is excluded and the PowerShell process itself ran ~30 s producing nothing. The same degraded window is measured inside the run: a trivial `Write-Output` command needed 21 poll rounds (~20 s+) before admission. Attribution: runner degradation (cold process start / AV / load), not a production-logic defect — the 30 s default `timeout_ms` was inherited by omission, while sibling scenarios in the same file already pass explicit `timeout_ms: 120000`.
 
-**Layer 2 — unsolicited 404 on idle probe connections (`0423e26`).** After the concurrency fix, all three runs still failed, and the observation sequence shifted to exactly: two connections with **no request bytes at all**, `GET /mcp` (authorized), the two RFC 9728 discovery GETs, and still no initialize. Reading the pinned client and its Go SDK (`go-sdk v1.4.1`) shows:
+### Fixes (test code only; no production change; no assertion weakened)
 
-- the client dial-and-write path means an observation with zero request bytes is a connection the transport dialed but had not yet written its request to (or an abandoned attempt);
-- the double answered every silent connection after 1s with an **unsolicited 404 and close** — something a real HTTP server never does;
-- `connectStartupProbe` (`pkg/mcpclient/fxmodule.go`) wraps such a transport failure as `ErrRejected` and the client **never retries the initialize**.
+1. `ca81c21` — the revision46 blocker is settled through the existing `settleAcceptedPublicCommand` (stable `session_id` from the initial response, `running`/`OperationTimedOut` both non-terminal, one absolute 60 s deadline), still requires `completed`, now also verifies the expected `LB_QUEUE_BLOCKER_DONE` stdout via the output handle, and keeps the queued-request cancellation and no-file-side-effect assertions. The blocker's `timeout_ms` was raised 20 000 → 60 000 with the measured degraded-start evidence; nothing asserts a timeout outcome. `command_lifecycle.test.mjs` gained the "already terminal first response settles without polling" case (existing four cases retained).
+2. `4a5872f` — a pure `CommandPollObservation` classifier (`Running` / `BoundedWaitExpired` / `Terminal` / `Invalid`) derived from the facade response contract is now shared by `settle_public_command`, `DetachedCommand::wait_for_output` and `poll_public_command_to_terminal`. `OperationTimedOut` continues polling the same stable session without resetting the absolute deadline; terminal failures and typed errors still report immediately; a timeout before any session identity was delivered panics explicitly. Unit-tested against payload shapes taken verbatim from the cloud logs. The now-unused `DetachedCommand::status()` was removed.
+3. `abae096` — the schema27 scenario command and its settle-fed siblings (`quoted`, `powershell_error`, `cmd_cd_switch`, `auto_utf8`, `autoload`) declare explicit `timeout_ms: 120000`, matching the file's existing convention (baseline, r1, schema28_detached); the schema27 poll loop treats a bounded timeout as pending and its convergence deadline is 150 s. Production timeout semantics are unchanged — no timeout was raised in production code, and `ProcessTimedOut` remains a terminal failure everywhere.
+4. `af8bb74` — `wait_for_output` treats "marker observed in the terminal response" as satisfied instead of panicking, per the observe-then-classify contract.
 
-A request written onto one of those connections in the closing window is therefore swallowed unobserved and unretried. A local reproduction with the same bundled `tunnel-client.exe`, the same flags and a byte-compatible double that (like a real server) leaves silent connections alone reached `mcp session initialized` in **14 ms** — confirming the client and the double's response contract are compatible and the failure is the idle-connection handling plus runner startup variance.
+## Original-snapshot contrast (goal §5)
 
-### Fix in this commit (test code only, no production change)
+- **A (original):** import snapshot `5ea0e25` on branch `codex/upstream-contrast-5ea0e25`; **B (current):** this head. The failing test code is byte-identical between A and B (verified by Git object comparison in the previous cycle for `test_support.rs`, `server.rs` modulo the auth regression test, and `tests/black-box/chatgpt/`).
+- **Method:** one helper commit on the contrast branch adds `.github/workflows/upstream-contrast.yml` (run condition only — no business, test, or assertion change) which runs the same gate stages `node scripts/test/ci-gate.mjs --through rust-test` on `windows-latest` with the same toolchain versions as the task branch's gate. Build outputs are isolated by construction (fresh runner, fresh checkout).
+- **Status:** the contrast branch push was blocked at write time by intermittent `github.com:443` connection resets from the local network (the task-branch pushes of the same window went through after retries); the contrast runs and their verdict are recorded in the delivery message. Until that verdict exists, dynamic attribution to the original snapshot remains open; the static identity argument above is the evidence of record. Classification will follow the goal §5.4 table (both fail with the same signature ⇒ original-code reproduction in this environment; original passes ⇒ timing/load/profile sensitivity; original cannot run ⇒ blocked, recorded as such).
 
-1. `serve_probe_connection` no longer responds to connections that have not produced a request: it keeps waiting on an idle connection (up to a 60s idle deadline) and closes silently on peer-close or idle timeout — mirroring real server behavior and removing the request-swallowing race. All Guard contract responses are unchanged (`708c6d9`).
-2. Every accepted connection is served on its own thread (kept from `0423e26`).
-3. The observation window is widened from 10s to 30s and the probe server lifetime from 15s to 60s to absorb CI runner startup variance; no assertion was weakened or removed.
-
-## Executed local checks (2026-09-19/20, worktree including this fix)
+## Executed local checks (2026-09-26, worktree at this head)
 
 | Check | Actual result |
 | --- | --- |
-| Local gate `node scripts/test/ci-gate.mjs --through frontend-build` (toolchains, dependencies, tunnel-source, bundled-integrity, test-base, format, public-release, licenses, schema44, frontend-test, frontend-build) | **PASS — 11 stages** |
-| Rust format check (rustfmt 1.85.0, `--edition 2024 --check --config skip_children=true`) | PASS — re-run on this fix, `PRE_RELEASE_FORMAT_CHECK=PASS rust_files=1` |
-| Client-side compatibility reproduction: bundled `tunnel-client.exe` + same flags/env against a byte-compatible probe double | PASS — `mcp session initialized` (server `localbridge-ci-probe`) within 14 ms of the probe hook; OAuth discovery failure observed as non-blocking, matching production where the Guard serves no `/.well-known` metadata |
-| Pinned Tunnel source build with Go 1.26.2 (commit `8d55683`, `-SkipTests`, binary not registered) | PASS — `TUNNEL_BUILD=PASS`, version `0.0.11+8d55683` |
-| Bundled runtime integrity | PASS — included in gate run above |
-
-Toolchain inventory: Node 24.16, git 2.46, Rust 1.85.0 (rustup-managed), Go 1.26.2. MSVC/Windows SDK is intentionally not installed locally, therefore compile-and-link checks cannot run locally.
+| `node --test tests/black-box/chatgpt/command_lifecycle.test.mjs` | PASS — 5 tests (4 retained + 1 new) |
+| Rust format check (vendored rustfmt 1.85.0, `--edition 2024 --check --config skip_children=true`) on both changed Rust files | PASS |
+| cargo check (type-level, no linking) | NOT_RUN — fails at dependency build scripts requiring `link.exe`; MSVC/Windows SDK intentionally not installed locally |
+| Rust unit/black-box test execution locally | NOT_RUN — no MSVC; covered by the cloud gate |
 
 ## Not executed (NOT_RUN — must not be claimed as passed)
 
-- `rust-test`, `auth-repeat` execution, `rust-clippy`, `nsis-package`, `package-integrity`, `artifacts` locally: no MSVC/Windows SDK; these run only in cloud CI, which also establishes the acceptance evidence.
-- Complete upstream Go test suite: runs in the Community workflow's Linux prerequisite job (passed on `ea1f745`'s run; re-run triggers on the new head).
-- Live ChatGPT connection, interactive UAC and clean Windows installation: outside this phase.
-- Cloud acceptance for this head: pending; the three expected runs on this commit are the acceptance object.
+- Local `rust-test`, `auth-repeat`, `rust-clippy`, `nsis-package`, `package-integrity`, `artifacts`: no MSVC/Windows SDK; these establish acceptance only in cloud CI.
+- Live ChatGPT connection, interactive UAC, clean Windows installation: outside this phase (recorded in TEST-REPORT.json `environmentAcceptance`).
+- The `schema27` ProcessTimedOut inner cause (why the degraded process produced no output) is not directly observable from the job log; the fix rests on the measured degradation and the semantics investigation above. Residual uncertainty is stated rather than resolved.
 
 ## Acceptance and evidence
 
-The sole gate is `node scripts/test/ci-gate.mjs` (19 stages); community builds use `scripts/build-community.ps1` (`LOCALBRIDGE_BUILD_PROFILE=community`). Successful local partial stages are not a full gate PASS. Final run IDs and links are recorded in the delivery message rather than by re-committing this document; if this report is updated after pushing, the new head must re-qualify through the complete cloud acceptance (three runs, same head, recorded base).
+The sole gate is `node scripts/test/ci-gate.mjs` (19 stages); community builds use `LOCALBRIDGE_BUILD_PROFILE=community`. Successful local partial stages are not a full gate PASS. Final run IDs and links are recorded in the delivery message rather than by re-committing this document; the three expected runs on this head are the acceptance object, and artifact verification (TEST-REPORT.json PASS, provenance, SHA256 manifest, installer checksum match, bundled/community separation) is performed against those runs.
