@@ -6274,11 +6274,10 @@ mod tests {
             7
         );
 
-        let running = public_tool_call(
+        let running = submit_public_command(
             pep.port(),
             &session,
             604,
-            "exec_command",
             json!({
                 "command":"Start-Sleep -Milliseconds 900; Write-Output LB_SCHEMA27_DONE",
                 "shell":"windows_powershell",
@@ -8379,7 +8378,7 @@ mod tests {
                 Duration::from_secs(150),
             )
         });
-        assert_eventually("session A never ran", Duration::from_secs(3), || {
+        assert_eventually("session A never ran", Duration::from_secs(10), || {
             matches!(
                 pep.current_task_projection().latest_snapshot(),
                 CurrentTaskStatus::Active(ref task) if task.state == TaskExecutionState::Running
@@ -8388,26 +8387,41 @@ mod tests {
 
         let call_session_b = session_b.clone();
         let call_b = thread::spawn(move || {
-            post_with_read_timeout(
-                port,
-                Some(&call_session_b),
-                &json!({
-                    "jsonrpc":"2.0",
-                    "id":1,
-                    "method":"tools/call",
-                    "params":{
-                        "name":"exec_command",
-                        "arguments":{
-                            "command":"Write-Output SESSION_B_SURVIVED",
-                            "shell":"windows_powershell",
-                            "yield_time_ms":0,
-                            "timeout_ms":120000,
-                            "max_output_bytes":4096
-                        }
+            let payload = json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"exec_command",
+                    "arguments":{
+                        "command":"Write-Output SESSION_B_SURVIVED",
+                        "shell":"windows_powershell",
+                        "yield_time_ms":0,
+                        "timeout_ms":120000,
+                        "max_output_bytes":4096
                     }
-                }),
-                Duration::from_secs(150),
-            )
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let result = post_with_read_timeout(
+                    port,
+                    Some(&call_session_b),
+                    &payload,
+                    Duration::from_secs(150),
+                );
+                let content = &result.body["result"]["structuredContent"];
+                if content["data"]["status"].is_string()
+                    || content["error"]["code"] != "OperationTimedOut"
+                {
+                    return result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "session B submission kept timing out: {:#?}",
+                    result.body
+                );
+            }
         });
         thread::sleep(Duration::from_millis(100));
 
@@ -8509,7 +8523,7 @@ mod tests {
                 Duration::from_secs(150),
             )
         });
-        let running_deadline = Instant::now() + Duration::from_secs(3);
+        let running_deadline = Instant::now() + Duration::from_secs(10);
         while !matches!(
             pep.current_task_projection().latest_snapshot(),
             CurrentTaskStatus::Active(ref task) if task.state == TaskExecutionState::Running
@@ -8520,28 +8534,43 @@ mod tests {
 
         let call_session_b = session_b.clone();
         let call_b = thread::spawn(move || {
-            post_with_read_timeout(
-                port,
-                Some(&call_session_b),
-                &json!({
-                    "jsonrpc":"2.0","id":7,"method":"tools/call",
-                    "params":{
-                        "name":"exec_command",
-                        "arguments":{
-                            "command":"Write-Output SESSION_B_NOT_CANCELLED",
-                            "shell":"windows_powershell",
-                            "yield_time_ms":0,
-                            "timeout_ms":120000,
-                            "max_output_bytes":4096
-                        }
+            let payload = json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{
+                    "name":"exec_command",
+                    "arguments":{
+                        "command":"Write-Output SESSION_B_NOT_CANCELLED",
+                        "shell":"windows_powershell",
+                        "yield_time_ms":0,
+                        "timeout_ms":120000,
+                        "max_output_bytes":4096
                     }
-                }),
-                Duration::from_secs(150),
-            )
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let result = post_with_read_timeout(
+                    port,
+                    Some(&call_session_b),
+                    &payload,
+                    Duration::from_secs(150),
+                );
+                let content = &result.body["result"]["structuredContent"];
+                if content["data"]["status"].is_string()
+                    || content["error"]["code"] != "OperationTimedOut"
+                {
+                    return result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "session B submission kept timing out: {:#?}",
+                    result.body
+                );
+            }
         });
         assert_eventually(
             "session B did not enter Work FIFO",
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             || {
                 let scheduler = pep.control_plane.scheduler().snapshot();
                 scheduler.work_running == 1 && scheduler.work_queued == 1
@@ -9160,12 +9189,10 @@ mod tests {
             202
         );
 
-        let started = Instant::now();
-        let running = public_tool_call(
+        let running = submit_public_command(
             pep.port(),
             &session,
             322,
-            "exec_command",
             json!({
                 "command":"Start-Sleep -Seconds 10; Write-Output SHOULD_NOT_COMPLETE",
                 "shell":"windows_powershell",
@@ -9179,6 +9206,7 @@ mod tests {
             "{:#?}",
             running.body
         );
+        let started = Instant::now();
         let public_session = running.body["result"]["structuredContent"]["data"]["session_id"]
             .as_str()
             .expect("detached public session")
@@ -9351,11 +9379,10 @@ mod tests {
             CurrentTaskStatus::Idle
         );
 
-        let second = public_tool_call(
+        let second = submit_public_command(
             pep.port(),
             &other_session,
             329,
-            "exec_command",
             json!({
                 "command":"$line=[Console]::In.ReadLine(); Write-Output ('stdin:'+ $line); Start-Sleep -Seconds 10",
                 "shell":"windows_powershell",

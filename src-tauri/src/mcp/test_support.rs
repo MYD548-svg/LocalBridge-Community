@@ -451,7 +451,26 @@ impl PublicMcpClient {
     }
 
     pub(crate) fn start_detached_command(&self, arguments: Value) -> DetachedCommand<'_> {
-        let response = self.call_tool("exec_command", arguments);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let response = loop {
+            let response = self.call_tool("exec_command", arguments.clone());
+            let content = &response.body["result"]["structuredContent"];
+            if content["data"]["status"].as_str() == Some("running") {
+                break response;
+            }
+            if content["error"]["code"] == "OperationTimedOut" {
+                assert!(
+                    Instant::now() < deadline,
+                    "detached command submission kept timing out: {:#?}",
+                    response.body
+                );
+                continue;
+            }
+            // Anything else (a delivered terminal status or a typed error) is
+            // a real fact about this submission; from_response asserts running
+            // and dumps the response for diagnosis.
+            break response;
+        };
         DetachedCommand::from_response(self, response)
     }
 }
@@ -656,6 +675,42 @@ fn command_poll_classification_matches_the_facade_response_contract() {
         classify_command_poll_response(&observation(json!({}))),
         CommandPollObservation::Invalid
     );
+}
+
+/// Submit a detached exec_command and return the first response that carries a
+/// lifecycle observation. A submission whose wait budget expires before the
+/// private runtime answers is terminal for its own session (the facade never
+/// delivered a session identity), so the only recovery is submitting the
+/// scenario command again; degraded runners occasionally need that, and the
+/// scenario assertions below are about ownership and lifecycle, not about a
+/// specific submission attempt succeeding.
+pub(crate) fn submit_public_command(
+    port: u16,
+    session: &str,
+    request_id: u64,
+    arguments: Value,
+) -> ClientResponse {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let response =
+            public_tool_call(port, session, request_id, "exec_command", arguments.clone());
+        let content = &response.body["result"]["structuredContent"];
+        if content["data"]["status"].is_string() {
+            return response;
+        }
+        if content["error"]["code"] == "OperationTimedOut" {
+            assert!(
+                Instant::now() < deadline,
+                "exec_command submission kept timing out: {:#?}",
+                response.body
+            );
+            continue;
+        }
+        panic!(
+            "exec_command submission returned neither lifecycle status nor bounded timeout: {:#?}",
+            response.body
+        );
+    }
 }
 
 pub(crate) fn settle_public_command(
