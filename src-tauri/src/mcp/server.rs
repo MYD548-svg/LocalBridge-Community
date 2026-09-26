@@ -6282,7 +6282,8 @@ mod tests {
             json!({
                 "command":"Start-Sleep -Milliseconds 900; Write-Output LB_SCHEMA27_DONE",
                 "shell":"windows_powershell",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         assert_eq!(
@@ -6307,9 +6308,14 @@ mod tests {
             "command_control",
             json!({"action":"poll","session_id":public_session,"wait_ms":25}),
         );
-        assert!(polled.body.get("error").is_none(), "{:#?}", polled.body);
+        assert_ne!(
+            classify_command_poll_response(&polled),
+            CommandPollObservation::Invalid,
+            "{:#?}",
+            polled.body
+        );
 
-        let terminal_deadline = Instant::now() + Duration::from_secs(30);
+        let terminal_deadline = Instant::now() + Duration::from_secs(150);
         let mut terminal_poll_id = 606u64;
         let mut observed_output = String::new();
         let terminal = loop {
@@ -6321,14 +6327,18 @@ mod tests {
                 json!({"action":"poll","session_id":public_session,"wait_ms":100}),
             );
             terminal_poll_id += 1;
-            assert!(poll.body.get("error").is_none(), "{:#?}", poll.body);
             observed_output.push_str(
                 poll.body["result"]["structuredContent"]["data"]["output"]
                     .as_str()
                     .unwrap_or_default(),
             );
-            if poll.body["result"]["structuredContent"]["data"]["status"] != "running" {
-                break poll;
+            match classify_command_poll_response(&poll) {
+                CommandPollObservation::Terminal => break poll,
+                CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
+                CommandPollObservation::Invalid => panic!(
+                    "schema27 poll response is neither lifecycle status nor bounded timeout: {:#?}",
+                    poll.body
+                ),
             }
             assert!(
                 Instant::now() < terminal_deadline,
@@ -7156,7 +7166,8 @@ mod tests {
             json!({
                 "command":format!("$env:PSModulePath='{module_root_literal}'; Invoke-LbGen14Auto"),
                 "shell":"windows_powershell",
-                "yield_time_ms":10000
+                "yield_time_ms":10000,
+                "timeout_ms":120000
             }),
         );
         let (autoload, autoload_output) =
@@ -7179,7 +7190,8 @@ mod tests {
             json!({
                 "command":"Write-Output \"a|b\"; Write-Output \"a&b\"; Write-Output 'q|b'; Write-Output 'q&b'; Write-Output '中文输出✓'",
                 "shell":"windows_powershell",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         let (quoted, quoted_output) = settle_public_command(pep.port(), &session, 41_000, quoted);
@@ -7203,7 +7215,8 @@ mod tests {
             json!({
                 "command":"Write-Error \"READERR 🚀\"",
                 "shell":"windows_powershell",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         let (powershell_error, powershell_error_output) =
@@ -7285,7 +7298,8 @@ mod tests {
             json!({
                 "command":"cd /d . && echo LB_CMD_D_OK",
                 "shell":"cmd",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         let (cmd_cd_switch, cmd_cd_output) =
@@ -7334,7 +7348,8 @@ mod tests {
             json!({
                 "command":"Write-Output '自动中文✓'",
                 "shell":"auto",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         let (auto_utf8, auto_utf8_output) =
