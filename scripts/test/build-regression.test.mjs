@@ -88,7 +88,7 @@ test("required hash checks reject missing, empty and corrupt files", () => {
 test("complete bundled trees pass; changed runtime source fails", () => {
   assert.equal(verifyRuntime(root, { bundledOnly: true }).status, "PASS");
   const directory = fixture();
-  for (const path of ["runtime", "runtime-manifest.toml", "provenance/runtime-lock.json", "src-tauri/src/tunnel/bundle.rs", "src-tauri/src/mcp/bundle.rs"]) {
+  for (const path of ["runtime", "runtime-manifest.toml", "provenance/runtime-lock.json", "src-tauri/src/tunnel/bundle.rs", "src-tauri/src/mcp/bundle.rs", "src-tauri/tauri.conf.json"]) {
     mkdirSync(dirname(join(directory, path)), { recursive: true });
     cpSync(join(root, path), join(directory, path), { recursive: true });
   }
@@ -106,6 +106,11 @@ test("complete bundled trees pass; changed runtime source fails", () => {
   put(directory, "src-tauri/target/toolbox-stage/bin/curl.cmd", '@echo off\r\n"%SystemRoot%\\System32\\curl.exe" %*\r\n');
   stageBroker(directory, () => put(directory, "src-tauri/target/release/localbridge-privileged-broker.exe", "fixture-broker"));
   assert.equal(verifyRuntime(directory).status, "PASS");
+  const configPath = "src-tauri/tauri.conf.json";
+  const config = readFileSync(join(directory, configPath));
+  put(directory, configPath, JSON.stringify({ ...JSON.parse(config), bundle: { ...JSON.parse(config).bundle, resources: {} } }));
+  assert.throws(() => verifyRuntime(directory), /attested staged broker/);
+  put(directory, configPath, config);
   const aria = "src-tauri/target/toolbox-stage/bin/aria2c.exe";
   put(directory, aria, "corrupt");
   assert.throws(() => verifyRuntime(directory), /mismatch/);
