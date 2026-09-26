@@ -95,12 +95,21 @@ export function verifyRuntime(root, { bundledOnly = false, lockFile = "provenanc
     }
     const curl = '@echo off\r\n"%SystemRoot%\\System32\\curl.exe" %*\r\n';
     verifyHash(join(stage, "bin/curl.cmd"), sha256(curl));
-    const broker = join(root, "src-tauri/target/release-stage/localbridge-privileged-broker.exe");
-    const evidence = JSON.parse(requiredFile(join(root, "src-tauri/target/release-stage/broker-build.json")));
-    if (evidence.status !== "PASS") throw new Error("broker build incomplete");
-    verifyHash(broker, evidence.sha256);
-    verifyHash(join(root, "src-tauri/target/release/localbridge-privileged-broker.exe"), evidence.sha256);
-    rejectExtras(dirname(broker), ["localbridge-privileged-broker.exe", "broker-build.json"]);
+  const broker = join(root, "src-tauri/target/release-stage/localbridge-privileged-broker.exe");
+  const evidence = JSON.parse(requiredFile(join(root, "src-tauri/target/release-stage/broker-build.json")));
+  if (evidence.status !== "PASS") throw new Error("broker build incomplete");
+  verifyHash(broker, evidence.sha256);
+  // The installer embeds the staged, evidence-attested broker (tauri.conf
+  // bundle.resources copies it from target/release-stage). The app build
+  // legitimately recompiles the broker into target/release with the app
+  // feature set, so that build-tree copy is not comparable to the staged
+  // evidence; the property that must hold is that the installer's broker
+  // source of truth stays the attested staged binary.
+  const config = JSON.parse(requiredFile(join(root, "src-tauri/tauri.conf.json")));
+  if (config?.bundle?.resources?.["target/release-stage/localbridge-privileged-broker.exe"] !== "localbridge-privileged-broker.exe") {
+    throw new Error("installer must embed the attested staged broker; check bundle.resources");
+  }
+  rejectExtras(dirname(broker), ["localbridge-privileged-broker.exe", "broker-build.json"]);
   }
   return { status: "PASS", coverage: bundledOnly ? "bundled-only" : "bundled-and-staged" };
 }
