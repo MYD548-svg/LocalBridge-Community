@@ -249,17 +249,25 @@ pub(crate) fn control_command_during_work(
             Ok(()) => {}
             Err(ExecutionRegistryError::AlreadyTerminal { .. }) => {
                 // A concurrent control call observed the same process exit and
-                // finalized this Execution first. The durable terminal of this
-                // same execution is already recorded, so answering this poll
-                // with that replay reports the recorded fact instead of a
-                // fabricated terminal-state conflict.
+                // finalized this Execution first — the durable terminal of this
+                // same execution is already recorded, so the poll answers with
+                // that recorded outcome instead of a fabricated terminal-state
+                // conflict. The observation still carries the incremental
+                // output this caller has not seen yet, so the replay reports
+                // the durable outcome together with the observed output rather
+                // than an output-less envelope.
                 let settled = executions
                     .execution_for_public_session(&request.public_session_id)
                     .ok_or(CommandControlError::SessionUnavailable)?;
                 let ExecutionState::Terminal(terminal) = &settled.state else {
                     return Err(CommandControlError::ExecutionConflict);
                 };
-                return Ok(result_from_terminal(&settled, terminal));
+                let mut replayed = result_from_terminal(&settled, terminal);
+                replayed.stdout = observation.stdout;
+                replayed.stderr = observation.stderr;
+                replayed.exit_code = observation.exit_code;
+                replayed.truncated = observation.truncated;
+                return Ok(replayed);
             }
             Err(error) => return Err(map_execution_error(error)),
         }
@@ -670,7 +678,7 @@ mod tests {
                 status: RuntimeCommandStatus::Failed,
                 exit_code: Some(1),
                 signal: None,
-                stdout: String::new(),
+                stdout: "RACING_OBSERVED_OUTPUT".to_string(),
                 stderr: String::new(),
                 truncated: Some(false),
             })
@@ -719,6 +727,10 @@ mod tests {
         .expect("a poll that loses the finish race replays the durable terminal");
 
         assert_eq!(polled.status, RuntimeCommandStatus::Cancelled);
+        // The replay must carry the observed incremental output: the caller has
+        // not seen it yet, and dropping it breaks output-accumulating consumers
+        // (the schema27/r1 terminal-poll failures on 37659cc).
+        assert_eq!(polled.stdout, "RACING_OBSERVED_OUTPUT");
         assert!(matches!(
             registry
                 .execution_for_public_session(&public_session)

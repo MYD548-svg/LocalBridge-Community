@@ -64,16 +64,21 @@ Traced to the production call chain. The comment's claimed race is real, but
 the blanket test-side retry masked it instead of fixing it: in
 `control_command_during_work` (`control_plane/command_control.rs`) the
 poll-observation path mapped `ExecutionRegistryError::AlreadyTerminal`
-(concurrent finalizer won the `finish` race) to `ExecutionConflict`, surfaced
-as `SessionUnavailable` with the "terminal-state conflict" message - exactly
+(concurrent finalizer won the `finish` race - the upstream facade's
+`normalize_command_result` finalizes the shared file-backed registry on
+terminal observations) to `ExecutionConflict`, surfaced as
+`SessionUnavailable` with the "terminal-state conflict" message - exactly
 the 9a27919 failure signature. Fixed in production this cycle: when a poll
 loses the finish race it now replays the durable terminal of the same
-execution (mirroring the tolerated path already present for the runtime-error
-finalize path); it never fabricates or overrides a terminal. The test-side
-tolerance was **removed** so genuinely unavailable or unknown sessions surface
-as contract errors again. A deterministic regression test
+execution, carrying the observed incremental output (the first cut of this
+fix replayed an output-less envelope and broke the schema27/r1
+output-accumulating assertions on `37659cc` - caught by the cloud run and
+corrected); it never fabricates or overrides a terminal. The test-side
+tolerance was **removed** so genuinely unavailable or unknown sessions
+surface as contract errors again. A deterministic regression test
 (`poll_returns_the_durable_terminal_when_a_concurrent_call_won_the_finish_race`)
-reproduces the race with a concurrent-finalizer runtime mock.
+reproduces the race with a concurrent-finalizer runtime mock and asserts the
+observed output survives the replay.
 
 ### 071b5bf / 70340ec - resubmission after submission-budget timeout
 
