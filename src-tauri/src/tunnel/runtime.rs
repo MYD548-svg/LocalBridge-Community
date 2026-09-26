@@ -776,7 +776,11 @@ mod tests {
     // silently swallows the MCP initialize (connectStartupProbe wraps that
     // transport failure as ErrRejected and the client never retries it).
     // Connections without a request are therefore waited on or closed
-    // silently, exactly like an idle keep-alive connection.
+    // silently, exactly like an idle keep-alive connection. Like the
+    // production Guard, each connection then stays alive and serves further
+    // requests: closing after one response leaves a window where the client
+    // writes its next request onto the closing connection, and that swallowed
+    // initialize is never retried either.
     fn serve_probe_connection(
         mut stream: std::net::TcpStream,
         request_tx: mpsc::Sender<ProbeObservation>,
@@ -784,103 +788,108 @@ mod tests {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
         let idle_deadline = Instant::now() + Duration::from_secs(60);
-        let mut bytes = Vec::new();
-        let mut byte = [0_u8; 1];
-        while bytes.len() < 32_768 && !bytes.ends_with(b"\r\n\r\n") {
-            match stream.read(&mut byte) {
-                Ok(0) => return, // peer closed without a request: close silently
-                Ok(_) => bytes.push(byte[0]),
-                Err(_) if Instant::now() < idle_deadline => {} // idle connection: keep waiting
-                Err(_) => return,                              // idle past deadline: close silently
+        loop {
+            let mut bytes = Vec::new();
+            let mut byte = [0_u8; 1];
+            while bytes.len() < 32_768 && !bytes.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) => return, // peer closed: close silently
+                    Ok(_) => bytes.push(byte[0]),
+                    Err(_) if Instant::now() < idle_deadline => {} // idle: keep waiting
+                    Err(_) => return,                              // idle past deadline: close
+                }
             }
-        }
-        let headers = String::from_utf8_lossy(&bytes);
-        let length = headers
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        if length > 65_536 {
-            return;
-        }
-        let mut body = vec![0; length];
-        if stream.read_exact(&mut body).is_err() {
-            return;
-        }
-        let message: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-        let initialize = message["method"] == "initialize";
-        let observation = observe_probe_request(&headers, initialize);
-        let session = headers.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("mcp-session-id")
-                .then(|| value.trim().to_owned())
-        });
-        // Mirror the production Guard contract (mcp/server.rs): a sessionless
-        // GET /mcp is rejected with 400 session_id_required, initialize and
-        // tools/list responses carry Mcp-Session-Id, and the negotiated
-        // protocol version is echoed from the client request.
-        let (status, content_type, response, session_id) = if observation.path != "/mcp" {
-            (
-                "404 Not Found",
-                "application/json",
-                serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"endpoint_not_found","http_status":404}}).to_string(),
-                None,
-            )
-        } else if !observation.matches_authorization {
-            (
-                "401 Unauthorized",
-                "application/json",
-                serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"client_authentication_required","http_status":401}}).to_string(),
-                None,
-            )
-        } else if observation.method == "GET" {
-            match session {
-                Some(_) => ("204 No Content", "", String::new(), None),
-                None => (
-                    "400 Bad Request",
+            let headers = String::from_utf8_lossy(&bytes);
+            let length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if length > 65_536 {
+                return;
+            }
+            let mut body = vec![0_u8; length];
+            let mut body_read = 0;
+            while body_read < length {
+                match stream.read(&mut body[body_read..]) {
+                    Ok(0) => return,
+                    Ok(count) => body_read += count,
+                    Err(_) if Instant::now() < idle_deadline => {}
+                    Err(_) => return,
+                }
+            }
+            let message: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let initialize = message["method"] == "initialize";
+            let observation = observe_probe_request(&headers, initialize);
+            let session = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("mcp-session-id")
+                    .then(|| value.trim().to_owned())
+            });
+            // Mirror the production Guard contract (mcp/server.rs): a sessionless
+            // GET /mcp is rejected with 400 session_id_required, initialize and
+            // tools/list responses carry Mcp-Session-Id, and the negotiated
+            // protocol version is echoed from the client request.
+            let (status, content_type, response, session_id) = if observation.path != "/mcp" {
+                (
+                    "404 Not Found",
                     "application/json",
-                    serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"session_id_required","http_status":400}}).to_string(),
+                    serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"endpoint_not_found","http_status":404}}).to_string(),
                     None,
-                ),
-            }
-        } else if initialize {
-            (
-                "200 OK",
-                "application/json",
-                serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":{
-                    "protocolVersion":message["params"]["protocolVersion"].as_str().unwrap_or("2025-11-25"),
-                    "capabilities":{"tools":{}},
-                    "serverInfo":{"name":"localbridge-ci-probe", "version":"1"}
-                }})
-                .to_string(),
-                Some("localbridge-probe-session"),
-            )
-        } else if message["method"] == "tools/list" {
-            (
-                "200 OK",
-                "application/json",
-                serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":{"tools":[]}})
+                )
+            } else if !observation.matches_authorization {
+                (
+                    "401 Unauthorized",
+                    "application/json",
+                    serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"client_authentication_required","http_status":401}}).to_string(),
+                    None,
+                )
+            } else if observation.method == "GET" {
+                match session {
+                    Some(_) => ("204 No Content", "", String::new(), None),
+                    None => (
+                        "400 Bad Request",
+                        "application/json",
+                        serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"session_id_required","http_status":400}}).to_string(),
+                        None,
+                    ),
+                }
+            } else if initialize {
+                (
+                    "200 OK",
+                    "application/json",
+                    serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":{
+                        "protocolVersion":message["params"]["protocolVersion"].as_str().unwrap_or("2025-11-25"),
+                        "capabilities":{"tools":{}},
+                        "serverInfo":{"name":"localbridge-ci-probe", "version":"1"}
+                    }})
                     .to_string(),
-                Some("localbridge-probe-session"),
-            )
-        } else {
-            ("202 Accepted", "", String::new(), None)
-        };
-        let mut head = format!("HTTP/1.1 {status}\r\n");
-        if !content_type.is_empty() {
-            head.push_str(&format!("Content-Type: {content_type}\r\n"));
+                    Some("localbridge-probe-session"),
+                )
+            } else if message["method"] == "tools/list" {
+                (
+                    "200 OK",
+                    "application/json",
+                    serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":{"tools":[]}})
+                        .to_string(),
+                    Some("localbridge-probe-session"),
+                )
+            } else {
+                ("202 Accepted", "", String::new(), None)
+            };
+            let mut head = format!("HTTP/1.1 {status}\r\n");
+            if !content_type.is_empty() {
+                head.push_str(&format!("Content-Type: {content_type}\r\n"));
+            }
+            if let Some(id) = session_id {
+                head.push_str(&format!("Mcp-Session-Id: {id}\r\n"));
+            }
+            head.push_str(&format!("Content-Length: {}\r\n\r\n", response.len()));
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(response.as_bytes());
+            let _ = request_tx.send(observation);
         }
-        if let Some(id) = session_id {
-            head.push_str(&format!("Mcp-Session-Id: {id}\r\n"));
-        }
-        head.push_str(&format!(
-            "Content-Length: {}\r\nConnection: close\r\n\r\n",
-            response.len()
-        ));
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(response.as_bytes());
-        let _ = request_tx.send(observation);
     }
 
     #[test]
