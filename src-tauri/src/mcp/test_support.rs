@@ -779,6 +779,15 @@ pub(crate) fn poll_public_command_to_terminal(
         match classify_command_poll_response(&response) {
             CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
             CommandPollObservation::Terminal => return response,
+            // A cancellation that finalizes the Execution while this poll is
+            // in flight answers SessionUnavailable (terminal-state conflict)
+            // even though the durable terminal is already recorded; polling
+            // again after that race resolves returns the terminal replay. A
+            // permanently lost session keeps answering this error until the
+            // deadline below fails with the last response.
+            CommandPollObservation::Invalid
+                if response.body["result"]["structuredContent"]["error"]["code"]
+                    == "SessionUnavailable" => {}
             CommandPollObservation::Invalid => panic!(
                 "public command returned neither lifecycle status nor bounded timeout: {:#?}",
                 response.body
