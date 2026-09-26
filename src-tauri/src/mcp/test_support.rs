@@ -678,13 +678,17 @@ fn command_poll_classification_matches_the_facade_response_contract() {
 }
 
 /// Submit a detached exec_command and return the first response that carries a
-/// lifecycle observation. A submission whose wait budget expires before the
-/// private runtime answers is terminal for its own session (the facade never
-/// delivered a session identity), so the only recovery is submitting the
-/// scenario command again; degraded runners occasionally need that, and the
-/// scenario assertions below are about ownership and lifecycle, not about a
-/// specific submission attempt succeeding.
-pub(crate) fn submit_public_command(
+/// lifecycle observation.
+///
+/// Resubmission safety scope: a submission whose wait budget expires does NOT
+/// prove the command was not executed — the facade's private call timeout does
+/// not cancel the upstream request, so the first attempt may still run to its
+/// natural end as an orphaned execution whose public session was terminalized
+/// with the error. Resubmitting is therefore only justified for
+/// observation-only scenario commands (sleep/echo) whose duplicate cannot
+/// corrupt the workspace or the assertions; a command with persistent side
+/// effects must not use this helper.
+pub(crate) fn submit_side_effect_free_public_command(
     port: u16,
     session: &str,
     request_id: u64,
@@ -779,15 +783,10 @@ pub(crate) fn poll_public_command_to_terminal(
         match classify_command_poll_response(&response) {
             CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
             CommandPollObservation::Terminal => return response,
-            // A cancellation that finalizes the Execution while this poll is
-            // in flight answers SessionUnavailable (terminal-state conflict)
-            // even though the durable terminal is already recorded; polling
-            // again after that race resolves returns the terminal replay. A
-            // permanently lost session keeps answering this error until the
-            // deadline below fails with the last response.
-            CommandPollObservation::Invalid
-                if response.body["result"]["structuredContent"]["error"]["code"]
-                    == "SessionUnavailable" => {}
+            // No transient SessionUnavailable tolerance here: the production
+            // poll path replays the durable terminal when a concurrent control
+            // call finalizes the same Execution, and a genuinely unavailable
+            // or unknown session must surface as the contract error.
             CommandPollObservation::Invalid => panic!(
                 "public command returned neither lifecycle status nor bounded timeout: {:#?}",
                 response.body

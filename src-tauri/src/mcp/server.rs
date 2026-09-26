@@ -6274,7 +6274,7 @@ mod tests {
             7
         );
 
-        let running = submit_public_command(
+        let running = submit_side_effect_free_public_command(
             pep.port(),
             &session,
             604,
@@ -8406,6 +8406,10 @@ mod tests {
 
         let call_session_b = session_b.clone();
         let call_b = thread::spawn(move || {
+            // Resubmission safety: this scenario command only writes to stdout
+            // (no persistent side effects), so a timed-out first attempt that
+            // still runs upstream as an orphaned execution cannot corrupt the
+            // workspace or these assertions.
             let payload = json!({
                 "jsonrpc":"2.0",
                 "id":1,
@@ -8553,6 +8557,8 @@ mod tests {
 
         let call_session_b = session_b.clone();
         let call_b = thread::spawn(move || {
+            // Resubmission safety: stdout-only scenario command (no persistent
+            // side effects), same condition as the other resubmit loops.
             let payload = json!({
                 "jsonrpc":"2.0","id":7,"method":"tools/call",
                 "params":{
@@ -8733,6 +8739,25 @@ mod tests {
         assert!(
             call_result.body.get("result").is_some() || call_result.body.get("error").is_some(),
             "cancelled tools/call must terminate with a JSON-RPC response: {}",
+            call_result.body
+        );
+        // The 20s settle bound above is only a hang guard: the command's natural
+        // completion also fits inside it. The cancellation itself is proven by the
+        // terminal envelope — a naturally finished command would report a success
+        // envelope instead of the cancelled one.
+        assert_eq!(
+            call_result.body["result"]["isError"], true,
+            "cancelled tools/call must terminate as an error, not a natural completion: {:#?}",
+            call_result.body
+        );
+        assert_eq!(
+            call_result.body["result"]["structuredContent"]["error"]["code"], "ProcessCancelled",
+            "{:#?}",
+            call_result.body
+        );
+        assert_eq!(
+            call_result.body["result"]["structuredContent"]["data"]["status"], "cancelled",
+            "{:#?}",
             call_result.body
         );
         let presentation_deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -9208,7 +9233,7 @@ mod tests {
             202
         );
 
-        let running = submit_public_command(
+        let running = submit_side_effect_free_public_command(
             pep.port(),
             &session,
             322,
@@ -9398,7 +9423,7 @@ mod tests {
             CurrentTaskStatus::Idle
         );
 
-        let second = submit_public_command(
+        let second = submit_side_effect_free_public_command(
             pep.port(),
             &other_session,
             329,
