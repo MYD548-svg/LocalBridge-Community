@@ -7266,25 +7266,60 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!("PowerShell failure must retain stderr: {powershell_error_data:#?}")
             });
-        let retained_error = public_tool_call(
+        // A session-less command_control read serves through the facade
+        // execution guard; when a work request still holds it the control lane
+        // answers the contract's retryable RuntimeUnavailable instead. Retry
+        // only those retryable envelopes within a bounded deadline.
+        let retry_deadline = Instant::now() + Duration::from_secs(30);
+        let mut retained_error = public_tool_call(
             pep.port(),
             &session,
             7012,
             "command_control",
             json!({"action":"read","output_ref":stderr_ref,"stream":"stderr","offset":0,"limit":1048576}),
         );
+        while retained_error.body["result"]["structuredContent"]["error"]["retryable"] == true {
+            assert!(
+                Instant::now() < retry_deadline,
+                "session-less command_control read kept hitting the busy control lane: {:#?}",
+                retained_error.body
+            );
+            thread::sleep(Duration::from_millis(200));
+            retained_error = public_tool_call(
+                pep.port(),
+                &session,
+                7012,
+                "command_control",
+                json!({"action":"read","output_ref":stderr_ref,"stream":"stderr","offset":0,"limit":1048576}),
+            );
+        }
         assert_eq!(
             retained_error.body["result"]["isError"], false,
             "{:#?}",
             retained_error.body
         );
-        let mismatched_stream = public_tool_call(
+        let mut mismatched_stream = public_tool_call(
             pep.port(),
             &session,
             70121,
             "command_control",
             json!({"action":"read","output_ref":stderr_ref,"stream":"stdout","offset":0,"limit":100}),
         );
+        while mismatched_stream.body["result"]["structuredContent"]["error"]["retryable"] == true {
+            assert!(
+                Instant::now() < retry_deadline,
+                "session-less command_control read kept hitting the busy control lane: {:#?}",
+                mismatched_stream.body
+            );
+            thread::sleep(Duration::from_millis(200));
+            mismatched_stream = public_tool_call(
+                pep.port(),
+                &session,
+                70121,
+                "command_control",
+                json!({"action":"read","output_ref":stderr_ref,"stream":"stdout","offset":0,"limit":100}),
+            );
+        }
         let mismatch_error = &mismatched_stream.body["result"]["structuredContent"]["error"];
         assert_eq!(mismatch_error["code"], "InvalidArgument");
         assert_eq!(mismatch_error["details"]["field"], "stream");

@@ -58,6 +58,20 @@ export function rejectDuplicateInstallerEntries(paths) {
     seen.add(key);
   }
 }
+function resolveInstallerSevenZip(root) {
+  // The toolbox 7z.exe is 7za (7z2602-extra), which cannot parse NSIS
+  // archives (exit code 2). Full 7-Zip is preinstalled on the CI runner
+  // images; the toolbox copy is only the last resort.
+  const candidates = [
+    join(process.env["ProgramFiles"] ?? "C:\\Program Files", "7-Zip", "7z.exe"),
+    join(process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)", "7-Zip", "7z.exe"),
+    join(root, "src-tauri/target/toolbox-stage/bin/7z.exe"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error("no 7-Zip installation available for installer payload verification");
+}
 function verifyInstallerPayload(root, evidence) {
   const bundleDir = join(root, "src-tauri/target/release/bundle/nsis");
   if (!existsSync(bundleDir)) return;
@@ -65,7 +79,7 @@ function verifyInstallerPayload(root, evidence) {
   if (installers.length === 0) return;
   if (installers.length > 1) throw new Error(`unexpected installers; remove manually:\n${installers.join("\n")}`);
   const installer = join(bundleDir, installers[0]);
-  const sevenZip = join(root, "src-tauri/target/toolbox-stage/bin/7z.exe");
+  const sevenZip = resolveInstallerSevenZip(root);
   const listing = spawnSync(sevenZip, ["l", "-slt", installer], { encoding: "utf8", windowsHide: true });
   if (listing.status !== 0 || !listing.stdout) throw new Error(`installer listing failed (${listing.status ?? listing.error})`);
   const paths = installerEntryPaths(listing.stdout);

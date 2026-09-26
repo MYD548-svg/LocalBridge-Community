@@ -140,6 +140,39 @@ bundled/community evidence is kept separate by profile
 `community-verified-installer` / `community-diagnostics`,
 `BUILD-PROVENANCE.json` `profile` field).
 
+## Cycle regressions and pre-existing transients exposed by the review runs
+
+The first two review-push rounds surfaced four distinct issues; each was
+diagnosed from its job log before any retry:
+
+1. `37659cc` (all three runs, 407/408): the first cut of the finish-race
+   replay answered with an output-less envelope, breaking the
+   output-accumulating assertions in schema27 and r1 session-B. Fixed in
+   `050193d`: the replay carries the observed stdout/stderr/exit_code with
+   the durable outcome; the concurrent-finalizer regression test asserts the
+   output survives.
+2. `050193d` CI pull_request: rust-test PASSED (the replay fix is effective),
+   but my new installer check failed at `installer listing failed (2)` - the
+   toolbox `7z.exe` is 7za from `7z2602-extra.7z`, which cannot parse NSIS
+   archives. Fixed: the gate resolves a full 7-Zip first (preinstalled on CI
+   runner images), with the toolbox copy as last resort.
+3. `050193d` CI push: schema28's session-less `command_control read` is
+   served through the facade execution guard; when a work request still held
+   it, the single-shot read received the contract's retryable
+   `RuntimeUnavailable` ("control plane busy") and failed. Fixed test-side:
+   both session-less reads retry only `retryable: true` envelopes within a
+   bounded 30 s deadline.
+4. `050193d` Community pull_request: revision46's stream-probe polls observed
+   a durable `Lost` terminal - the production command_control error path
+   terminalized the execution on ANY non-OperationTimedOut error, including
+   retryable transport/control-lane transients (retryable errors carry
+   `retryable: true` by contract). Fixed in production: retryable errors now
+   keep the Execution non-terminal and the kill intent intact, exactly like
+   OperationTimedOut; non-retryable errors still terminalize. The JS
+   terminal driver classifies retryable error envelopes as pending for the
+   same reason, keyed on the envelope's contract flag rather than blanket
+   code matching, so genuinely unavailable sessions still surface.
+
 ## Original-snapshot contrast (verdict and limits, unchanged)
 
 Run 36218847261 (import snapshot `5ea0e25` + one workflow-only helper commit)
