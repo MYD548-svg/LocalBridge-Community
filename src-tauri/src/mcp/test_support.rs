@@ -506,6 +506,9 @@ impl<'a> DetachedCommand<'a> {
                 self.last_response.body
             );
             self.poll(1_000);
+            if self.output.contains(marker) {
+                break;
+            }
             match classify_command_poll_response(&self.last_response) {
                 CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
                 CommandPollObservation::Terminal => panic!(
