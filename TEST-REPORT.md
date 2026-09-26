@@ -4,7 +4,7 @@
 
 **CLOUD ACCEPTANCE IN PROGRESS — LOCAL NON-LINK CHECKS VERIFIED; LINK-TYPE STAGES CLOUD-ONLY.**
 
-Branch: `codex/fix-ci-validation`, PR #1 → `main` in `MYD548-svg/LocalBridge-Community`. Commit chain for this repair cycle: `9add3d6` (probe idle-connection handling, prior cycle) → `ca81c21` (revision46 queue blocker settled through the accepted-command terminal driver) → `4a5872f` (Rust test support treats bounded command-control timeouts as pending) → `abae096` (schema27 scenario commands carry explicit degraded-runner budgets) → `af8bb74` (`wait_for_output` satisfies when the marker arrives with the terminal response) → `6ea6a84` (this report, first revision) → `bf54898` (probe double serves repeated requests on one connection like the production Guard) → `071b5bf` (scenario commands resubmit when their submission wait budget expired) → this report revision.
+Branch: `codex/fix-ci-validation`, PR #1 → `main` in `MYD548-svg/LocalBridge-Community`. Commit chain for this repair cycle: `9add3d6` (probe idle-connection handling, prior cycle) → `ca81c21` (revision46 queue blocker settled through the accepted-command terminal driver) → `4a5872f` (Rust test support treats bounded command-control timeouts as pending) → `abae096` (schema27 scenario commands carry explicit degraded-runner budgets) → `af8bb74` (`wait_for_output` satisfies when the marker arrives with the terminal response) → `6ea6a84` (this report, first revision) → `bf54898` (probe double serves repeated requests on one connection like the production Guard) → `071b5bf` (scenario commands resubmit when their submission wait budget expired) → `de26450` (this report, second revision) → `70340ec` (the nested workflow retries when its command submission budget expired) → this report revision.
 
 ## Original-snapshot contrast verdict (goal §5, decided 2026-09-26)
 
@@ -18,15 +18,20 @@ Run `36218847261` ("Upstream Contrast", branch `codex/upstream-contrast-5ea0e25`
 
 Per the goal §5.4 table this is the "both versions fail with matching signatures" outcome: **the rust-test failures are present in the imported code and reproduce in this environment; they are not introduced by the task branch.** The contrast limitation is documented below (helper workflow commit, stage list of the 5ea0e25 gate).
 
-## Cloud evidence on the fix heads `abae096` / `6ea6a84` (docs-only difference between them)
+## Cloud evidence on the fix heads `abae096` / `6ea6a84` / `de26450`
 
 | Head | Run | Workflow | Event | Result |
 | --- | --- | --- | --- | --- |
 | `abae096` | `36218255642` | CI | push | auth-repeat FAIL: `auth-1..auth-6` PASS, `auth-7` probe race (runtime.rs:998, "no authenticated MCP initialization") |
 | `abae096` | `36218256983` | LocalBridge Community Build | pull_request | FAIL (auth-repeat stage) |
 | `6ea6a84` | `36218961677` / `36218963630` / `36218963629` | CI push / CI PR / Community PR | all | auth-repeat FAIL on the first probe round, same signature as `abae096` `auth-7` |
+| `de26450` | `36221409446` / `36221412164` | CI push / CI PR | both | **auth-repeat PASS (10/10, keep-alive probe fix effective)**; rust-test 406/407: one transient failure — `schema28_public` panicked at server.rs:6981 because the nested `agent_workflow` command submission surfaced a retryable `OperationTimedOut` (`request_deadline_expired`) |
 
-The mcp fixes themselves were not reached by these runs (auth-repeat precedes rust-test in the 19-stage gate). The probe failure is a residual test-double race, not a product defect: the observation sequence shows the client's full authenticated startup traffic (OAuth POST probe, session DELETE, sessionless GET, both RFC 9728 discovery GETs) and **no initialize at all** — the initialize POST was written onto a connection the one-shot double had already closed. Every double response carried `Connection: close`, so the shared keep-alive client opens a fresh connection per request in the clean case (verified by the local reproduction log), but a request written in the closing window of a served connection is swallowed and never retried (`connectStartupProbe` wraps the transport failure as `ErrRejected`). The same swallow existed in the original snapshot's probe (contrast run above).
+The mcp poll/submission fixes above were all exercised on `de26450`: every previously failing lib test passed, and the single remaining failure moved to the workflow command path — the same degraded-runner stall family (facade command budget `yield_time_ms` + 3 s for `yield_time_ms: 0` submissions; the workflow invocation's budget is `yield_time_ms: 10_000` + 3 s). The failed workflow attempt terminalizes its own checkpoint (`terminalize_legacy_checkpoint_failure`), so the test-side fix (`70340ec`) re-invokes the workflow until it submits, with all scenario assertions applied to the successful attempt. `70340ec` has not yet been cloud-verified; that is the current acceptance object.
+
+### Probe race root cause (fixed by `bf54898`, cloud-verified on `de26450`)
+
+The probe failure on `abae096`/`6ea6a84` was a residual test-double race, not a product defect: the observation sequence showed the client's full authenticated startup traffic (OAuth POST probe, session DELETE, sessionless GET, both RFC 9728 discovery GETs) and **no initialize at all** — the initialize POST was written onto a connection the one-shot double had already closed. Every double response carried `Connection: close`, so the shared keep-alive client opens a fresh connection per request in the clean case (verified by the local reproduction log), but a request written in the closing window of a served connection is swallowed and never retried (`connectStartupProbe` wraps the transport failure as `ErrRejected`). The same swallow existed in the original snapshot's probe (contrast run above). With the keep-alive double, auth-repeat passed 10/10 on both `de26450` CI runs.
 
 ## Cloud evidence on `9add3d6` (all three expected runs FAIL at rust-test)
 
@@ -52,6 +57,7 @@ All stages before `rust-test` passed in every run, including `auth-repeat` on bo
 4. `af8bb74` — `wait_for_output` treats "marker observed in the terminal response" as satisfied instead of panicking, per the observe-then-classify contract.
 5. `bf54898` — the probe test double now serves repeated requests on one connection (keep-alive loop, no `Connection: close`), mirroring the production Guard's connection lifecycle; per-request response contracts are unchanged. This removes the closing-window swallow of the initialize POST described above. Idle-connection behavior (wait, never answer) is retained from `9add3d6`.
 6. `071b5bf` — detached scenario submissions that expire their submission wait budget (facade budget = `yield_time_ms` + 3 s; the response then carries no session identity and the attempt is terminal) are resubmitted with a bounded 60 s deadline in the test support layer: `submit_public_command` for the cancel-ownership test's two submissions and schema27, a retry loop in both r1 session-B threads, and the same tolerance inside `start_detached_command`. The scheduler-readiness waits around those submissions are 3 s → 10 s. Scenario assertions (ownership, isolation, cancellation, output) are unchanged; a genuinely failing submission still panics with the response dump.
+7. `70340ec` — the nested `agent_workflow` invocation in schema28_public retries on the retryable `OperationTimedOut` that its command submission surfaced; the failed attempt terminalizes its own checkpoint, so each retry starts a fresh workflow and the scenario assertions apply to the successful attempt.
 
 ## Original-snapshot contrast (goal §5)
 
@@ -73,6 +79,7 @@ All stages before `rust-test` passed in every run, including `auth-repeat` on bo
 - Live ChatGPT connection, interactive UAC, clean Windows installation: outside this phase (recorded in TEST-REPORT.json `environmentAcceptance`).
 - The `schema27` ProcessTimedOut inner cause (why the degraded process produced no output) is not directly observable from the job log; the fix rests on the measured degradation, the timeout-clock investigation, and the original-snapshot contrast above. Residual uncertainty is stated rather than resolved.
 - The submission-timeout and probe-race frequencies on the runners are measured from single runs (probe race: `auth-7` of 10 rounds on `abae096`; submission timeout: once in the original-snapshot contrast); they are environmental and vary run to run.
+- Residual exposure, not yet observed in a cloud run: `revision46.mjs` `verifyWorkflowExecutionOwnership` (lines ~85-130) issues workflow prepare/edit/verify calls whose verify phase starts detached commands; a submission-level `OperationTimedOut` there would fail the scenario. A retry is not yet implemented because a failed attempt terminalizes the workflow and the edit's patch is not re-applicable without workspace cleanup; it will be designed against real evidence if a run ever fails there.
 
 ## Acceptance and evidence
 
