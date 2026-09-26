@@ -231,22 +231,38 @@ pub(crate) fn control_command_during_work(
         }
     });
     if let Some(outcome) = terminal_outcome {
-        executions
-            .finish(
-                &execution.id,
-                ExecutionTerminal {
-                    outcome,
-                    exit_code: observation.exit_code,
-                    signal: observation
-                        .signal
-                        .clone()
-                        .or_else(|| cancellation_signal.clone()),
-                    output_refs: Vec::new(),
-                    error_code: terminal_error_code(outcome).map(str::to_string),
-                    completed_at_ms: unix_time_ms(),
-                },
-            )
-            .map_err(map_execution_error)?;
+        let finish_result = executions.finish(
+            &execution.id,
+            ExecutionTerminal {
+                outcome,
+                exit_code: observation.exit_code,
+                signal: observation
+                    .signal
+                    .clone()
+                    .or_else(|| cancellation_signal.clone()),
+                output_refs: Vec::new(),
+                error_code: terminal_error_code(outcome).map(str::to_string),
+                completed_at_ms: unix_time_ms(),
+            },
+        );
+        match finish_result {
+            Ok(()) => {}
+            Err(ExecutionRegistryError::AlreadyTerminal { .. }) => {
+                // A concurrent control call observed the same process exit and
+                // finalized this Execution first. The durable terminal of this
+                // same execution is already recorded, so answering this poll
+                // with that replay reports the recorded fact instead of a
+                // fabricated terminal-state conflict.
+                let settled = executions
+                    .execution_for_public_session(&request.public_session_id)
+                    .ok_or(CommandControlError::SessionUnavailable)?;
+                let ExecutionState::Terminal(terminal) = &settled.state else {
+                    return Err(CommandControlError::ExecutionConflict);
+                };
+                return Ok(result_from_terminal(&settled, terminal));
+            }
+            Err(error) => return Err(map_execution_error(error)),
+        }
     }
 
     Ok(CommandControlResult {
@@ -613,6 +629,106 @@ mod tests {
             })
         ));
         assert_eq!(registry.cancellation_signal(&public_session), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Deterministic reproduction of the terminal-state finish race: a
+    /// concurrent control call finalizes the Execution between this poll's
+    /// registry read and its own `finish`, so this poll's `finish` hits
+    /// `AlreadyTerminal`. The poll must answer with the durable terminal of
+    /// the same execution — never a fabricated conflict, never the racing
+    /// observation's conflicting outcome.
+    #[derive(Debug)]
+    struct ConcurrentFinalizerRuntime {
+        registry: ExecutionRegistry,
+        public_session: PublicSessionId,
+    }
+
+    impl RuntimeCommandControl for ConcurrentFinalizerRuntime {
+        fn control_command(
+            &self,
+            _request: &RuntimeCommandRequest,
+        ) -> Result<RuntimeCommandObservation, RuntimeCommandControlError> {
+            let execution = self
+                .registry
+                .execution_for_public_session(&self.public_session)
+                .expect("racing execution still registered");
+            self.registry
+                .finish(
+                    &execution.id,
+                    ExecutionTerminal {
+                        outcome: TerminalOutcome::Cancelled,
+                        exit_code: None,
+                        signal: Some("KILL".into()),
+                        output_refs: Vec::new(),
+                        error_code: Some("ProcessCancelled".into()),
+                        completed_at_ms: unix_time_ms(),
+                    },
+                )
+                .expect("the concurrent observer wins the finish race");
+            Ok(RuntimeCommandObservation {
+                status: RuntimeCommandStatus::Failed,
+                exit_code: Some(1),
+                signal: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: Some(false),
+            })
+        }
+    }
+
+    #[test]
+    fn poll_returns_the_durable_terminal_when_a_concurrent_call_won_the_finish_race() {
+        let root = std::env::temp_dir().join(format!(
+            "localbridge-command-control-finish-race-{}-{}",
+            std::process::id(),
+            unix_time_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test workspace");
+        let registry =
+            ExecutionRegistry::open_at(root.join("executions.json")).expect("execution registry");
+        let public_session = PublicSessionId::new("public-finish-race");
+        let execution_id = registry
+            .start(TaskId::new("task-finish-race"), public_session.clone())
+            .expect("start execution");
+        registry
+            .bind_runtime_handle(
+                &execution_id,
+                RuntimeCommandHandle::new("private-finish-race"),
+            )
+            .expect("bind runtime handle");
+        registry
+            .request_cancellation(&public_session, "KILL")
+            .expect("accept cancellation intent");
+
+        let polled = control_command_during_work(
+            CommandControlRequest {
+                action: CommandControlAction::Poll,
+                chars: None,
+                signal: None,
+                wait_ms: 0,
+                request_id: RpcRequestId::String("poll-finish-race".into()),
+                public_session_id: public_session.clone(),
+            },
+            &registry,
+            &ConcurrentFinalizerRuntime {
+                registry: registry.clone(),
+                public_session: public_session.clone(),
+            },
+        )
+        .expect("a poll that loses the finish race replays the durable terminal");
+
+        assert_eq!(polled.status, RuntimeCommandStatus::Cancelled);
+        assert!(matches!(
+            registry
+                .execution_for_public_session(&public_session)
+                .expect("execution")
+                .state,
+            ExecutionState::Terminal(ExecutionTerminal {
+                outcome: TerminalOutcome::Cancelled,
+                ..
+            })
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 }
