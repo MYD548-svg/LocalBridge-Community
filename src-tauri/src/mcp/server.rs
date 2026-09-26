@@ -6967,17 +6967,36 @@ mod tests {
             nested_status.body["result"]["structuredContent"]["data"]["repository_root"],
             "NestedProject"
         );
-        let nested_workflow = public_tool_call(
-            pep.port(),
-            &session,
-            691,
-            "agent_workflow",
-            json!({
-                "action":"bugfix",
-                "path":"NestedProject/src",
-                "commands":[{"command":"cd","shell":"cmd","yield_time_ms":10000}]
-            }),
-        );
+        // The workflow runs its commands through the same command-control
+        // transport as direct exec_command calls. A degraded runner can expire
+        // that submission's wait budget; the failed attempt terminalizes its
+        // checkpoint, so the retry below starts a fresh workflow and every
+        // following assertion applies to the successful one.
+        let nested_workflow = {
+            let retry_deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let response = public_tool_call(
+                    pep.port(),
+                    &session,
+                    691,
+                    "agent_workflow",
+                    json!({
+                        "action":"bugfix",
+                        "path":"NestedProject/src",
+                        "commands":[{"command":"cd","shell":"cmd","yield_time_ms":10000}]
+                    }),
+                );
+                let code = &response.body["result"]["structuredContent"]["error"]["code"];
+                if code.as_str() != Some("OperationTimedOut") {
+                    break response;
+                }
+                assert!(
+                    Instant::now() < retry_deadline,
+                    "nested workflow submission kept timing out: {:#?}",
+                    response.body
+                );
+            }
+        };
         assert_eq!(
             nested_workflow.body["result"]["isError"], false,
             "{:#?}",
