@@ -3,9 +3,14 @@ const DEFAULT_POLL_WAIT_MS = 100;
 
 export function publicCommandIsPending(response) {
   const structured = response?.body?.result?.structuredContent;
-  return (
-    structured?.error?.code === "OperationTimedOut" || structured?.data?.status === "running"
-  );
+  if (structured?.data?.status === "running") return true;
+  const error = structured?.error;
+  if (!error) return false;
+  if (error.code === "OperationTimedOut") return true;
+  // Retryable transport/control-lane transients keep the execution alive (the
+  // facade does not terminalize them), so the contract promises the caller can
+  // poll the same session again; only non-retryable errors surface here.
+  return error.retryable === true;
 }
 
 export async function settleAcceptedPublicCommand({ initialResponse, ...driver }) {

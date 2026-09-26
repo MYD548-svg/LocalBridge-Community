@@ -2132,7 +2132,13 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
                         .public_commands
                         .terminal_with_pending(&public_session_id, terminal));
                 }
-                if error.code != FacadeErrorCode::OperationTimedOut {
+                if error.code != FacadeErrorCode::OperationTimedOut && !error.retryable {
+                    // Retryable transport/control-lane transients keep the
+                    // Execution non-terminal, like OperationTimedOut: the
+                    // envelope promises the caller can poll the same session
+                    // later, and terminalizing it here (execution_terminal_from_result
+                    // maps SessionUnavailable/RuntimeUnavailable to Lost) would
+                    // turn one transient hiccup into a permanently lost command.
                     if action == CommandControlAction::Kill {
                         self.executions.clear_cancellation(&public_session_key);
                     }
