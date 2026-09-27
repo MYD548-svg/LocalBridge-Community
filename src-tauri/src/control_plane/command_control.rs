@@ -743,4 +743,153 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// The PEP maps transport outages (connection refused and friends) to
+    /// `RuntimeCommandControlError::Unavailable`. A kill whose upstream call
+    /// fails that way must NOT combine with the recorded cancellation intent
+    /// into any terminal: intent, delivery and process termination are
+    /// different facts. The intent survives the outage and the next real
+    /// observation resolves the terminal per contract.
+    #[derive(Debug)]
+    struct TransportOutageRuntime;
+
+    impl RuntimeCommandControl for TransportOutageRuntime {
+        fn control_command(
+            &self,
+            _request: &RuntimeCommandRequest,
+        ) -> Result<RuntimeCommandObservation, RuntimeCommandControlError> {
+            Err(RuntimeCommandControlError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn kill_intent_survives_a_transport_outage_until_the_runtime_reports_the_real_terminal() {
+        let root = std::env::temp_dir().join(format!(
+            "localbridge-command-control-outage-{}-{}",
+            std::process::id(),
+            unix_time_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test workspace");
+        let registry =
+            ExecutionRegistry::open_at(root.join("executions.json")).expect("execution registry");
+        let public_session = PublicSessionId::new("public-transport-outage");
+        let execution_id = registry
+            .start(TaskId::new("task-transport-outage"), public_session.clone())
+            .expect("start execution");
+        registry
+            .bind_runtime_handle(
+                &execution_id,
+                RuntimeCommandHandle::new("private-transport-outage"),
+            )
+            .expect("bind runtime handle");
+        registry
+            .request_cancellation(&public_session, "KILL")
+            .expect("record the cancellation intent before the outage");
+
+        let killed = control_command_during_work(
+            CommandControlRequest {
+                action: CommandControlAction::Kill,
+                chars: None,
+                signal: Some(CommandKillSignal::Kill),
+                wait_ms: 0,
+                request_id: RpcRequestId::String("kill-outage".into()),
+                public_session_id: public_session.clone(),
+            },
+            &registry,
+            &TransportOutageRuntime,
+        );
+        assert_eq!(
+            killed,
+            Err(CommandControlError::RuntimeUnavailable),
+            "a transport outage must surface as the retryable error, not a fabricated terminal"
+        );
+        assert_eq!(
+            registry.cancellation_signal(&public_session).as_deref(),
+            Some("KILL"),
+            "the outage must not consume the recorded cancel intent"
+        );
+        assert!(matches!(
+            registry
+                .execution_for_public_session(&public_session)
+                .expect("execution")
+                .state,
+            ExecutionState::Running
+        ));
+
+        // The outage passes; the next poll observes the process's REAL exit.
+        // The accepted cancellation intent maps the outcome to Cancelled, and
+        // the observed output must ride along instead of being lost.
+        let polled = control_command_during_work(
+            CommandControlRequest {
+                action: CommandControlAction::Poll,
+                chars: None,
+                signal: None,
+                wait_ms: 0,
+                request_id: RpcRequestId::String("poll-after-outage".into()),
+                public_session_id: public_session.clone(),
+            },
+            &registry,
+            &FakeRuntime(Mutex::new(Some(RuntimeCommandObservation {
+                status: RuntimeCommandStatus::Failed,
+                exit_code: Some(1),
+                signal: None,
+                stdout: "REAL_TERMINAL_OUTPUT".to_string(),
+                stderr: String::new(),
+                truncated: Some(false),
+            }))),
+        )
+        .expect("the recovered poll resolves the real terminal");
+        assert_eq!(polled.status, RuntimeCommandStatus::Cancelled);
+        assert_eq!(polled.stdout, "REAL_TERMINAL_OUTPUT");
+        assert_eq!(polled.exit_code, Some(1));
+
+        // Later replays answer from the durable terminal without re-appending
+        // the observation output.
+        let replay = control_command_during_work(
+            CommandControlRequest {
+                action: CommandControlAction::Poll,
+                chars: None,
+                signal: None,
+                wait_ms: 0,
+                request_id: RpcRequestId::String("replay-after-outage".into()),
+                public_session_id: public_session.clone(),
+            },
+            &registry,
+            &TransportOutageRuntime,
+        )
+        .expect("the durable terminal replays");
+        assert_eq!(replay.status, RuntimeCommandStatus::Cancelled);
+        assert_eq!(replay.stdout, String::new());
+
+        // A non-poll action on the now-terminal execution reports the
+        // contract error and must not overwrite the recorded terminal.
+        let late_kill = control_command_during_work(
+            CommandControlRequest {
+                action: CommandControlAction::Kill,
+                chars: None,
+                signal: Some(CommandKillSignal::Kill),
+                wait_ms: 0,
+                request_id: RpcRequestId::String("kill-after-terminal".into()),
+                public_session_id: public_session.clone(),
+            },
+            &registry,
+            &TransportOutageRuntime,
+        );
+        assert_eq!(
+            late_kill,
+            Err(CommandControlError::SessionUnavailable),
+            "killing a terminal execution surfaces the contract error"
+        );
+        assert!(matches!(
+            registry
+                .execution_for_public_session(&public_session)
+                .expect("execution")
+                .state,
+            ExecutionState::Terminal(ExecutionTerminal {
+                outcome: TerminalOutcome::Cancelled,
+                ..
+            })
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

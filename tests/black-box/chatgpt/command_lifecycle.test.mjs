@@ -76,6 +76,10 @@ test("terminal driver keeps polling retryable transport transients on the same s
 test("terminal driver returns typed tool errors instead of retrying them", async () => {
   const denied = response({ errorCode: "SessionUnavailable" });
   assert.equal(publicCommandIsPending(denied), false);
+  // A non-retryable session error (an unknown or unowned session answers with
+  // retryable: false) must surface immediately, not poll forever.
+  const unknownSession = response({ errorCode: "SessionUnavailable", retryable: false });
+  assert.equal(publicCommandIsPending(unknownSession), false);
   assert.equal(
     await drivePublicCommandToTerminal({
       callTool: async () => denied,

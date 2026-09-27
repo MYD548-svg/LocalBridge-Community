@@ -2107,10 +2107,19 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
                 self.public_commands
                     .append_pending(&public_session_id, &pending);
                 let cancellation_signal = self.executions.cancellation_signal(&public_session_key);
+                // "The upstream answered that this session is gone" and "the
+                // transport could not reach the upstream" are different facts.
+                // normalize_private_error answers carry retryable=false;
+                // normalize_runtime_error transport failures carry
+                // retryable=true. Only the former may combine with a recorded
+                // cancellation intent into a durable cancelled terminal — a
+                // transport failure leaves the process state unknown, so the
+                // intent stays recorded and the caller can retry.
                 if matches!(
                     error.code,
                     FacadeErrorCode::SessionUnavailable | FacadeErrorCode::RuntimeUnavailable
-                ) && cancellation_signal.is_some()
+                ) && !error.retryable
+                    && cancellation_signal.is_some()
                 {
                     self.public_commands.mark_terminal(
                         &public_session_id,
@@ -10885,5 +10894,321 @@ mod tests {
             public_task_kind("exec_command", &json!({"command":"npm run build"})),
             TaskKind::Build
         );
+    }
+
+    /// Regression for the cancelled-on-retryable-transport-error defect: a
+    /// kill records the cancellation intent BEFORE the upstream call, and a
+    /// transport outage during that call must not be promoted into a durable
+    /// cancelled terminal. The intent, the Running execution and the public
+    /// session identity must all survive so the caller can retry against the
+    /// same execution.
+    #[cfg(windows)]
+    #[test]
+    fn kill_with_retryable_transport_failure_keeps_the_execution_and_cancel_intent() {
+        use crate::control_plane::execution_registry::ExecutionState;
+        use crate::mcp::{CodingToolsPermissionMode, CodingToolsRuntimeConfig, InternalBearer};
+        use std::time::Duration;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "localbridge-cancel-transport-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let listener = std::net::TcpListener::bind(std::net::Ipv4Addr::LOCALHOST, 0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let runtime = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                port,
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new("LB_CANCEL_TRANSPORT_SYNTHETIC_BEARER").unwrap(),
+            Duration::from_secs(10),
+        )
+        .expect("bundled coding runtime for the transport-outage regression");
+        let executions = ExecutionRegistry::for_workspace(runtime.workspace()).unwrap();
+        let mut facade =
+            AgentFacade::from_coding_runtime_with_executions(runtime, policy(), executions)
+                .unwrap();
+
+        let submit = facade
+            .call_tool(
+                PermissionMode::Full,
+                "exec_command",
+                json!({
+                    "command":"Start-Sleep -Seconds 20",
+                    "shell":"windows_powershell",
+                    "yield_time_ms":0,
+                    "timeout_ms":60000,
+                    "max_output_bytes":4096
+                }),
+                None,
+                |_| {},
+            )
+            .expect("detached scenario command started");
+        assert_eq!(
+            submit["structuredContent"]["data"]["status"], "running",
+            "{submit:#}"
+        );
+        let public_session = submit["structuredContent"]["data"]["session_id"]
+            .as_str()
+            .expect("running command has PublicSessionId")
+            .to_string();
+        let session_key = PublicSessionId::new(public_session.clone());
+
+        // Inject a REAL transport outage: stop the upstream process. The
+        // kill below now fails inside private_call_with_timeout with a
+        // retryable transport error while the cancellation intent is already
+        // recorded - the exact shape the defective branch turned into a
+        // fabricated cancelled terminal.
+        facade.adapter.runtime.stop().unwrap();
+
+        let kill = facade.call_tool(
+            PermissionMode::Full,
+            "command_control",
+            json!({"action":"kill","session_id":public_session,"signal":"KILL","wait_ms":0}),
+            None,
+            |_| {},
+        );
+        let kill_error = kill.expect_err(
+            "a retryable transport outage must surface as an error, not a fabricated cancelled terminal",
+        );
+        assert_eq!(
+            kill_error.code,
+            FacadeErrorCode::SessionUnavailable,
+            "{kill_error:#?}"
+        );
+        assert!(
+            kill_error.retryable,
+            "the outage is retryable by contract: {kill_error:#?}"
+        );
+
+        // Cancellation intent, delivery and process termination are different
+        // facts: the intent stays recorded, the execution stays Running and no
+        // durable terminal was fabricated.
+        assert_eq!(
+            facade
+                .adapter
+                .executions
+                .cancellation_signal(&session_key)
+                .as_deref(),
+            Some("KILL"),
+            "the recorded cancel intent must survive a retryable transport failure"
+        );
+        let execution = facade
+            .adapter
+            .executions
+            .execution_for_public_session(&session_key)
+            .expect("the execution must remain registered");
+        assert!(
+            matches!(
+                execution.state,
+                crate::control_plane::execution_registry::ExecutionState::Running
+            ),
+            "a retryable transport failure must not terminalize the execution: {execution:#?}"
+        );
+        assert!(
+            facade
+                .adapter
+                .durable_command_terminal(&public_session)
+                .is_none(),
+            "no terminal may be fabricated from a transport outage"
+        );
+
+        // The same holds for polls issued while the intent is pending (C):
+        // a transient error must not be converted into a cancelled success.
+        let poll = facade.call_tool(
+            PermissionMode::Full,
+            "command_control",
+            json!({"action":"poll","session_id":public_session,"wait_ms":0}),
+            None,
+            |_| {},
+        );
+        let poll_error =
+            poll.expect_err("a poll during the transport outage must surface the retryable error");
+        assert_eq!(
+            poll_error.code,
+            FacadeErrorCode::SessionUnavailable,
+            "{poll_error:#?}"
+        );
+        assert!(poll_error.retryable, "{poll_error:#?}");
+        let execution = facade
+            .adapter
+            .executions
+            .execution_for_public_session(&session_key)
+            .expect("the execution must remain registered after the failed poll");
+        assert!(matches!(
+            execution.state,
+            crate::control_plane::execution_registry::ExecutionState::Running
+        ));
+        assert_eq!(
+            facade
+                .adapter
+                .executions
+                .cancellation_signal(&session_key)
+                .as_deref(),
+            Some("KILL")
+        );
+
+        let mut runtime = facade.into_runtime();
+        let _ = runtime.stop();
+        drop(runtime);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// Dynamic boundary probe for the resubmission risk (goal section on
+    /// submit-timeout duplicate executions): a submission whose transport
+    /// budget expires does NOT cancel the upstream work. The work item stays
+    /// queued and executes later, so a resubmission produces a SECOND
+    /// execution. This test observes that boundary dynamically with counted,
+    /// workspace-local side effects (a temp workspace, never the user's). It
+    /// documents the risk rather than asserting exactly-once semantics; if
+    /// production ever gains submit idempotency, this expectation must be
+    /// consciously updated.
+    #[cfg(windows)]
+    #[test]
+    fn resubmission_after_a_submit_budget_timeout_executes_the_command_twice() {
+        use crate::mcp::{CodingToolsPermissionMode, CodingToolsRuntimeConfig, InternalBearer};
+        use std::time::Duration;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "localbridge-resubmit-boundary-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let listener = std::net::TcpListener::bind(std::net::Ipv4Addr::LOCALHOST, 0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let runtime = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                port,
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new("LB_RESUBMIT_BOUNDARY_SYNTHETIC_BEARER").unwrap(),
+            Duration::from_secs(10),
+        )
+        .expect("bundled coding runtime for the resubmission boundary probe");
+        let executions = ExecutionRegistry::for_workspace(runtime.workspace()).unwrap();
+        let mut facade =
+            AgentFacade::from_coding_runtime_with_executions(runtime, policy(), executions)
+                .unwrap();
+
+        let marker = workspace.join("resubmit-probe.txt");
+        let marker_literal = marker.to_string_lossy().to_string();
+
+        // Occupy the single foreground work lane so the next submission queues
+        // behind it. The yield returns "running" while the sleep keeps the
+        // lane busy for the rest of the test.
+        let occupier = facade
+            .call_tool(
+                PermissionMode::Full,
+                "exec_command",
+                json!({
+                    "command":"Start-Sleep -Seconds 15",
+                    "shell":"windows_powershell",
+                    "yield_time_ms":1000,
+                    "timeout_ms":60000,
+                    "max_output_bytes":4096
+                }),
+                None,
+                |_| {},
+            )
+            .expect("occupying command started");
+        assert_eq!(occupier["structuredContent"]["data"]["status"], "running");
+
+        // First submission: its transport budget (yield_ms + 3s) expires while
+        // the command is still queued upstream. The response carries no
+        // session identity and the facade terminalizes this attempt's public
+        // session with the error - but the upstream work item is NOT
+        // cancelled and will run later.
+        let first = facade.call_tool(
+            PermissionMode::Full,
+            "exec_command",
+            json!({
+                "command":format!("Add-Content -Path '{marker_literal}' -Value 'orphan-run'"),
+                "shell":"windows_powershell",
+                "yield_time_ms":0,
+                "timeout_ms":60000,
+                "max_output_bytes":4096
+            }),
+            None,
+            |_| {},
+        );
+        let first_error = first.expect_err(
+            "a submission queued past its transport budget must answer OperationTimedOut",
+        );
+        assert_eq!(first_error.code, FacadeErrorCode::OperationTimedOut);
+
+        // Resubmission: a fresh execution identity that waits out the lane and
+        // runs to completion.
+        let second = facade
+            .call_tool(
+                PermissionMode::Full,
+                "exec_command",
+                json!({
+                    "command":format!("Add-Content -Path '{marker_literal}' -Value 'resubmit-run'"),
+                    "shell":"windows_powershell",
+                    "yield_time_ms":30000,
+                    "timeout_ms":60000,
+                    "max_output_bytes":4096
+                }),
+                None,
+                |_| {},
+            )
+            .expect("the resubmitted command runs after the lane clears");
+        assert_eq!(
+            second["structuredContent"]["data"]["status"], "completed",
+            "{second:#}"
+        );
+
+        // The orphaned first attempt must still be alive upstream and append
+        // its own marker once the lane clears, so BOTH runs leave evidence:
+        // exactly the duplicate-execution boundary documented in the report.
+        let settle_deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let content = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                if text.contains("orphan-run") && text.contains("resubmit-run") {
+                    break text;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < settle_deadline,
+                "the timed-out submission's upstream work item never ran: {marker:?}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        assert!(
+            content.contains("orphan-run"),
+            "the submission that answered OperationTimedOut still executed upstream (orphan liveness)"
+        );
+        assert!(
+            content.contains("resubmit-run"),
+            "the resubmission produced its own second execution"
+        );
+
+        let mut runtime = facade.into_runtime();
+        runtime.stop().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }
