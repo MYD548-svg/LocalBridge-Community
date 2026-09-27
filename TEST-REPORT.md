@@ -13,18 +13,76 @@ Branch `codex/fix-ci-validation`, PR #1 -> `main` in `MYD548-svg/LocalBridge-Com
 The sole acceptance gate is `node scripts/test/ci-gate.mjs` (19 stages); the
 community workflow runs the same gate with `LOCALBRIDGE_BUILD_PROFILE=community`.
 
-Head `2f3de89` completed all three expected runs with success:
+Head `46e0afb` (the repair chain through the installer-content verification,
+the retryable-transient terminalization fix and the full-7-Zip installer
+check) completed all three runs with success:
 
 | Workflow | Event | Run | Result |
 | --- | --- | --- | --- |
-| CI | push | 36235265911 | success (19/19 stages PASS) |
-| CI | pull_request | 36235269939 | success (19/19 stages PASS) |
-| LocalBridge Community Build | pull_request | 36235269870 | success (19/19 stages PASS; Linux upstream-tests job PASS) |
+| CI | push | 36248206192 | success (19/19 stages PASS) |
+| CI | pull_request | 36248208546 | success (19/19 stages PASS) |
+| LocalBridge Community Build | pull_request | 36248208631 | success (19/19 stages PASS; Linux upstream-tests job PASS) |
 
-PR-event runs checkout the merge ref; its actual checkout SHA is
-`118d12193053f1a5498af0f0adfe2a17fe8db42c` ("Merge 2f3de89... into 012adf9...",
-parents = base `012adf9` + head `2f3de89`, verified via the API). The CI push
-run checked out `2f3de89` itself (provenance `dirty: false`).
+Earlier accepted heads (each with its own three green runs recorded in the
+history below): `2f3de89` (push 36235265911 / PR 36235269939 / community
+36235269870), `050193d`, and the intermediate review heads. PR-event runs
+checkout the merge ref; each PR run's merge commit was verified via the API
+to have exactly base `012adf9` + head as parents. Branch protection on
+`main`: not readable (404) and no applicable rulesets via the rules API -
+recorded as unverified rather than claimed absent.
+
+## Cancel-intent vs retryable-transport-failure fix (current cycle)
+
+Production defect fixed in `CodingToolsRuntimeAdapter::control_command`
+(`src-tauri/src/mcp/facade.rs`): the command_control error path treated
+"an error with code SessionUnavailable/RuntimeUnavailable plus a recorded
+cancellation intent" as a completed cancellation and persisted a durable
+`Cancelled` terminal - even when the error was a RETRYABLE transport
+failure (connection refused, HTTP status, health timeout; those answer
+with `retryable: true` via `normalize_runtime_error`). Cancellation intent,
+cancellation delivery and process termination are different facts: a
+transport outage leaves the process state unknown, so the fix gates the
+cancelled-finalization on `!error.retryable`. Upstream-answered
+"session is gone" errors (via `normalize_private_error`, which answers
+with `retryable: false`) keep the deliberate accepted-cancellation-wins
+contract; retryable outages now keep the intent recorded, the execution
+Running and the public session controllable. The later error branch (added
+in `02a6a4f`) already kept retryable errors non-terminal; the earlier
+cancelled-ification branch had bypassed it - this cycle closes that gap.
+
+Regression coverage (goes through the real error-handling paths):
+
+- `kill_with_retryable_transport_failure_keeps_the_execution_and_cancel_intent`
+  (facade-level, real bundled runtime): a detached command is started, the
+  upstream process is really stopped, and the kill then fails inside
+  `private_call_with_timeout`. Asserts the retryable error envelope (no
+  fabricated cancelled success), the execution still Running, the recorded
+  "KILL" intent intact, no durable terminal, and the same for a poll issued
+  while the intent is pending.
+- `kill_intent_survives_a_transport_outage_until_the_runtime_reports_the_real_terminal`
+  (control-plane level, deterministic mock): a transport outage
+  (`RuntimeCommandControlError::Unavailable`, the PEP mapping for
+  connection failures) must not terminalize; after recovery the next real
+  observation resolves the terminal (Cancelled via the recorded intent) with
+  the observed output carried; replays stay stable without re-appending
+  output; a late kill on the terminal execution surfaces the contract error
+  and does not overwrite the recorded terminal.
+- The JS terminal driver keeps polling envelopes flagged `retryable: true`
+  and surfaces non-retryable ones immediately (unknown or unowned sessions
+  answer with `retryable: false`, so they are never retried forever).
+
+Dynamic duplicate-execution boundary (previously documented analytically,
+now verified by fault injection): the new
+`resubmission_after_a_submit_budget_timeout_executes_the_command_twice`
+test occupies the work lane, lets a submission expire its transport budget
+(`OperationTimedOut`, no session identity), resubmits the same command and
+observes with counted workspace-local side effects that BOTH runs execute -
+the timed-out submission's upstream work item is not cancelled (orphan
+liveness) and the resubmission produces a second execution. This pins the
+documented risk: resubmission remains restricted to the reviewed
+side-effect-free test scenarios, and production submit idempotency would
+require a protocol-level change (idempotency keys or durable submission
+records) that is out of scope for this cycle.
 
 After this review cycle the branch gained additional commits; the final
 acceptance object is the new head's own three runs. Their run IDs and artifact
