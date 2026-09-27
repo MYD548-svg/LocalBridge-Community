@@ -20,7 +20,7 @@ use std::fs;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type SharedEvents = Rc<RefCell<Vec<&'static str>>>;
 type SharedTask = Rc<RefCell<CurrentTaskStatus>>;
