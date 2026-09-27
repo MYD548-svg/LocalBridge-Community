@@ -8952,10 +8952,36 @@ mod tests {
             "the abandoned submission must time out on the client side"
         );
         let resubmit_response = resubmitted.join().expect("resubmission client thread");
+        // Unlike the abandoned submission, the resubmission received a session
+        // identity. The ack may report "running" (the healthy upstream
+        // acknowledges queued work immediately), so settle it to terminal
+        // through that same session.
+        let resubmit_status =
+            &resubmit_response.body["result"]["structuredContent"]["data"]["status"];
+        let resubmit_terminal = if resubmit_status == "completed" {
+            resubmit_response
+        } else {
+            assert_eq!(
+                resubmit_status, "running",
+                "unexpected resubmission envelope: {resubmit_response:#?}"
+            );
+            let resubmit_session_id = resubmit_response.body["result"]["structuredContent"]["data"]
+                ["session_id"]
+                .as_str()
+                .expect("resubmission delivered a session identity")
+                .to_string();
+            poll_public_command_to_terminal(
+                pep.port(),
+                &session,
+                40301,
+                &resubmit_session_id,
+                Duration::from_secs(60),
+            )
+        };
         assert_eq!(
-            resubmit_response.body["result"]["structuredContent"]["data"]["status"], "completed",
+            resubmit_terminal.body["result"]["structuredContent"]["data"]["status"], "completed",
             "{:#?}",
-            resubmit_response.body
+            resubmit_terminal.body
         );
 
         // Both executions left markers: the abandoned submission ran even
