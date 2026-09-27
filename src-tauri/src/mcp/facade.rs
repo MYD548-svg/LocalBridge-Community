@@ -10905,7 +10905,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn kill_with_retryable_transport_failure_keeps_the_execution_and_cancel_intent() {
-        use crate::control_plane::execution_registry::ExecutionState;
+        use crate::domain::execution::ExecutionState;
         use crate::mcp::{CodingToolsPermissionMode, CodingToolsRuntimeConfig, InternalBearer};
         use std::time::Duration;
 
@@ -10922,7 +10922,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&workspace).unwrap();
-        let listener = std::net::TcpListener::bind(std::net::Ipv4Addr::LOCALHOST, 0).unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let runtime = CodingToolsRuntime::start(
@@ -11014,7 +11014,7 @@ mod tests {
         assert!(
             matches!(
                 execution.state,
-                crate::control_plane::execution_registry::ExecutionState::Running
+                crate::domain::execution::ExecutionState::Running
             ),
             "a retryable transport failure must not terminalize the execution: {execution:#?}"
         );
@@ -11053,7 +11053,7 @@ mod tests {
             .expect("the execution must remain registered after the failed poll");
         assert!(matches!(
             execution.state,
-            crate::control_plane::execution_registry::ExecutionState::Running
+            crate::domain::execution::ExecutionState::Running
         ));
         assert_eq!(
             facade
@@ -11098,7 +11098,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&workspace).unwrap();
-        let listener = std::net::TcpListener::bind(std::net::Ipv4Addr::LOCALHOST, 0).unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let runtime = CodingToolsRuntime::start(
