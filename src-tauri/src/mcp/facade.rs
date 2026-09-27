@@ -946,6 +946,15 @@ pub trait WorkspaceRuntimeAdapter {
 
 const MAX_PENDING_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_PROTOCOL_BYTES: usize = 256 * 1024;
+const INCOMPLETE_COMMAND_OUTPUT: &str =
+    "Output incomplete: pipe readers did not finish within 5 seconds after process exit.";
+
+fn annotate_incomplete_output(result: &mut Value, incomplete: bool) {
+    if incomplete {
+        result["structuredContent"]["data"]["truncated"] = Value::Bool(true);
+        result["structuredContent"]["warnings"] = json!([INCOMPLETE_COMMAND_OUTPUT]);
+    }
+}
 
 fn next_public_handle(prefix: &str) -> String {
     crate::security::random_prefixed_id(&format!("{prefix}-"))
@@ -957,6 +966,7 @@ struct PublicCommandSession {
     started_at: Instant,
     pending_output: String,
     pending_output_truncated: bool,
+    output_incomplete: bool,
     stderr_protocol_buffer: String,
 }
 
@@ -991,6 +1001,7 @@ impl PublicCommandSessions {
                 started_at: Instant::now(),
                 pending_output: String::new(),
                 pending_output_truncated: false,
+                output_incomplete: false,
                 stderr_protocol_buffer: String::new(),
             },
         );
@@ -2452,7 +2463,7 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
             }
             data.insert("output_refs".into(), Value::Object(output_refs));
         }
-        match terminal.outcome {
+        let mut result = match terminal.outcome {
             TerminalOutcome::Completed => Some(stable_success(
                 Value::Object(data),
                 command_summary("completed"),
@@ -2476,7 +2487,17 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
                 "命令会话不可用",
                 data,
             )),
+        };
+        if let Some(value) = result.as_mut() {
+            annotate_incomplete_output(
+                value,
+                self.public_commands
+                    .sessions
+                    .get(session_id)
+                    .is_some_and(|session| session.output_incomplete),
+            );
         }
+        result
     }
 }
 
@@ -2541,11 +2562,24 @@ impl CodingToolsRuntimeAdapter {
                 data.insert("truncated".into(), value.clone());
             }
         }
+        // Only propagate the fixed diagnostic; arbitrary private warnings may
+        // contain runtime paths or other implementation details.
+        let incomplete = structured
+            .and_then(|object| object.get("warnings"))
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| {
+                warnings
+                    .iter()
+                    .any(|warning| warning.as_str() == Some(INCOMPLETE_COMMAND_OUTPUT))
+            });
+        if let Some(session) = self.public_commands.sessions.get_mut(public_session_id) {
+            session.output_incomplete |= incomplete;
+        }
         let output = self.safe_command_output_for_session(raw, public_session_id);
         data.insert("output".into(), Value::String(output));
         self.map_private_output_refs(structured, &mut data, public_session_id);
 
-        let result = match public_status {
+        let mut result = match public_status {
             "running" => stable_success(Value::Object(data), command_summary("running")),
             "completed" => stable_success(Value::Object(data), command_summary("completed")),
             "failed" => stable_command_error(
@@ -2565,6 +2599,13 @@ impl CodingToolsRuntimeAdapter {
                 data,
             ),
         };
+        annotate_incomplete_output(
+            &mut result,
+            self.public_commands
+                .sessions
+                .get(public_session_id)
+                .is_some_and(|session| session.output_incomplete),
+        );
         if public_status != "running" {
             self.public_commands.mark_terminal(
                 public_session_id,
@@ -10088,6 +10129,7 @@ mod tests {
                 started_at: Instant::now(),
                 pending_output: String::new(),
                 pending_output_truncated: false,
+                output_incomplete: false,
                 stderr_protocol_buffer: String::new(),
             },
         );
@@ -10618,6 +10660,43 @@ mod tests {
                 ..
             }) if code == "ProcessCancelled"
         ));
+    }
+
+    #[test]
+    fn incomplete_output_keeps_the_warning_in_the_public_envelope() {
+        let mut data = Map::new();
+        data.insert("output".into(), Value::String("already-read".into()));
+        let mut result = stable_success(Value::Object(data), "Command completed");
+        annotate_incomplete_output(&mut result, true);
+        assert!(
+            result["structuredContent"]["data"]
+                .get("warnings")
+                .is_none()
+        );
+        assert_eq!(result["structuredContent"]["data"]["truncated"], true);
+        assert_eq!(
+            result["structuredContent"]["warnings"],
+            json!([INCOMPLETE_COMMAND_OUTPUT])
+        );
+        assert_eq!(
+            result["structuredContent"]["data"]["output"],
+            "already-read"
+        );
+        let mut complete = stable_success(json!({"status":"completed"}), "Command completed");
+        let original = complete.clone();
+        annotate_incomplete_output(&mut complete, false);
+        assert_eq!(complete, original);
+        let mut error = stable_command_error(
+            FacadeErrorCode::ProcessTimedOut,
+            "Command timed out",
+            Map::new(),
+        );
+        annotate_incomplete_output(&mut error, true);
+        assert_eq!(
+            error["structuredContent"]["warnings"],
+            json!([INCOMPLETE_COMMAND_OUTPUT])
+        );
+        assert_eq!(error["structuredContent"]["data"]["truncated"], true);
     }
 
     #[test]

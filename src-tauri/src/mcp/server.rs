@@ -8296,7 +8296,11 @@ mod tests {
                 "{:#?}",
                 response.body
             );
-            assert!(output.contains(marker), "{:#?}", response.body);
+            assert!(
+                output.contains(marker),
+                "shell={shell} command={command:?} marker={marker} accumulated_output={output:?} response={:#?}",
+                response.body
+            );
         }
 
         let nul = public_tool_call(

@@ -1,3 +1,104 @@
+# Command output settlement repair - 2026-09-27
+
+## Delivery boundary
+
+Implementation starts from `9a8abb2e60d7dac3f4060705624dd177d124222a`
+on `codex/fix-ci-validation`. This section supersedes the delivery statuses
+below. The repaired commit's cloud result is **UNVERIFIED**.
+This delivery ends after one push and a remote branch SHA comparison.
+No new Actions query, polling, rerun, monitor, merge, or release is authorized.
+
+## Verified cloud baseline (before this repair)
+
+All three runs below belong to head `9a8abb2e60d7dac3f4060705624dd177d124222a`.
+PR runs checked out merge `ff388e70e6d6ecc1a3b786b8341f19f936d4499d`,
+whose base is `012adf917b06b8a3866b0d77a564ae481c289b4f`.
+
+| Run | Event/profile | Verified result |
+| --- | --- | --- |
+| [36313820560](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36313820560) | CI push / bundled | PASS: all 19 stages; installer uploaded |
+| [36313823351](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36313823351) | CI PR / bundled | PASS: all 19 stages; installer uploaded |
+| [36313823283](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36313823283) | Community PR | Linux upstream PASS; Windows FAIL in rust-test |
+
+Community Windows passed its first 14 stages, including the four compile/lint
+preflight checks and all ten authentication probes. The Rust library suite
+reported 411 passed and 1 failed:
+`mcp::server::tests::full_scripts_share_current_user_authority_independent_of_path_spelling`
+at `src/mcp/server.rs:8299`. A PowerShell command reported completed / exit 0,
+but its accumulated output did not contain the script marker. The later
+standalone Clippy stage, NSIS packaging, package integrity and artifacts stages
+were NOT_RUN in that run. Installer existence and cloud gate results were
+verified for the two CI runs; independent installer download/extraction was
+NOT_RUN in this audit.
+
+## Repair and evidence boundaries
+
+- Serialize active snapshots and archival per session. Each response uses a
+  single settled lifecycle observation; it cannot re-poll after copying bytes
+  and upgrade an older empty snapshot to terminal.
+- Require process exit plus pipe-reader completion before publishing terminal.
+  Readers use interruptible nonblocking pipes. A shared monotonic five-second
+  drain deadline bounds post-exit collection; expiry freezes already-read bytes
+  and marks output incomplete with warnings/truncated. Each drain wait is at
+  most 200 ms. Cleanup of pending readers/watchdog is deferred with bounded
+  joins; request threads never wait indefinitely on a pipe or reader.
+- Cache one retained record and redirect stale active-session snapshots to its
+  cursor. Retained records reuse the registry lock, avoiding one retained OS
+  synchronization handle per completed command. Registry publication does not
+  resurrect an evicted record.
+- Install readers/watchdog before exposing a new session to pruning. Keep an
+  exited session reachable while output is draining, including the kill path.
+- Preserve the fixed incomplete-output warning and truncation flag through the
+  Rust public result and terminal replay. Do not forward arbitrary private
+  warnings. Keep output-marker assertions, with shell/command/accumulated
+  output details and per-poll identity/status/byte-count diagnostics.
+- Synchronize the coding-tools payload tree hash in runtime metadata, manifest
+  and the Rust pin. The tree hash is
+  `9f94420accf554f5227e96b58d49be4eb01acb4f99f35d09a9060651ded7f58f`.
+  Other runtime components and historical build/installer attestations remain
+  unchanged. Original unchanged byte-pinned source lines retain their bytes.
+
+The snapshot/exit and delayed-reader hazards were reproduced with controlled
+processes. They match the cloud symptom; the existing cloud log does not prove
+which interleaving caused that particular failure. No assertion was weakened,
+no test was skipped, and no retry-until-success behavior was added.
+
+## Local validation of this repair
+
+- PASS: test-base, 32 Node tests including the bundled-Python regression runner.
+- PASS: final Python output suite, 11 tests, including deterministic exit and
+  delayed stdout/stderr cases, archive/snapshot contention, timeout and kill
+  drainage, open inherited-pipe cancellation, and startup publication ordering.
+- PASS: real Windows .cmd, .bat and PowerShell scripts, ten runs each. Markers
+  appear exactly once, exit code is zero, terminal replay returns no old bytes.
+- PASS: 24 additional commands in one Runtime; retained output remains readable
+  and process handle count stays 261 -> 261 (existing maximum growth: 8).
+- PASS: bundled runtime integrity, source formatting, public-release policy,
+  dependency licenses (166 npm / 484 cargo packages), schema44 residue scan.
+- PASS: frontend tests (18 tests in 6 files) and TypeScript/Vite build.
+- PASS: git diff whitespace check. An intermediate check rejected CRLF on new
+  byte-pinned source lines; new lines were corrected, hashes recomputed and the
+  format gate passed. An initial new fixture used the public `command` key for
+  the private API; it was corrected to `cmd` and the suite passed.
+- NOT_RUN locally: Rust test compilation, Clippy, full Rust/runtime regressions,
+  authenticated Tunnel repetitions and NSIS packaging. No usable MSVC/Windows
+  SDK was found; the user chose not to install them. Formatting and Python
+  runtime tests are not represented as Rust compilation or public MCP E2E.
+- ADDED / NOT_RUN locally: Rust public-envelope incomplete-output regression.
+- NOT_RUN: live ChatGPT, UAC and clean-machine installation.
+- UNVERIFIED: cloud results for the new repaired commit. Historical passing
+  runs above are evidence only for their original SHA.
+
+Commands used: `node scripts/test/ci-gate.mjs --from test-base --through frontend-build`
+(test-base PASS, intermediate formatting issue), then
+`node scripts/test/ci-gate.mjs --from format --through frontend-build` (all selected
+stages PASS), `node --test scripts/test/runtime-output.test.mjs` (final suite PASS),
+and `node scripts/test/runtime-integrity.mjs --bundled-only`.
+Selected-stage gate reports are PARTIAL by design. No local all-19-stage PASS
+is claimed. Test workspaces and unrelated untracked files are retained.
+
+## Historical reports (superseded; original evidence retained)
+
 # LocalBridge concentrated repair - 2026-09-27
 
 ## Current delivery boundary

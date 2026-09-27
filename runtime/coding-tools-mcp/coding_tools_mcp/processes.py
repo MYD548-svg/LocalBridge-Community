@@ -14,6 +14,7 @@ from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_tail
 
 
 SESSION_BUFFER_BYTES = 524_288
+OUTPUT_DRAIN_SECONDS = 5.0
 HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
@@ -161,9 +162,14 @@ class ExecSession:
     stderr_dropped_bytes: int = 0
     buffer_limit: int = SESSION_BUFFER_BYTES
     lock: threading.Lock = field(default_factory=threading.Lock)
+    lifecycle_lock: Any = field(default_factory=threading.RLock, repr=False)
+    output_incomplete: bool = False
+    exit_observed_at: float | None = None
+    retained: Any = field(default=None, repr=False)
     reader_threads: list[threading.Thread] = field(default_factory=list)
     watchdog_thread: threading.Thread | None = None
     watchdog_stop: threading.Event = field(default_factory=threading.Event)
+    reader_stop: threading.Event = field(default_factory=threading.Event)
     started_at: float = field(default_factory=time.time)
     completed_at: float | None = None
     closed: bool = False
@@ -182,6 +188,8 @@ class ExecSession:
 
     def append_stdout(self, chunk: bytes) -> None:
         with self.lock:
+            if self.closed:
+                return
             self.stdout.extend(chunk)
             self.stdout_total_bytes += len(chunk)
             self.stdout_dropped_bytes += _trim_buffer(
@@ -193,6 +201,8 @@ class ExecSession:
 
     def append_stderr(self, chunk: bytes) -> None:
         with self.lock:
+            if self.closed:
+                return
             self.stderr.extend(chunk)
             self.stderr_total_bytes += len(chunk)
             self.stderr_dropped_bytes += _trim_buffer(
@@ -227,6 +237,13 @@ class ExecSession:
                 pass
 
     def snapshot_since_cursor(self, max_output_bytes: int) -> dict[str, Any]:
+        # Stale active-session references must share the retained cursor.
+        with self.lifecycle_lock:
+            if self.retained is not None:
+                return self.retained.snapshot_since_cursor(max_output_bytes)
+            return self._snapshot_since_cursor(max_output_bytes)
+
+    def _snapshot_since_cursor(self, max_output_bytes: int) -> dict[str, Any]:
         self.refresh_status()
         with self.lock:
             stdout_omitted = max(0, self.stdout_start_offset - self.stdout_cursor)
@@ -243,20 +260,22 @@ class ExecSession:
         stderr_truncation = truncate_output_bytes_tail(
             stderr_bytes, max_output_bytes, encoding=self.output_encoding
         )
-        if self.timed_out:
-            status = "timeout"
-        elif self.terminating and self.process.poll() is None:
+        # Do not re-poll after copying output: that can publish a terminal
+        # paired with bytes captured before the process actually exited.
+        if not self.closed:
             status = "running"
+        elif self.timed_out:
+            status = "timeout"
         elif self.signal_name is not None:
             status = "terminated"
         else:
-            status = "running" if self.process.poll() is None else "exited"
+            status = "exited"
         payload: dict[str, Any] = {
             "session_id": self.session_id,
             "status": status,
-            "exit_code": self.exit_code,
+            "exit_code": self.exit_code if self.closed else None,
             "signal": self.signal_name,
-            "timed_out": self.timed_out,
+            "timed_out": self.timed_out if self.closed else False,
             "stdout": stdout_truncation.content,
             "stderr": stderr_truncation.content,
             "stdout_truncated": stdout_truncation.truncated,
@@ -272,7 +291,8 @@ class ExecSession:
             "stdout_omitted_bytes": stdout_omitted,
             "stderr_omitted_bytes": stderr_omitted,
             "truncated": (
-                stdout_truncation.truncated
+                self.output_incomplete
+                or stdout_truncation.truncated
                 or stderr_truncation.truncated
                 or stdout_omitted > 0
                 or stderr_omitted > 0
@@ -293,31 +313,49 @@ class ExecSession:
         return payload
 
     def refresh_status(self) -> None:
-        if self.timeout_at is not None and not self.timed_out and self.process.poll() is None and time.time() >= self.timeout_at:
+        with self.lifecycle_lock:
+            self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        if self.closed:
+            return
+        code = self.process.poll()
+        if code is None and self.timeout_at is not None and not self.timed_out and time.time() >= self.timeout_at:
             self.timed_out = True
             terminate_process_group(self.process, signal.SIGTERM)
-            self.drain_readers()
-        code = self.process.poll()
+            code = self.process.poll()
         if code is None:
             return
         self.watchdog_stop.set()
-        self.drain_readers()
+        if self.exit_observed_at is None:
+            self.exit_observed_at = time.monotonic()
+        remaining = max(0.0, OUTPUT_DRAIN_SECONDS - (time.monotonic() - self.exit_observed_at))
+        # Readers take only the buffer lock. Never hold it while joining them.
+        self.drain_readers(timeout=min(0.2, remaining))
+        pending = any(reader.is_alive() for reader in self.reader_threads)
+        if pending and time.monotonic() - self.exit_observed_at < OUTPUT_DRAIN_SECONDS:
+            return
         self.exit_code = code
         self.terminating = False
         if code < 0:
             values = {item.value for item in signal.Signals}
             self.signal_name = signal.Signals(-code).name if -code in values else str(-code)
-        self.closed = True
-        if self.completed_at is None:
-            self.completed_at = time.time()
+        with self.lock:
+            if pending:
+                self.output_incomplete = True
+                self.reader_stop.set()
+                self.warnings.append("Output incomplete: pipe readers did not finish within 5 seconds after process exit.")
+            # Freeze buffers before publishing a terminal or copying an archive.
+            self.closed = True
+        self.completed_at = time.time()
 
     def drain_readers(self, timeout: float = 0.2) -> None:
-        deadline = time.time() + timeout
-        for thread in list(self.reader_threads):
-            remaining = max(0.0, deadline - time.time())
+        deadline = time.monotonic() + timeout
+        for reader in list(self.reader_threads):
+            remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
                 break
-            thread.join(timeout=remaining)
+            reader.join(timeout=remaining)
 
     def drain_watchdog(self, timeout: float = 0.2) -> None:
         thread = self.watchdog_thread
@@ -370,50 +408,59 @@ class RetainedExecOutput:
     signal_name: str | None
     timed_out: bool
     output_encoding: str
+    output_incomplete: bool
     lock: Any = field(repr=False)
 
     @classmethod
     def capture(cls, session: ExecSession, registry_lock: Any) -> RetainedExecOutput:
-        session.refresh_status()
-        if session.process.poll() is None:
-            raise ValueError("cannot retain output for a running process")
-        session.close_stdin()
-        session.drain_readers(timeout=0.2)
-        session.drain_watchdog(timeout=0.2)
-        for stream in (session.process.stdout, session.process.stderr):
-            if stream is not None and not stream.closed:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-        session.reader_threads.clear()
-        with session.lock:
-            retained = cls(
-                session_id=session.session_id,
-                warnings=list(session.warnings),
-                stdout=bytearray(session.stdout),
-                stderr=bytearray(session.stderr),
-                stdout_start_offset=session.stdout_start_offset,
-                stderr_start_offset=session.stderr_start_offset,
-                stdout_cursor=session.stdout_cursor,
-                stderr_cursor=session.stderr_cursor,
-                stdout_total_bytes=session.stdout_total_bytes,
-                stderr_total_bytes=session.stderr_total_bytes,
-                stdout_dropped_bytes=session.stdout_dropped_bytes,
-                stderr_dropped_bytes=session.stderr_dropped_bytes,
-                completed_at=session.completed_at or time.time(),
-                exit_code=session.exit_code,
-                signal_name=session.signal_name,
-                timed_out=session.timed_out,
-                output_encoding=session.output_encoding,
-                # Retained output has no independent lifecycle owner. Reuse
-                # the Runtime registry's re-entrant lock so a retained record
-                # does not allocate one Windows synchronization handle per
-                # completed command.
-                lock=registry_lock,
-            )
-        release_terminal_process_resources(session)
-        return retained
+        # Active snapshots/capture take lifecycle before registry; registry
+        # operations never acquire lifecycle. Retained records reuse the
+        # registry lock so completed sessions do not retain one OS lock each.
+        with session.lifecycle_lock:
+            if session.retained is not None:
+                return session.retained
+            session.refresh_status()
+            if not session.closed:
+                raise ValueError("cannot retain output before process exit and output settlement")
+            with session.lock:
+                retained = cls(
+                    session_id=session.session_id,
+                    warnings=list(session.warnings),
+                    stdout=bytearray(session.stdout),
+                    stderr=bytearray(session.stderr),
+                    stdout_start_offset=session.stdout_start_offset,
+                    stderr_start_offset=session.stderr_start_offset,
+                    stdout_cursor=session.stdout_cursor,
+                    stderr_cursor=session.stderr_cursor,
+                    stdout_total_bytes=session.stdout_total_bytes,
+                    stderr_total_bytes=session.stderr_total_bytes,
+                    stdout_dropped_bytes=session.stdout_dropped_bytes,
+                    stderr_dropped_bytes=session.stderr_dropped_bytes,
+                    completed_at=session.completed_at or time.time(),
+                    exit_code=session.exit_code,
+                    signal_name=session.signal_name,
+                    timed_out=session.timed_out,
+                    output_encoding=session.output_encoding,
+                    output_incomplete=session.output_incomplete,
+                    lock=registry_lock,
+                )
+            session.retained = retained
+            # Closing a buffered pipe owned by a reader can block. Hand that
+            # cleanup to a daemon; request completion never waits on pipe EOF.
+            def cleanup() -> None:
+                session.drain_readers(timeout=0.2)
+                session.drain_watchdog(timeout=0.2)
+                release_terminal_process_resources(session)
+                session.reader_threads[:] = [reader for reader in session.reader_threads if reader.is_alive()]
+
+            if any(reader.is_alive() for reader in session.reader_threads) or (
+                session.watchdog_thread is not None and session.watchdog_thread.is_alive()
+            ):
+                threading.Thread(target=cleanup, name=f"output-cleanup-{session.session_id}", daemon=True).start()
+            else:
+                release_terminal_process_resources(session)
+                session.reader_threads.clear()
+            return retained
 
     @property
     def retained_bytes(self) -> int:
@@ -461,7 +508,8 @@ class RetainedExecOutput:
             "stdout_omitted_bytes": stdout_omitted,
             "stderr_omitted_bytes": stderr_omitted,
             "truncated": (
-                stdout_truncation.truncated
+                self.output_incomplete
+                or stdout_truncation.truncated
                 or stderr_truncation.truncated
                 or stdout_omitted > 0
                 or stderr_omitted > 0
@@ -509,7 +557,12 @@ def release_terminal_process_resources(session: ExecSession) -> None:
     process = session.process
     if process.returncode is None:
         raise ValueError("cannot release resources for a running process")
+    readers_pending = any(reader.is_alive() for reader in session.reader_threads)
     for name in ("stdin", "stdout", "stderr"):
+        # A delayed reader owns its pipe close; never close its fd underneath
+        # os.read (or wait for its buffered-I/O lock on a request thread).
+        if readers_pending and name in {"stdout", "stderr"}:
+            continue
         stream = getattr(process, name, None)
         if stream is not None and not stream.closed:
             try:
@@ -517,7 +570,7 @@ def release_terminal_process_resources(session: ExecSession) -> None:
             except OSError:
                 pass
         setattr(process, name, None)
-    if session.pty_master_fd is not None:
+    if session.pty_master_fd is not None and not readers_pending:
         try:
             os.close(session.pty_master_fd)
         except OSError:
@@ -536,8 +589,13 @@ def release_terminal_process_resources(session: ExecSession) -> None:
 def start_reader_threads(session: ExecSession) -> None:
     def reader(stream: BinaryIO, append: Any) -> None:
         try:
-            while True:
-                chunk = os.read(stream.fileno(), 4096)
+            os.set_blocking(stream.fileno(), False)
+            while not session.reader_stop.is_set():
+                try:
+                    chunk = os.read(stream.fileno(), 4096)
+                except BlockingIOError:
+                    session.reader_stop.wait(0.01)
+                    continue
                 if not chunk:
                     break
                 append(chunk)
@@ -551,8 +609,13 @@ def start_reader_threads(session: ExecSession) -> None:
 
     def pty_reader(fd: int) -> None:
         try:
-            while True:
-                chunk = os.read(fd, 4096)
+            os.set_blocking(fd, False)
+            while not session.reader_stop.is_set():
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    session.reader_stop.wait(0.01)
+                    continue
                 if not chunk:
                     break
                 session.append_stdout(chunk)

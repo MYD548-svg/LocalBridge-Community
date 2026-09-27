@@ -37,6 +37,7 @@ export const CI_STAGES = validateStages([
       "scripts/test/ci-gate.test.mjs",
       "scripts/test/structure.test.mjs",
       "scripts/test/build-regression.test.mjs",
+      "scripts/test/runtime-output.test.mjs",
     ),
   },
   {

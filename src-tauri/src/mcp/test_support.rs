@@ -775,6 +775,16 @@ pub(crate) fn settle_public_command(
     loop {
         let data = &response.body["result"]["structuredContent"]["data"];
         output.push_str(data["output"].as_str().unwrap_or_default());
+        eprintln!(
+            "COMMAND_POLL id={} session={} status={} exit={} chunk_bytes={} total_bytes={} error={}",
+            response.body["id"],
+            data["session_id"],
+            data["status"],
+            data["exit_code"],
+            data["output"].as_str().unwrap_or_default().len(),
+            output.len(),
+            response.body["result"]["structuredContent"]["error"]
+        );
         match classify_command_poll_response(&response) {
             CommandPollObservation::Running => {
                 public_session = data["session_id"]
