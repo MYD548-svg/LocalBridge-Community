@@ -8853,6 +8853,8 @@ mod tests {
         );
 
         let marker = workspace.join("resubmit-probe.txt");
+        let abandoned_marker = marker.clone();
+        let resubmit_marker = marker.clone();
 
         // Occupy the facade execution lane: the healthy upstream acknowledges
         // queued work in ~50ms, so the stall comes from the lane itself.
@@ -8904,7 +8906,7 @@ mod tests {
                         "params":{
                             "name":"exec_command",
                             "arguments":{
-                                "command":format!("Add-Content -Path '{}' -Value 'orphan-run'", marker.display()),
+                                "command":format!("Add-Content -Path '{}' -Value 'orphan-run'", abandoned_marker.display()),
                                 "shell":"windows_powershell",
                                 "yield_time_ms":0,
                                 "timeout_ms":60000,
@@ -8932,7 +8934,7 @@ mod tests {
                     "params":{
                         "name":"exec_command",
                         "arguments":{
-                            "command":format!("Add-Content -Path '{}' -Value 'resubmit-run'", marker.display()),
+                                "command":format!("Add-Content -Path '{}' -Value 'resubmit-run'", resubmit_marker.display()),
                             "shell":"windows_powershell",
                             "yield_time_ms":30000,
                             "timeout_ms":60000,
