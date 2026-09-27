@@ -10973,24 +10973,25 @@ mod tests {
         // fabricated cancelled terminal.
         facade.adapter.runtime.stop().unwrap();
 
-        let kill = facade.call_tool(
-            PermissionMode::Full,
-            "command_control",
-            json!({"action":"kill","session_id":public_session,"signal":"KILL","wait_ms":0}),
-            None,
-            |_| {},
-        );
-        let kill_error = kill.expect_err(
-            "a retryable transport outage must surface as an error, not a fabricated cancelled terminal",
+        let kill = facade
+            .call_tool(
+                PermissionMode::Full,
+                "command_control",
+                json!({"action":"kill","session_id":public_session,"signal":"KILL","wait_ms":0}),
+                None,
+                |_| {},
+            )
+            .expect("the kill answers an MCP envelope, not a fabricated cancelled terminal");
+        // The outage surfaces as the contract's retryable error envelope
+        // instead of a cancelled success.
+        assert_eq!(kill["isError"], true, "{kill:#}");
+        assert_eq!(
+            kill["structuredContent"]["error"]["code"], "SessionUnavailable",
+            "{kill:#}"
         );
         assert_eq!(
-            kill_error.code,
-            FacadeErrorCode::SessionUnavailable,
-            "{kill_error:#?}"
-        );
-        assert!(
-            kill_error.retryable,
-            "the outage is retryable by contract: {kill_error:#?}"
+            kill["structuredContent"]["error"]["retryable"], true,
+            "the outage is retryable by contract: {kill:#}"
         );
 
         // Cancellation intent, delivery and process termination are different
@@ -11027,21 +11028,24 @@ mod tests {
 
         // The same holds for polls issued while the intent is pending (C):
         // a transient error must not be converted into a cancelled success.
-        let poll = facade.call_tool(
-            PermissionMode::Full,
-            "command_control",
-            json!({"action":"poll","session_id":public_session,"wait_ms":0}),
-            None,
-            |_| {},
-        );
-        let poll_error =
-            poll.expect_err("a poll during the transport outage must surface the retryable error");
+        let poll = facade
+            .call_tool(
+                PermissionMode::Full,
+                "command_control",
+                json!({"action":"poll","session_id":public_session,"wait_ms":0}),
+                None,
+                |_| {},
+            )
+            .expect("the poll answers an MCP envelope during the outage");
+        assert_eq!(poll["isError"], true, "{poll:#}");
         assert_eq!(
-            poll_error.code,
-            FacadeErrorCode::SessionUnavailable,
-            "{poll_error:#?}"
+            poll["structuredContent"]["error"]["code"], "SessionUnavailable",
+            "{poll:#}"
         );
-        assert!(poll_error.retryable, "{poll_error:#?}");
+        assert_eq!(
+            poll["structuredContent"]["error"]["retryable"], true,
+            "{poll:#}"
+        );
         let execution = facade
             .adapter
             .executions
@@ -11141,23 +11145,29 @@ mod tests {
         // session identity and the facade terminalizes this attempt's public
         // session with the error - but the upstream work item is NOT
         // cancelled and will run later.
-        let first = facade.call_tool(
-            PermissionMode::Full,
-            "exec_command",
-            json!({
-                "command":format!("Add-Content -Path '{marker_literal}' -Value 'orphan-run'"),
-                "shell":"windows_powershell",
-                "yield_time_ms":0,
-                "timeout_ms":60000,
-                "max_output_bytes":4096
-            }),
-            None,
-            |_| {},
+        let first = facade
+            .call_tool(
+                PermissionMode::Full,
+                "exec_command",
+                json!({
+                    "command":format!("Add-Content -Path '{marker_literal}' -Value 'orphan-run'"),
+                    "shell":"windows_powershell",
+                    "yield_time_ms":0,
+                    "timeout_ms":60000,
+                    "max_output_bytes":4096
+                }),
+                None,
+                |_| {},
+            )
+            .expect("the expired submission answers an MCP envelope");
+        assert_eq!(
+            first["structuredContent"]["error"]["code"], "OperationTimedOut",
+            "a submission queued past its transport budget must answer OperationTimedOut: {first:#}"
         );
-        let first_error = first.expect_err(
-            "a submission queued past its transport budget must answer OperationTimedOut",
+        assert!(
+            first["structuredContent"]["data"].is_null(),
+            "the timed-out submission carries no session identity: {first:#}"
         );
-        assert_eq!(first_error.code, FacadeErrorCode::OperationTimedOut);
 
         // Resubmission: a fresh execution identity that waits out the lane and
         // runs to completion.
