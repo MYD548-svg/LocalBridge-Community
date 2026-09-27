@@ -10905,7 +10905,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn kill_with_retryable_transport_failure_keeps_the_execution_and_cancel_intent() {
-        use crate::domain::execution::ExecutionState;
         use crate::mcp::{CodingToolsPermissionMode, CodingToolsRuntimeConfig, InternalBearer};
         use std::time::Duration;
 

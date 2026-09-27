@@ -8963,7 +8963,7 @@ mod tests {
         } else {
             assert_eq!(
                 resubmit_status, "running",
-                "unexpected resubmission envelope: {resubmit_response:#?}"
+                "unexpected resubmission envelope: {resubmit_response.body:#?}"
             );
             let resubmit_session_id = resubmit_response.body["result"]["structuredContent"]["data"]
                 ["session_id"]
