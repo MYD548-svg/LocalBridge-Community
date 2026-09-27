@@ -8811,6 +8811,183 @@ mod tests {
         cleanup_test_directory(&workspace);
     }
 
+    /// Dynamic boundary probe for the resubmission risk (the submit-timeout
+    /// duplicate-execution question): a submission whose response the caller
+    /// never received still gets processed by the PEP afterwards, so the
+    /// caller's resubmission produces a SECOND execution of the same command.
+    /// The healthy upstream acknowledges queued submissions in ~50ms, so the
+    /// stall is injected deterministically by holding the facade execution
+    /// lane with a foreground command while the abandoned client's read
+    /// budget expires. Counted workspace-local markers (a temp workspace,
+    /// never the user's) prove both runs; this documents the resubmission
+    /// boundary rather than asserting exactly-once semantics, and keeps the
+    /// resubmission restricted to the reviewed side-effect-free test
+    /// scenarios.
+    #[test]
+    fn resubmission_after_an_abandoned_submission_leaves_two_executions() {
+        let root = repo_root();
+        let workspace = temp_workspace();
+        let coding = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                free_port(),
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
+            Duration::from_secs(10),
+        )
+        .expect("bundled MCP ready");
+        let pep = PolicyEnforcementRuntime::start(coding, policy(&root), PermissionMode::Full)
+            .expect("PEP listener ready");
+        let initialized = initialize(pep.port(), 400);
+        let session = initialized.session.expect("downstream MCP session");
+        assert_eq!(
+            post(
+                pep.port(),
+                Some(&session),
+                &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            )
+            .status,
+            202
+        );
+
+        let marker = workspace.join("resubmit-probe.txt");
+
+        // Occupy the facade execution lane: the healthy upstream acknowledges
+        // queued work in ~50ms, so the stall comes from the lane itself.
+        let occupier_port = pep.port();
+        let occupier_session = session.clone();
+        let occupier = thread::spawn(move || {
+            post_with_read_timeout(
+                occupier_port,
+                Some(&occupier_session),
+                &json!({
+                    "jsonrpc":"2.0","id":401,"method":"tools/call",
+                    "params":{
+                        "name":"exec_command",
+                        "arguments":{
+                            "command":"Start-Sleep -Seconds 20",
+                            "shell":"windows_powershell",
+                            "yield_time_ms":30000,
+                            "timeout_ms":60000,
+                            "max_output_bytes":4096
+                        }
+                    }
+                }),
+                Duration::from_secs(90),
+            )
+        });
+        assert_eventually(
+            "occupier never acquired the facade lane",
+            Duration::from_secs(15),
+            || {
+                matches!(
+                    pep.current_task_projection().latest_snapshot(),
+                    CurrentTaskStatus::Active(ref task) if task.state == TaskExecutionState::Running
+                )
+            },
+        );
+
+        // Abandoned submission: the client's read budget (2s) expires while
+        // the lane is held, so the caller never learns any session identity.
+        // The PEP still processes the submission once the lane frees.
+        let abandoned_port = pep.port();
+        let abandoned_session = session.clone();
+        let abandoned = thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                post_with_read_timeout(
+                    abandoned_port,
+                    Some(&abandoned_session),
+                    &json!({
+                        "jsonrpc":"2.0","id":402,"method":"tools/call",
+                        "params":{
+                            "name":"exec_command",
+                            "arguments":{
+                                "command":format!("Add-Content -Path '{}' -Value 'orphan-run'", marker.display()),
+                                "shell":"windows_powershell",
+                                "yield_time_ms":0,
+                                "timeout_ms":60000,
+                                "max_output_bytes":4096
+                            }
+                        }
+                    }),
+                    Duration::from_secs(2),
+                )
+            }))
+            .is_err()
+        });
+        thread::sleep(Duration::from_millis(500));
+
+        // Resubmission: enqueued behind the abandoned one, processed after
+        // the occupier releases the lane, runs to completion.
+        let resubmit_port = pep.port();
+        let resubmit_session = session.clone();
+        let resubmitted = thread::spawn(move || {
+            post_with_read_timeout(
+                resubmit_port,
+                Some(&resubmit_session),
+                &json!({
+                    "jsonrpc":"2.0","id":403,"method":"tools/call",
+                    "params":{
+                        "name":"exec_command",
+                        "arguments":{
+                            "command":format!("Add-Content -Path '{}' -Value 'resubmit-run'", marker.display()),
+                            "shell":"windows_powershell",
+                            "yield_time_ms":30000,
+                            "timeout_ms":60000,
+                            "max_output_bytes":4096
+                        }
+                    }
+                }),
+                Duration::from_secs(90),
+            )
+        });
+
+        let abandoned_gave_up = abandoned.join().expect("abandoned client thread");
+        assert!(
+            abandoned_gave_up,
+            "the abandoned submission must time out on the client side"
+        );
+        let resubmit_response = resubmitted.join().expect("resubmission client thread");
+        assert_eq!(
+            resubmit_response.body["result"]["structuredContent"]["data"]["status"], "completed",
+            "{:#?}",
+            resubmit_response.body
+        );
+
+        // Both executions left markers: the abandoned submission ran even
+        // though its caller never received a session identity, and the
+        // resubmission produced the second run.
+        let settle_deadline = Instant::now() + Duration::from_secs(45);
+        let content = loop {
+            if let Ok(text) = fs::read_to_string(&marker) {
+                if text.contains("orphan-run") && text.contains("resubmit-run") {
+                    break text;
+                }
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "the abandoned submission's work never ran: {marker:?}"
+            );
+            thread::sleep(Duration::from_millis(250));
+        };
+        assert!(
+            content.contains("orphan-run"),
+            "orphan liveness: the timed-out submission still executed"
+        );
+        assert!(
+            content.contains("resubmit-run"),
+            "the resubmission produced its own second execution"
+        );
+
+        let mut coding = pep.stop().expect("PEP stop after the boundary probe");
+        coding.stop().expect("MCP stop after the boundary probe");
+        assert_eq!(coding.active_processes().unwrap(), 0);
+        drop(coding);
+        cleanup_test_directory(&workspace);
+    }
+
     #[test]
     fn command_control_kill_is_not_blocked_by_unrelated_foreground_work() {
         let root = repo_root();

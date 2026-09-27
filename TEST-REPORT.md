@@ -73,16 +73,22 @@ Regression coverage (goes through the real error-handling paths):
 
 Dynamic duplicate-execution boundary (previously documented analytically,
 now verified by fault injection): the new
-`resubmission_after_a_submit_budget_timeout_executes_the_command_twice`
-test occupies the work lane, lets a submission expire its transport budget
-(`OperationTimedOut`, no session identity), resubmits the same command and
-observes with counted workspace-local side effects that BOTH runs execute -
-the timed-out submission's upstream work item is not cancelled (orphan
-liveness) and the resubmission produces a second execution. This pins the
-documented risk: resubmission remains restricted to the reviewed
-side-effect-free test scenarios, and production submit idempotency would
-require a protocol-level change (idempotency keys or durable submission
-records) that is out of scope for this cycle.
+`resubmission_after_an_abandoned_submission_leaves_two_executions` test
+holds the facade execution lane with a foreground command, lets a
+submission's client read budget expire (the caller never receives any
+session identity - the degraded-runner submit-timeout situation), then
+resubmits the same command and observes with counted workspace-local side
+effects that BOTH runs execute: the abandoned submission is still
+processed by the PEP and its command runs (orphan liveness), and the
+resubmission produces a second execution. A first cut of this probe
+assumed the healthy upstream would also leave queued submissions
+unacknowledged; the cloud run disproved that (queued submissions are
+acknowledged in ~50ms), so the stall is now injected at the facade lane,
+which is where the historical degraded-runner timeouts actually stalled.
+This pins the documented risk: resubmission remains restricted to the
+reviewed side-effect-free test scenarios, and production submit
+idempotency would require a protocol-level change (idempotency keys or
+durable submission records) that is out of scope for this cycle.
 
 After this review cycle the branch gained additional commits; the final
 acceptance object is the new head's own three runs. Their run IDs and artifact
