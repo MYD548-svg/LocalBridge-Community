@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { auditPackageRoot, scanTextForSensitive } from "../../../scripts/public-release/preflight.mjs";
 import { isPrivatePath, isPublicPath, sanitizePublicText } from "../../../scripts/public-release/policy.mjs";
@@ -38,13 +38,12 @@ assert.equal(scanTextForSensitive(`Runtime API Key=${syntheticSecret}`, "fixture
 assert.equal(scanTextForSensitive(`synthetic test token=${syntheticSecret}`, "fixture").high.length, 0);
 assert.equal(scanTextForSensitive("path=C:\\Users\\alice\\Desktop\\dump.txt", "fixture").warnings.length > 0, true);
 
-const fixture = resolve("release-artifacts/preflight/lb018pre-package-fixture");
-await rm(fixture, { recursive: true, force: true });
-await mkdir(fixture, { recursive: true });
+await mkdir(resolve("release-artifacts/preflight"), { recursive: true });
+const fixture = await mkdtemp(resolve("release-artifacts/preflight/lb018pre-package-fixture-"));
 await writeFile(resolve(fixture, "LocalBridge.exe"), "synthetic binary placeholder");
 assert.equal((await auditPackageRoot(fixture)).ok, true);
 await writeFile(resolve(fixture, "PR_CONTRACTS.json"), "{}");
 assert.equal((await auditPackageRoot(fixture)).ok, false);
-await rm(fixture, { recursive: true, force: true });
+console.log(`TEST_WORKSPACE_RETAINED path=${fixture}`);
 
 console.log("PUBLIC_RELEASE_PREFLIGHT_TEST=PASS private_governance=false fresh_history_policy=true package_audit=true");

@@ -24,7 +24,7 @@ impl TempDir {
 }
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", self.0.display());
     }
 }
 

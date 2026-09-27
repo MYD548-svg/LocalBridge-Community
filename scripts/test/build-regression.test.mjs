@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { stageBroker } from "../prepare-lb018-resources.mjs";
+import { stageBroker, compilePreflight } from "../prepare-lb018-resources.mjs";
 import { updateManifest } from "./update-tunnel.mjs";
 import { verifyRuntime, verifyHash, sha256, rejectExtras, installerEntryPaths, rejectDuplicateInstallerEntries } from "./runtime-integrity.mjs";
 import { runStages } from "./process.mjs";
@@ -167,3 +167,50 @@ test("failed stage prevents later stages from executing", () => {
   ]), /exit 7/);
   assert.throws(() => readFileSync(marker), /ENOENT/);
 });
+
+// No real compiler is spawned: failures must invalidate existing broker evidence
+// and prevent release builds, including when a previous attempt passed.
+for (const failure of [0, 1, 2, 3, "release", null]) {
+  test(`compile preflight and broker staging order: ${failure ?? "success"}`, () => {
+    const directory = fixture();
+    const evidence = "src-tauri/target/release-stage/broker-build.json";
+    const binary = "src-tauri/target/release/localbridge-privileged-broker.exe";
+    const reportPath = "tests/artifacts/ci/COMPILE-PREFLIGHT.json";
+    stageBroker(directory, () => put(directory, binary, "old-broker"));
+    put(directory, reportPath, JSON.stringify({ status: "PASS", checkoutSha: "old" }));
+    const calls = [];
+    const compile = () => compilePreflight(directory, (program, args) => {
+      assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, "BUILDING");
+      assert.equal(program, "cargo");
+      assert.equal(args[0], "+1.85.0");
+      assert.equal(args[args.indexOf("--manifest-path") + 1], "src-tauri/Cargo.toml");
+      assert.equal(args[args.indexOf("--target-dir") + 1], "src-tauri/target");
+      const index = calls.length;
+      if (index < 2) assert.ok(!args.includes("--features"));
+      else assert.equal(args[args.indexOf("--features") + 1], "privileged-broker");
+      calls.push(args[1]);
+      return { status: failure === index ? 17 : 0 };
+    }, () => "a".repeat(40));
+    const build = () => {
+      calls.push("release");
+      if (failure === "release") throw new Error("release build failed");
+      put(directory, binary, "new-broker");
+    };
+    const action = () => stageBroker(directory, build, compile);
+    if (failure === null) action();
+    else assert.throws(action, /failed/);
+    const report = JSON.parse(readFileSync(join(directory, reportPath)));
+    assert.equal(report.checkoutSha, "a".repeat(40));
+    if (Number.isInteger(failure)) {
+      assert.equal(report.status, "FAIL");
+      assert.deepEqual(calls, ["test", "clippy", "test", "clippy"].slice(0, failure + 1));
+      assert.equal(report.checks[failure].exitCode, 17);
+      assert.deepEqual(report.checks.map((check) => check.status),
+        report.checks.map((_, index) => index < failure ? "PASS" : index === failure ? "FAIL" : "NOT_RUN"));
+    } else {
+      assert.equal(report.status, "PASS");
+      assert.deepEqual(calls, ["test", "clippy", "test", "clippy", "release"]);
+    }
+    assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, failure === null ? "PASS" : "BUILDING");
+  });
+}

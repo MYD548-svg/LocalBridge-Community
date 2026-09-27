@@ -236,7 +236,7 @@ fn actual_bundled_runtime_is_authenticated_loopback_owned_and_secret_redacted() 
         "MCP listener must not accept new connections after stop"
     );
     drop(runtime);
-    fs::remove_dir_all(workspace).expect("cleanup workspace");
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
 }
 
 #[test]
@@ -318,7 +318,7 @@ fn terminal_commands_release_process_resources_while_retained_output_remains_rea
     runtime.stop().expect("stop terminal resource runtime");
     assert_eq!(runtime.active_processes().unwrap(), 0);
     drop(runtime);
-    fs::remove_dir_all(workspace).expect("cleanup terminal resource workspace");
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
 }
 
 #[test]
@@ -358,9 +358,9 @@ fn missing_or_corrupt_bundle_fails_closed_without_system_python_fallback() {
         CodingToolsRuntimeError::RuntimeChecksumMismatch(_)
     ));
 
-    fs::remove_dir_all(workspace).unwrap();
-    fs::remove_dir_all(missing_root).unwrap();
-    fs::remove_dir_all(corrupt_root).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", missing_root.display());
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", corrupt_root.display());
 }
 
 #[test]
@@ -427,17 +427,7 @@ fn guarded_git_call(
 }
 
 fn cleanup_nested_git_workspace(path: &Path) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match fs::remove_dir_all(path) {
-            Ok(()) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => panic!("cleanup {}: {error}", path.display()),
-        }
-    }
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", path.display());
 }
 
 #[test]

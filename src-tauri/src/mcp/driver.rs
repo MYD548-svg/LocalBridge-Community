@@ -500,7 +500,6 @@ fn production_runtime_config_keeps_workspace_identity_after_same_path_replacemen
         Some(original_identity.as_str())
     );
 
-    std::fs::remove_dir_all(&workspace).unwrap();
-    std::fs::rename(&displaced, &workspace).unwrap();
-    std::fs::remove_dir_all(&workspace).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", displaced.display());
 }

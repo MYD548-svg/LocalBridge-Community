@@ -29,7 +29,7 @@ impl TempWorkspace {
 
 impl Drop for TempWorkspace {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", self.0.display());
     }
 }
 
@@ -227,7 +227,11 @@ fn missing_workspace_after_restart_cannot_become_active() {
     let id = add_validated(&mut state, &validator, "id-deleted", path.clone(), 1);
     state.set_active_reference(id).unwrap();
     let json = serde_json::to_string(&state).unwrap();
-    fs::remove_dir_all(&path).unwrap();
+    fs::rename(&path, path.with_extension("retained")).unwrap();
+    eprintln!(
+        "TEST_WORKSPACE_RETAINED path={}",
+        path.with_extension("retained").display()
+    );
     let decoded: WorkspacePersistence = serde_json::from_str(&json).unwrap();
 
     assert!(matches!(

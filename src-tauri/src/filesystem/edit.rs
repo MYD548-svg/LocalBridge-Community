@@ -451,7 +451,7 @@ mod tests {
             service.search_replace("a.txt", &identity, "x", "y"),
             Err(CodingEditError::AmbiguousMatch)
         );
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -464,7 +464,7 @@ mod tests {
         service.delete_file("b.txt", &identity).unwrap();
         assert!(!root.join("b.txt").exists());
         assert!(root.join("dir").is_dir());
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -492,7 +492,7 @@ mod tests {
             ),
             Err(CodingEditError::FileChanged)
         );
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -515,7 +515,7 @@ mod tests {
             fs::read(root.join("a.txt")).unwrap(),
             b"\xef\xbb\xbfafter\r\ncontext\r\n"
         );
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -534,7 +534,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"after");
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -553,7 +553,7 @@ mod tests {
             Err(CodingEditError::PatchConflict)
         );
         assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"before suffix");
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(result, Err(CodingEditError::MultiFilePatchUnsupported));
         assert_eq!(fs::read(root.join("a.txt")).unwrap(), first);
         assert_eq!(fs::read(root.join("b.txt")).unwrap(), second);
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -601,7 +601,7 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
         drop(_writer);
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -621,7 +621,7 @@ mod tests {
             Err(CodingEditError::InvalidPath)
         );
         assert_eq!(fs::read(&outside_file).unwrap(), b"outside\n");
-        let _ = fs::remove_dir_all(container);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", container.display());
     }
 
     #[test]
@@ -660,7 +660,7 @@ mod tests {
         );
         let final_bytes = fs::read(root.join("new.txt")).unwrap();
         assert!(final_bytes == b"first" || final_bytes == b"second");
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -717,7 +717,7 @@ mod tests {
             b"outside\n"
         );
 
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 }

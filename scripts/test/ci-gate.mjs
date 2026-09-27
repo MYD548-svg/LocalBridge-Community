@@ -74,7 +74,7 @@ export const CI_STAGES = validateStages([
   {
     id: "runtime-resources",
     label: "pinned runtime resources",
-    ...node("scripts/prepare-lb018-resources.mjs"),
+    ...node("scripts/prepare-lb018-resources.mjs", "--compile-preflight"),
   },
   {
     id: "staged-integrity",
@@ -168,7 +168,7 @@ export function main(args = process.argv.slice(2)) {
     report.finishedAt = new Date().toISOString();
     save();
     if (report.status === "PASS") {
-      const evidence = ["TEST-REPORT.json", "BUILD-PROVENANCE.json", "toolchains.json"];
+      const evidence = ["TEST-REPORT.json", "BUILD-PROVENANCE.json", "toolchains.json", "COMPILE-PREFLIGHT.json"];
       appendFileSync(join(evidenceRoot, "SHA256SUMS.txt"), evidence.map((name) => `${sha256(readFileSync(join(evidenceRoot, name)))}  tests/artifacts/ci/${name}\n`).join(""));
     }
   }

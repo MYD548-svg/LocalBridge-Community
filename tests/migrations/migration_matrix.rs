@@ -28,7 +28,7 @@ fn v1_migrates_sequentially_to_current_registry_and_active_reference() {
         "legacy-one"
     );
     assert!(SettingsStore::new(&path).backup_path().exists());
-    fs::remove_dir_all(dir).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn v2_migrates_to_current_without_skipping_version_contract() {
             .as_str(),
         "validated:v2"
     );
-    fs::remove_dir_all(dir).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn v3_migrates_close_window_policy_to_safe_continue_running_default() {
     assert_eq!(data.schema_version, CURRENT_SETTINGS_SCHEMA_VERSION);
     assert!(data.settings.close_window_continue_running);
     assert!(SettingsStore::new(&path).backup_path().exists());
-    fs::remove_dir_all(dir).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn unvalidated_historical_workspace_is_preserved_as_pending_but_not_authorized()
     assert!(data.workspace.registry.entries().is_empty());
     assert!(data.workspace.active_workspace_id.is_none());
     assert!(data.workspace.pending_workspace_confirmation.is_some());
-    fs::remove_dir_all(dir).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
 }
 
 #[test]
@@ -83,7 +83,7 @@ fn future_schema_fails_safely_and_preserves_original_bytes() {
         )
     ));
     assert_eq!(fs::read(&path).unwrap(), before);
-    fs::remove_dir_all(dir).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
 }
 
 #[test]
@@ -94,5 +94,5 @@ fn failed_migration_preserves_original_data_and_does_not_reset() {
     assert!(SettingsStore::new(&path).load().is_err());
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(!SettingsStore::new(&path).backup_path().exists());
-    fs::remove_dir_all(dir).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
 }

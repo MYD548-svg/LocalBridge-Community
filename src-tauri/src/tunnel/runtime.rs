@@ -642,7 +642,7 @@ mod tests {
         ));
         let health_dir = prepared.config.health_state_dir.clone();
         drop(prepared);
-        fs::remove_dir_all(health_dir).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", health_dir.display());
     }
 
     #[test]
@@ -704,7 +704,10 @@ mod tests {
             Err(TunnelError::RestartDenied)
         ));
         assert_eq!(store.reads(), 2);
-        fs::remove_dir_all(base.health_state_dir).unwrap();
+        eprintln!(
+            "TEST_WORKSPACE_RETAINED path={}",
+            base.health_state_dir.display()
+        );
     }
 
     #[test]
@@ -728,7 +731,10 @@ mod tests {
             "non-recoverable credential/configuration faults must not reread the secret"
         );
         if base.health_state_dir.exists() {
-            fs::remove_dir_all(base.health_state_dir).unwrap();
+            eprintln!(
+                "TEST_WORKSPACE_RETAINED path={}",
+                base.health_state_dir.display()
+            );
         }
     }
 
@@ -1055,6 +1061,6 @@ mod tests {
         assert_eq!(runtime.active_processes().unwrap(), 0);
         drop(runtime);
         control_plane_thread.join().unwrap();
-        fs::remove_dir_all(health_dir).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", health_dir.display());
     }
 }

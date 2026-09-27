@@ -207,6 +207,8 @@ pub struct CodingToolsRuntime {
     workspace: PathBuf,
     workspace_authority: WorkspaceResolver,
     install_root: PathBuf,
+    #[cfg(test)]
+    tool_faults: std::collections::VecDeque<CodingToolsRuntimeError>,
 }
 
 impl fmt::Debug for CodingToolsRuntime {
@@ -314,6 +316,8 @@ impl CodingToolsRuntime {
             workspace: config.workspace,
             workspace_authority,
             install_root: config.install_root,
+            #[cfg(test)]
+            tool_faults: std::collections::VecDeque::new(),
         })
     }
 
@@ -392,6 +396,10 @@ impl CodingToolsRuntime {
         request_id: Option<&Value>,
         transport_timeout: Duration,
     ) -> Result<Value, CodingToolsRuntimeError> {
+        #[cfg(test)]
+        if let Some(error) = self.tool_faults.pop_front() {
+            return Err(error);
+        }
         if let Some(result) =
             handle_git_tool_with_authority(&self.workspace_authority, name, &arguments)
         {
@@ -408,6 +416,11 @@ impl CodingToolsRuntime {
                 .session
                 .call_tool_with_timeout(name, arguments, transport_timeout),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_tool_fault(&mut self, error: CodingToolsRuntimeError) {
+        self.tool_faults.push_back(error);
     }
 
     pub(crate) fn cancellation_client(
@@ -587,8 +600,7 @@ mod tests {
             Err(CodingToolsRuntimeError::InvalidConfiguration)
         ));
 
-        fs::remove_dir_all(&workspace).unwrap();
-        fs::rename(&displaced, &workspace).unwrap();
-        fs::remove_dir_all(container).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", container.display());
     }
 }

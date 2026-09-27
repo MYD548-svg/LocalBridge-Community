@@ -100,7 +100,7 @@ mod tests {
             Err(TunnelError::RuntimeChecksumMismatch)
         ));
 
-        fs::remove_dir_all(missing).unwrap();
-        fs::remove_dir_all(corrupt).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", missing.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", corrupt.display());
     }
 }

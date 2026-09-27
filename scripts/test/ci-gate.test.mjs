@@ -71,3 +71,8 @@ test("a running desktop binary can use the same Rust gate with an isolated targe
     ["+1.85.0", "test", "--target-dir", "src-tauri/target/local-gate"],
   );
 });
+
+test("only the shared resource gate opts into compile preflight", () => {
+  const resources = CI_STAGES.find((stage) => stage.id === "runtime-resources");
+  assert.deepEqual(resources.args, ["scripts/prepare-lb018-resources.mjs", "--compile-preflight"]);
+});

@@ -783,19 +783,7 @@ fn actual_blocked_control_plane() -> (String, Sender<()>, JoinHandle<()>) {
 
 #[cfg(windows)]
 fn actual_cleanup_dir(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        match fs::remove_dir_all(path) {
-            Ok(()) => return,
-            Err(error) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(25));
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    return;
-                }
-            }
-            Err(error) => panic!("remove LB-013 temp dir {}: {error}", path.display()),
-        }
-    }
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", path.display());
 }
 
 #[cfg(windows)]

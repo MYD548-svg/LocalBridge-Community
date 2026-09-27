@@ -580,7 +580,7 @@ fn schema49_actual_broker_structured_filesystem_covers_all_twelve_actions() {
 
     session.shutdown().unwrap();
     assert!(child.wait().unwrap().success());
-    fs::remove_dir_all(root).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
 }
 
 #[test]
@@ -628,7 +628,7 @@ fn schema43_actual_broker_structured_filesystem_cancel_reaches_worker() {
     session.ping().unwrap();
     session.shutdown().unwrap();
     assert!(child.wait().unwrap().success());
-    fs::remove_dir_all(root).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
 }
 
 #[derive(Debug)]
@@ -955,7 +955,7 @@ fn live_uac_mcp_elevated_exec_uses_administrator_token_and_revokes_catalog() {
     coding.stop().expect("stop live UAC coding runtime");
     drop(coding);
     let _ = fs::remove_file(&sibling_broker);
-    let _ = fs::remove_dir_all(&workspace);
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
     println!(
         "LB012_LIVE_UAC=PASS ordinary_before=S-1-16-8192 ordinary_after=S-1-16-8192 elevated=S-1-16-12288 authority_restarts=2"
     );

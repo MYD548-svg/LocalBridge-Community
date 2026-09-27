@@ -1,3 +1,59 @@
+# LocalBridge concentrated repair - 2026-09-27
+
+## Current delivery boundary
+
+Implementation baseline: `944001d5014858ae4ea5a30a4da173be7f34afd0`.
+Branch: `codex/fix-ci-validation`. The user requests one push after local
+checks, then immediate stop after comparing the remote branch SHA. No Actions
+query, rerun, artifact download, merge, or release is part of this delivery.
+**Cloud results for this delivery: UNVERIFIED.** Historical evidence below
+belongs to its named commits and is not acceptance evidence for this change.
+
+## Changes in this delivery
+
+- Preserve the production `!error.retryable` cancellation safeguard.
+- Replace the resubmission probe's sleeping occupier with the existing facade
+  mutex. Scoped request threads are joined; the lock is released before joining
+  a blocked request, including during assertion unwinding.
+- The HTTP test helper reports connect/configure/write/read/parse failures,
+  I/O error kind and received byte count. The first request must time out while
+  reading with zero received bytes; only then is the second sent. The requests
+  have identical tool arguments and different JSON-RPC IDs. Each execution
+  atomically publishes a UUID marker; exactly two valid markers are required.
+  This tests client-response abandonment, not every server OperationTimedOut path.
+- Add per-runtime, cfg(test)-only one-shot control faults. ConnectionUnavailable
+  and McpExited exercise the actual facade mappings without killing the process.
+  Tests cover preserved cancellation intent/session/pending output, same-session
+  recovery, real cancellation, terminal replay and non-retryable unknown sessions.
+  Injected McpExited is an error-mapping probe, not proof of supervisor recovery
+  after actual process exit. Production pending_runtime_fault handling is intact;
+  the independent real-process-stop regression remains.
+- Retain test workspaces, including Drop cleanup and release-preflight fixtures.
+  Missing-path/identity tests preserve their assertions by retaining displaced
+  directories. The production filesystem delete implementation is unchanged.
+- Keep all 19 gate stages, ten authentication probes and existing workflows.
+  Only the shared runtime-resources call opts into --compile-preflight. After
+  toolbox/bootstrap and BUILDING evidence, test compilation and Clippy run for
+  default all-targets and the feature-gated broker, before release broker build.
+  The feature is not passed to Tauri packaging. COMPILE-PREFLIGHT.json records
+  checkout SHA, exact commands, statuses and exit codes; failed checks leave
+  later checks NOT_RUN and broker evidence BUILDING. Final gate hashes include
+  this report. Ordinary resource preparation does not repeat the preflight.
+
+## Validation status
+
+- PASS: 31 Node base/gate/build-regression tests in the initial local run,
+  including all four injected preflight failures, release failure and success.
+  Final check results are recorded in the delivery message.
+- Rust test compilation, Clippy, runtime regressions and three repeated timing
+  runs: NOT_RUN locally. No usable MSVC/Windows SDK was found. No toolchain was
+  installed and formatting is not being represented as compilation.
+- New dynamic resubmission/recovery tests: ADDED, AWAITING WINDOWS EXECUTION.
+- Current-head Actions and installer/artifact verification: UNVERIFIED by user
+  instruction. Live ChatGPT, UAC and clean-machine installation: NOT_RUN.
+
+## Historical report (prior commits only; not revalidated this delivery)
+
 # LocalBridge CI repair verification - rewritten 2026-09-26
 
 This report was rewritten from scratch in explicit UTF-8 (ASCII subset): the
@@ -72,7 +128,7 @@ Regression coverage (goes through the real error-handling paths):
   answer with `retryable: false`, so they are never retried forever).
 
 Dynamic duplicate-execution boundary (previously documented analytically,
-now verified by fault injection): the new
+now covered by an added fault-injection test; successful execution remains unverified): the new
 `resubmission_after_an_abandoned_submission_leaves_two_executions` test
 holds the facade execution lane with a foreground command, lets a
 submission's client read budget expire (the caller never receives any

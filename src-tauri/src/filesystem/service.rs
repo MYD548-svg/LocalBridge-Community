@@ -2957,7 +2957,7 @@ mod tests {
             service.read("binary.bin", 0, MAX_FILESYSTEM_READ_BYTES + 1),
             Err(FilesystemError::LimitExceeded)
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -2982,7 +2982,7 @@ mod tests {
                 .to_string_lossy()
                 .contains(".localbridge-")
         }));
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3004,7 +3004,7 @@ mod tests {
             ),
             Err(FilesystemError::LimitExceeded)
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3040,7 +3040,7 @@ mod tests {
         assert_eq!(bounded.scanned_entries, 2);
         assert!(bounded.truncated);
         assert_eq!(bounded.entries.len(), 2);
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3093,7 +3093,7 @@ mod tests {
             .unwrap();
         assert_eq!(single_file.matches.len(), 1);
         assert_eq!(single_file.scanned_files, 1);
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3145,7 +3145,7 @@ mod tests {
             recursive.truncated,
             "deeper content is truncated without discarding root siblings"
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -3224,7 +3224,7 @@ mod tests {
             tree_manifest(&root, 8, 2, &FilesystemCancellation::default()),
             Err(FilesystemError::LimitExceeded)
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3239,7 +3239,7 @@ mod tests {
             service.remove_empty_directory("."),
             Err(FilesystemError::OutsideAuthority)
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3257,7 +3257,7 @@ mod tests {
             service.hash("large.bin").unwrap().sha256,
             service.hash("large-copy.bin").unwrap().sha256
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3272,7 +3272,7 @@ mod tests {
             service.read_all_bytes("large.bin"),
             Err(FilesystemError::LimitExceeded)
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3292,7 +3292,7 @@ mod tests {
             fs::read(root.join("source/sub/secret.txt")).unwrap(),
             b"secret"
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -3310,7 +3310,7 @@ mod tests {
         assert_eq!(fs::read(root.join("limit/a.txt")).unwrap(), b"a");
         assert_eq!(fs::read(root.join("limit/b.txt")).unwrap(), b"b");
 
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -3326,7 +3326,7 @@ mod tests {
         service.delete("link", true, 8, 100).unwrap();
         assert!(!link.exists());
         assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"keep");
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -3345,7 +3345,7 @@ mod tests {
         service.delete("parent", true, 8, 100).unwrap();
         assert!(!parent.exists());
         assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"keep");
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -3366,7 +3366,7 @@ mod tests {
         assert!(metadata_is_reparse(&fs::symlink_metadata(&moved).unwrap()));
         assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"keep");
         fs::remove_dir(&moved).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -3416,8 +3416,8 @@ mod tests {
 
         assert_eq!(fs::read(&target).unwrap(), b"inside");
         assert!(!outside.join("target.txt").exists());
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[cfg(windows)]
@@ -3450,7 +3450,7 @@ mod tests {
         drop(delete_handle);
         assert!(!moved.exists());
         assert!(!displaced.exists());
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -3477,8 +3477,8 @@ mod tests {
             fs::read(outside_parent.join("read.txt")).unwrap(),
             b"outside"
         );
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[cfg(windows)]
@@ -3509,8 +3509,8 @@ mod tests {
             fs::read(outside_parent.join("read.txt")).unwrap(),
             b"outside-secret"
         );
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[cfg(windows)]
@@ -3549,8 +3549,8 @@ mod tests {
         assert!(root.join("move-source.txt").exists());
 
         fs::remove_dir(&link).unwrap();
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[cfg(windows)]
@@ -3580,7 +3580,7 @@ mod tests {
                 std::process::id()
             ));
         if drive(&source_root) == drive(&destination_root) {
-            fs::remove_dir_all(source_root).unwrap();
+            eprintln!("TEST_WORKSPACE_RETAINED path={}", source_root.display());
             return;
         }
         fs::create_dir_all(&destination_root).unwrap();
@@ -3631,8 +3631,11 @@ mod tests {
             b"beta"
         );
 
-        fs::remove_dir_all(source_root).unwrap();
-        fs::remove_dir_all(destination_root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", source_root.display());
+        eprintln!(
+            "TEST_WORKSPACE_RETAINED path={}",
+            destination_root.display()
+        );
     }
 
     #[test]
@@ -3670,7 +3673,7 @@ mod tests {
         drop(locks);
         assert!(OpenOptions::new().write(true).open(&child).is_ok());
         fs::remove_file(injected).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -3710,7 +3713,7 @@ mod tests {
         drop(locks);
         assert_eq!(fs::read(tree.join("original.txt")).unwrap(), b"original");
         assert_eq!(fs::read(tree.join("injected.txt")).unwrap(), b"injected");
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3727,7 +3730,7 @@ mod tests {
         assert!(fs::rename(&safe, &displaced).is_err());
         drop(guard);
         fs::rename(&safe, &displaced).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -3749,7 +3752,7 @@ mod tests {
             fs::read(root.join("source/sub/data.txt")).unwrap(),
             b"payload"
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]

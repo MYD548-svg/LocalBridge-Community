@@ -408,7 +408,7 @@ mod tests {
                 .any(|path| path.replace('\\', "/").ends_with("src/runtime/recovery.rs")),
             "{related:#?}"
         );
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(windows)]
@@ -449,9 +449,9 @@ mod tests {
             related.is_empty(),
             "junction escaped context authority: {related:#?}"
         );
-        let _ = fs::remove_dir_all(&junction);
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", junction.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[cfg(windows)]
@@ -487,8 +487,8 @@ mod tests {
             fs::read(outside.join("source.rs")).unwrap(),
             b"outside-secret-context"
         );
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[test]

@@ -6016,7 +6016,7 @@ mod tests {
         }
 
         let _coding = pep.stop().unwrap();
-        let _ = fs::remove_dir_all(workspace);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
     }
 
     #[test]
@@ -6057,8 +6057,8 @@ mod tests {
         assert_eq!(pep.control_plane.scheduler().snapshot().work_queued, 0);
 
         let _coding = pep.stop().unwrap();
-        let _ = fs::remove_dir_all(workspace_a);
-        let _ = fs::remove_dir_all(workspace_b);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace_a.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace_b.display());
     }
 
     #[test]
@@ -6151,7 +6151,7 @@ mod tests {
         );
 
         let _coding = pep.stop().unwrap();
-        let _ = fs::remove_dir_all(workspace);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
     }
 
     #[test]
@@ -7766,7 +7766,7 @@ mod tests {
         let mut coding = pep.stop().expect("absolute path PEP stops");
         coding.stop().expect("absolute path MCP stops");
         cleanup_test_directory(&workspace);
-        fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[test]
@@ -8811,209 +8811,162 @@ mod tests {
         cleanup_test_directory(&workspace);
     }
 
-    /// Dynamic boundary probe for the resubmission risk (the submit-timeout
-    /// duplicate-execution question): a submission whose response the caller
-    /// never received still gets processed by the PEP afterwards, so the
-    /// caller's resubmission produces a SECOND execution of the same command.
-    /// The healthy upstream acknowledges queued submissions in ~50ms, so the
-    /// stall is injected deterministically by holding the facade execution
-    /// lane with a foreground command while the abandoned client's read
-    /// budget expires. Counted workspace-local markers (a temp workspace,
-    /// never the user's) prove both runs; this documents the resubmission
-    /// boundary rather than asserting exactly-once semantics, and keeps the
-    /// resubmission restricted to the reviewed side-effect-free test
-    /// scenarios.
+    /// A client read timeout does not withdraw an already-sent request.
+    /// Resubmitting identical tool arguments can execute the command twice.
     #[test]
     fn resubmission_after_an_abandoned_submission_leaves_two_executions() {
-        let root = repo_root();
         let workspace = temp_workspace();
-        let coding = CodingToolsRuntime::start(
-            CodingToolsRuntimeConfig::new(
-                &root,
-                &workspace,
-                free_port(),
-                CodingToolsPermissionMode::Trusted,
-            ),
-            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
-            Duration::from_secs(10),
-        )
-        .expect("bundled MCP ready");
-        let pep = PolicyEnforcementRuntime::start(coding, policy(&root), PermissionMode::Full)
-            .expect("PEP listener ready");
+        let markers = workspace.join("resubmit-markers");
+        fs::create_dir(&markers).unwrap();
+        let fixture = PublicRuntimeFixture::start_in(workspace.clone(), PermissionMode::Full);
+        let pep = fixture.runtime();
         let initialized = initialize(pep.port(), 400);
         let session = initialized.session.expect("downstream MCP session");
         assert_eq!(
             post(
                 pep.port(),
                 Some(&session),
-                &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                &json!({
+                    "jsonrpc":"2.0", "method":"notifications/initialized", "params":{}
+                })
             )
             .status,
             202
         );
-
-        let marker = workspace.join("resubmit-probe.txt");
-        let abandoned_marker = marker.clone();
-        let resubmit_marker = marker.clone();
-
-        // Occupy the facade execution lane: the healthy upstream acknowledges
-        // queued work in ~50ms, so the stall comes from the lane itself.
-        let occupier_port = pep.port();
-        let occupier_session = session.clone();
-        let occupier = thread::spawn(move || {
-            post_with_read_timeout(
-                occupier_port,
-                Some(&occupier_session),
-                &json!({
-                    "jsonrpc":"2.0","id":401,"method":"tools/call",
-                    "params":{
-                        "name":"exec_command",
-                        "arguments":{
-                            "command":"Start-Sleep -Seconds 20",
-                            "shell":"windows_powershell",
-                            "yield_time_ms":30000,
-                            "timeout_ms":60000,
-                            "max_output_bytes":4096
-                        }
-                    }
-                }),
-                Duration::from_secs(90),
-            )
-        });
-        assert_eventually(
-            "occupier never acquired the facade lane",
-            Duration::from_secs(15),
-            || {
-                matches!(
-                    pep.current_task_projection().latest_snapshot(),
-                    CurrentTaskStatus::Active(ref task) if task.state == TaskExecutionState::Running
-                )
-            },
-        );
-
-        // Abandoned submission: the client's read budget (2s) expires while
-        // the lane is held, so the caller never learns any session identity.
-        // The PEP still processes the submission once the lane frees.
-        let abandoned_port = pep.port();
-        let abandoned_session = session.clone();
-        let abandoned = thread::spawn(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                post_with_read_timeout(
-                    abandoned_port,
-                    Some(&abandoned_session),
-                    &json!({
-                        "jsonrpc":"2.0","id":402,"method":"tools/call",
-                        "params":{
-                            "name":"exec_command",
-                            "arguments":{
-                                "command":format!("Add-Content -Path '{}' -Value 'orphan-run'", abandoned_marker.display()),
-                                "shell":"windows_powershell",
-                                "yield_time_ms":0,
-                                "timeout_ms":60000,
-                                "max_output_bytes":4096
-                            }
-                        }
-                    }),
+        // The command generates the identity at execution time. Both requests
+        // carry exactly the same tool parameters; only the RPC id changes.
+        let parameters = json!({"name":"exec_command", "arguments":{
+            "command":"$id = [guid]::NewGuid().ToString('D'); $dir = Join-Path (Get-Location).Path 'resubmit-markers'; $pending = Join-Path $dir ($id + '.pending'); [IO.File]::WriteAllText($pending, 'executed'); [IO.File]::Move($pending, (Join-Path $dir ($id + '.txt')))",
+            "shell":"windows_powershell", "yield_time_ms":0,
+            "timeout_ms":60000, "max_output_bytes":4096
+        }});
+        let response = thread::scope(|scope| {
+            // Declared inside the scope so unwinding releases the guard before
+            // scope waits for outstanding HTTP workers. The fixture then stops
+            // the runtime even if an assertion failed.
+            let guard_arc = pep.guard.as_ref().expect("facade guard").clone();
+            let guard = guard_arc.lock().unwrap();
+            let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+            let first_payload = json!({"jsonrpc":"2.0", "id":402, "method":"tools/call", "params":parameters.clone()});
+            let first_session = session.clone();
+            let port = pep.port();
+            let abandoned = scope.spawn(move || {
+                try_post_with_read_timeout(
+                    port,
+                    Some(&first_session),
+                    &first_payload,
                     Duration::from_secs(2),
+                    || sent_tx.send(()).expect("first request sent observer"),
                 )
-            }))
-            .is_err()
-        });
-        thread::sleep(Duration::from_millis(500));
-
-        // Resubmission: enqueued behind the abandoned one, processed after
-        // the occupier releases the lane, runs to completion.
-        let resubmit_port = pep.port();
-        let resubmit_session = session.clone();
-        let resubmitted = thread::spawn(move || {
-            post_with_read_timeout(
-                resubmit_port,
-                Some(&resubmit_session),
-                &json!({
-                    "jsonrpc":"2.0","id":403,"method":"tools/call",
-                    "params":{
-                        "name":"exec_command",
-                        "arguments":{
-                                "command":format!("Add-Content -Path '{}' -Value 'resubmit-run'", resubmit_marker.display()),
-                            "shell":"windows_powershell",
-                            "yield_time_ms":30000,
-                            "timeout_ms":60000,
-                            "max_output_bytes":4096
-                        }
-                    }
-                }),
-                Duration::from_secs(90),
-            )
-        });
-
-        let abandoned_gave_up = abandoned.join().expect("abandoned client thread");
-        assert!(
-            abandoned_gave_up,
-            "the abandoned submission must time out on the client side"
-        );
-        let resubmit_response = resubmitted.join().expect("resubmission client thread");
-        // Unlike the abandoned submission, the resubmission received a session
-        // identity. The ack may report "running" (the healthy upstream
-        // acknowledges queued work immediately), so settle it to terminal
-        // through that same session.
-        let resubmit_status =
-            &resubmit_response.body["result"]["structuredContent"]["data"]["status"];
-        let resubmit_terminal = if resubmit_status == "completed" {
-            resubmit_response
-        } else {
-            assert_eq!(
-                resubmit_status, "running",
-                "unexpected resubmission envelope: {resubmit_response.body:#?}"
-            );
-            let resubmit_session_id = resubmit_response.body["result"]["structuredContent"]["data"]
-                ["session_id"]
-                .as_str()
-                .expect("resubmission delivered a session identity")
-                .to_string();
-            poll_public_command_to_terminal(
-                pep.port(),
-                &session,
-                40301,
-                &resubmit_session_id,
-                Duration::from_secs(60),
-            )
-        };
-        assert_eq!(
-            resubmit_terminal.body["result"]["structuredContent"]["data"]["status"], "completed",
-            "{:#?}",
-            resubmit_terminal.body
-        );
-
-        // Both executions left markers: the abandoned submission ran even
-        // though its caller never received a session identity, and the
-        // resubmission produced the second run.
-        let settle_deadline = Instant::now() + Duration::from_secs(45);
-        let content = loop {
-            if let Ok(text) = fs::read_to_string(&marker) {
-                if text.contains("orphan-run") && text.contains("resubmit-run") {
-                    break text;
-                }
-            }
+            });
+            sent_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("first request fully written");
+            let error = abandoned
+                .join()
+                .expect("first client thread")
+                .expect_err("first request must time out while the facade is locked");
+            assert_eq!(error.stage, "read");
             assert!(
-                Instant::now() < settle_deadline,
-                "the abandoned submission's work never ran: {marker:?}"
+                matches!(
+                    error.kind,
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ),
+                "{error:?}"
             );
-            thread::sleep(Duration::from_millis(250));
-        };
-        assert!(
-            content.contains("orphan-run"),
-            "orphan liveness: the timed-out submission still executed"
-        );
-        assert!(
-            content.contains("resubmit-run"),
-            "the resubmission produced its own second execution"
-        );
+            assert_eq!(error.received_bytes, 0);
 
-        let mut coding = pep.stop().expect("PEP stop after the boundary probe");
-        coding.stop().expect("MCP stop after the boundary probe");
-        assert_eq!(coding.active_processes().unwrap(), 0);
-        drop(coding);
-        cleanup_test_directory(&workspace);
+            let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+            let second_payload =
+                json!({"jsonrpc":"2.0", "id":403, "method":"tools/call", "params":parameters});
+            let second_session = session.clone();
+            let resubmitted = scope.spawn(move || {
+                try_post_with_read_timeout(
+                    port,
+                    Some(&second_session),
+                    &second_payload,
+                    Duration::from_secs(90),
+                    || sent_tx.send(()).expect("second request sent observer"),
+                )
+            });
+            sent_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("second request fully written");
+            drop(guard);
+            resubmitted
+                .join()
+                .expect("second client thread")
+                .expect("second HTTP response")
+        });
+        assert_eq!(response.status, 200, "{:#?}", response.body);
+        assert_eq!(
+            response.body["result"]["isError"], false,
+            "{:#?}",
+            response.body
+        );
+        let terminal =
+            if response.body["result"]["structuredContent"]["data"]["status"] == "running" {
+                let id = response.body["result"]["structuredContent"]["data"]["session_id"]
+                    .as_str()
+                    .expect("resubmission session");
+                poll_public_command_to_terminal(
+                    pep.port(),
+                    &session,
+                    40301,
+                    id,
+                    Duration::from_secs(60),
+                )
+            } else {
+                response
+            };
+        assert_eq!(
+            terminal.body["result"]["structuredContent"]["data"]["status"], "completed",
+            "{:#?}",
+            terminal.body
+        );
+        let valid_markers = || {
+            fs::read_dir(&markers)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) != Some("pending"))
+                .inspect(|path| {
+                    assert!(path.is_file(), "unexpected marker entry: {path:?}");
+                    assert_eq!(
+                        path.extension().and_then(|value| value.to_str()),
+                        Some("txt")
+                    );
+                    let name = path.file_stem().unwrap().to_str().unwrap();
+                    assert_eq!(name.len(), 36);
+                    assert!(
+                        name.bytes().enumerate().all(|(i, byte)| {
+                            if [8, 13, 18, 23].contains(&i) {
+                                byte == b'-'
+                            } else {
+                                byte.is_ascii_hexdigit()
+                            }
+                        }),
+                        "invalid execution UUID: {name}"
+                    );
+                    assert_eq!(fs::read_to_string(path).unwrap(), "executed");
+                })
+                .count()
+        };
+        assert_eventually(
+            "both accepted submissions must execute",
+            Duration::from_secs(60),
+            || valid_markers() >= 2,
+        );
+        fixture.shutdown();
+        assert_eq!(
+            valid_markers(),
+            2,
+            "exactly two execution markers after process shutdown"
+        );
+        assert_eq!(
+            fs::read_dir(&markers).unwrap().count(),
+            2,
+            "no incomplete marker writes"
+        );
     }
 
     #[test]
@@ -10627,7 +10580,7 @@ mod tests {
             .expect("MCP stop after schema43 filesystem routing");
         drop(coding);
         cleanup_test_directory(&workspace);
-        let _ = fs::remove_dir_all(outside);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[test]

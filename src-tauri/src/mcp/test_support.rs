@@ -18,6 +18,7 @@ use crate::state::PermissionMode;
 
 const TEST_BEARER: &str = "LOCALBRIDGE_TEST_RUNTIME_BEARER_DO_NOT_LEAK";
 
+#[derive(Debug)]
 pub(crate) struct ClientResponse {
     pub(crate) status: u16,
     pub(crate) session: Option<String>,
@@ -75,54 +76,7 @@ pub(crate) fn free_port() -> u16 {
 }
 
 pub(crate) fn cleanup_test_directory(path: &Path) {
-    // Process ownership is asserted by the runtime fixture before this
-    // housekeeping step. Windows Defender, indexing, or another external
-    // observer can still retain a sharing handle after the owned Job is empty.
-    // Keep that environmental condition out of business lifecycle assertions,
-    // but only for the two concrete Windows lock errors; every other cleanup
-    // failure remains a test failure.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match fs::remove_dir_all(path) {
-            Ok(()) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) if is_external_windows_cleanup_lock(&error) => {
-                if Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                eprintln!(
-                    "TEST_WORKSPACE_CLEANUP=DEFERRED path={} windows_error={} reason=external_sharing_lock",
-                    path.display(),
-                    error.raw_os_error().unwrap_or_default()
-                );
-                return;
-            }
-            Err(error) => panic!("remove test workspace {}: {error}", path.display()),
-        }
-    }
-}
-
-fn is_external_windows_cleanup_lock(error: &std::io::Error) -> bool {
-    // ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION are the only errors that
-    // may be produced by a non-owned scanner/indexer after process convergence.
-    matches!(error.raw_os_error(), Some(5 | 32))
-}
-
-#[test]
-fn workspace_cleanup_only_defers_concrete_windows_lock_errors() {
-    assert!(is_external_windows_cleanup_lock(
-        &std::io::Error::from_raw_os_error(5)
-    ));
-    assert!(is_external_windows_cleanup_lock(
-        &std::io::Error::from_raw_os_error(32)
-    ));
-    assert!(!is_external_windows_cleanup_lock(
-        &std::io::Error::from_raw_os_error(3)
-    ));
-    assert!(!is_external_windows_cleanup_lock(
-        &std::io::Error::from_raw_os_error(87)
-    ));
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", path.display());
 }
 
 pub(crate) fn assert_eventually(
@@ -207,7 +161,7 @@ impl Drop for PublicRuntimeFixture {
     fn drop(&mut self) {
         self.stop_best_effort();
         if !self.cleaned {
-            let _ = fs::remove_dir_all(&self.workspace);
+            cleanup_test_directory(&self.workspace);
         }
     }
 }
@@ -225,9 +179,39 @@ pub(crate) fn post_with_read_timeout(
     payload: &Value,
     read_timeout: Duration,
 ) -> ClientResponse {
-    let body = serde_json::to_vec(payload).unwrap();
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    stream.set_read_timeout(Some(read_timeout)).unwrap();
+    try_post_with_read_timeout(port, session, payload, read_timeout, || {})
+        .unwrap_or_else(|error| panic!("test HTTP request: {error:?}"))
+}
+
+#[derive(Debug)]
+pub(crate) struct TestHttpError {
+    pub(crate) stage: &'static str,
+    pub(crate) kind: std::io::ErrorKind,
+    pub(crate) received_bytes: usize,
+}
+
+pub(crate) fn try_post_with_read_timeout(
+    port: u16,
+    session: Option<&str>,
+    payload: &Value,
+    read_timeout: Duration,
+    sent: impl FnOnce(),
+) -> Result<ClientResponse, TestHttpError> {
+    let io_error = |stage, error: std::io::Error| TestHttpError {
+        stage,
+        kind: error.kind(),
+        received_bytes: 0,
+    };
+    let body = serde_json::to_vec(payload).expect("JSON value serializes");
+    let address = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|error| io_error("connect", error))?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|error| io_error("configure", error))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| io_error("configure", error))?;
     let mut request = format!(
         "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {CURRENT_PROTOCOL_VERSION}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
@@ -238,10 +222,48 @@ pub(crate) fn post_with_read_timeout(
         request.push_str("\r\n");
     }
     request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.write_all(&body).unwrap();
-    stream.flush().unwrap();
-    parse_client_response(stream)
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| io_error("write", error))?;
+    stream
+        .write_all(&body)
+        .map_err(|error| io_error("write", error))?;
+    stream.flush().map_err(|error| io_error("write", error))?;
+    sent();
+    let mut bytes = Vec::new();
+    let deadline = Instant::now() + read_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TestHttpError {
+                stage: "read",
+                kind: std::io::ErrorKind::TimedOut,
+                received_bytes: bytes.len(),
+            });
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| io_error("configure", error))?;
+        let mut chunk = [0_u8; 8192];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionReset
+                    && response_content_length_is_complete(&bytes) =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(TestHttpError {
+                    stage: "read",
+                    kind: error.kind(),
+                    received_bytes: bytes.len(),
+                });
+            }
+        }
+    }
+    parse_client_bytes(&bytes)
 }
 
 pub(crate) fn delete(port: u16, session: &str) -> u16 {
@@ -304,20 +326,29 @@ fn parse_raw_http_response(mut stream: TcpStream) -> RawHttpResponse {
 
 pub(crate) fn parse_client_response(mut stream: TcpStream) -> ClientResponse {
     let bytes = read_complete_http_response(&mut stream);
+    parse_client_bytes(&bytes).unwrap_or_else(|error| panic!("test HTTP response: {error:?}"))
+}
+
+fn parse_client_bytes(bytes: &[u8]) -> Result<ClientResponse, TestHttpError> {
+    let invalid = || TestHttpError {
+        stage: "parse",
+        kind: std::io::ErrorKind::InvalidData,
+        received_bytes: bytes.len(),
+    };
     let split = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .unwrap();
-    let headers = std::str::from_utf8(&bytes[..split]).unwrap();
+        .ok_or_else(invalid)?;
+    let headers = std::str::from_utf8(&bytes[..split]).map_err(|_| invalid())?;
     let mut lines = headers.split("\r\n");
     let status = lines
         .next()
-        .unwrap()
+        .ok_or_else(invalid)?
         .split_whitespace()
         .nth(1)
-        .unwrap()
+        .ok_or_else(invalid)?
         .parse::<u16>()
-        .unwrap();
+        .map_err(|_| invalid())?;
     let session = lines.find_map(|line| {
         line.split_once(':').and_then(|(name, value)| {
             name.eq_ignore_ascii_case("Mcp-Session-Id")
@@ -328,13 +359,13 @@ pub(crate) fn parse_client_response(mut stream: TcpStream) -> ClientResponse {
     let body = if body_bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(body_bytes).unwrap()
+        serde_json::from_slice(body_bytes).map_err(|_| invalid())?
     };
-    ClientResponse {
+    Ok(ClientResponse {
         status,
         session,
         body,
-    }
+    })
 }
 
 fn read_complete_http_response(stream: &mut TcpStream) -> Vec<u8> {
@@ -365,6 +396,21 @@ fn response_content_length_is_complete(bytes: &[u8]) -> bool {
             .flatten()
     });
     content_length.is_some_and(|length| bytes.len() >= header_end + 4 + length)
+}
+
+#[test]
+fn structured_http_errors_distinguish_parse_failures_from_timeouts() {
+    let malformed = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n{";
+    let error = parse_client_bytes(malformed).unwrap_err();
+    assert_eq!(error.stage, "parse");
+    assert_eq!(error.kind, std::io::ErrorKind::InvalidData);
+    assert_eq!(error.received_bytes, malformed.len());
+    let empty = parse_client_bytes(b"").unwrap_err();
+    assert_eq!(empty.stage, "parse");
+    assert_eq!(empty.received_bytes, 0);
+    let valid = parse_client_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+    assert_eq!(valid.status, 200);
+    assert_eq!(valid.body, json!({}));
 }
 
 #[test]

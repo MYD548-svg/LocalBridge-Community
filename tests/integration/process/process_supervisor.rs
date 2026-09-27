@@ -74,7 +74,10 @@ fn nested_pid(root_pid: u32) -> u32 {
 }
 
 fn cleanup(root_pid: u32) {
-    let _ = fs::remove_dir_all(helper_dir(root_pid));
+    eprintln!(
+        "TEST_WORKSPACE_RETAINED path={}",
+        (helper_dir(root_pid)).display()
+    );
 }
 
 #[test]

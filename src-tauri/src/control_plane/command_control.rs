@@ -456,7 +456,7 @@ mod tests {
                 ..
             })
         ));
-        let _ = std::fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
             })
         ));
         assert_eq!(registry.cancellation_signal(&public_session), None);
-        let _ = std::fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -583,7 +583,7 @@ mod tests {
                 .state,
             ExecutionState::Running
         ));
-        let _ = std::fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -637,7 +637,7 @@ mod tests {
             })
         ));
         assert_eq!(registry.cancellation_signal(&public_session), None);
-        let _ = std::fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     /// Deterministic reproduction of the terminal-state finish race: a
@@ -741,7 +741,7 @@ mod tests {
                 ..
             })
         ));
-        let _ = std::fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     /// The PEP maps transport outages (connection refused and friends) to
@@ -890,6 +890,6 @@ mod tests {
                 ..
             })
         ));
-        let _ = std::fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 }

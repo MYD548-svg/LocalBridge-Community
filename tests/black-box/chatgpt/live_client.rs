@@ -175,7 +175,7 @@ impl Drop for LiveRuntime {
                 let _ = coding.stop();
             }
         }
-        let _ = fs::remove_dir_all(&self.workspace);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", self.workspace.display());
     }
 }
 

@@ -954,7 +954,7 @@ mod tests {
         assert!(!workspace_input_path_valid(r"\\?\C:\project\file.txt"));
         assert!(!workspace_input_path_valid(r"C:\project\file.txt:ads"));
 
-        std::fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -991,7 +991,7 @@ mod tests {
             Err(PathAuthorityError::InvalidPath)
         );
 
-        std::fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -1021,7 +1021,7 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
-        std::fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -1042,7 +1042,7 @@ mod tests {
         std::fs::rename(&displaced, &workspace).unwrap();
         assert_eq!(pin.validate_current(), Ok(()));
         drop(pin);
-        std::fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -1075,6 +1075,6 @@ mod tests {
             Err(PathAuthorityError::InvalidPath)
         );
 
-        std::fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 }

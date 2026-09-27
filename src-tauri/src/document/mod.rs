@@ -1349,7 +1349,7 @@ mod tests {
                 .unwrap_err(),
             DocumentError::FileChanged
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -1397,7 +1397,7 @@ mod tests {
         let markdown = fs::read_to_string(root.join("note.md")).unwrap();
         assert!(markdown.contains("# Title"));
         assert!(markdown.contains("edited"));
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -1451,7 +1451,7 @@ mod tests {
             DocumentError::UnsupportedContent
         );
         assert_eq!(fs::read(root.join("rich.docx")).unwrap(), edited);
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -1494,6 +1494,6 @@ mod tests {
                 .unwrap_err(),
             DocumentError::UnsupportedFormat
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 }

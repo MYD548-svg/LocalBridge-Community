@@ -7004,8 +7004,8 @@ mod schema43_filesystem_facade_tests {
             FacadeErrorCode::WorkspaceDenied
         );
 
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 }
 
@@ -8116,7 +8116,7 @@ mod tests {
         let mut runtime = facade.into_runtime();
         runtime.stop().unwrap();
         drop(runtime);
-        std::fs::remove_dir_all(workspace).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
     }
 
     fn test_task_state(label: &str) -> ExecutionRegistry {
@@ -10833,8 +10833,8 @@ mod tests {
             }
         }
 
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::remove_dir_all(&other).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", other.display());
     }
 
     #[test]
@@ -11066,6 +11066,255 @@ mod tests {
         let mut runtime = facade.into_runtime();
         let _ = runtime.stop();
         drop(runtime);
-        std::fs::remove_dir_all(workspace).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
+    }
+
+    // Fault injection exercises the facade mapping without destroying the
+    // upstream process. It does not claim supervisor-level recovery from a
+    // genuinely exited process (the real-stop regression remains separate).
+    #[cfg(windows)]
+    #[test]
+    fn retryable_control_faults_preserve_session_output_and_recover() {
+        use crate::mcp::{CodingToolsPermissionMode, CodingToolsRuntimeConfig, InternalBearer};
+        use std::time::{Duration, Instant};
+        for exited in [false, true] {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let workspace = std::env::temp_dir().join(format!(
+                "localbridge-cancel-transport-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&workspace).unwrap();
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let runtime = CodingToolsRuntime::start(
+                CodingToolsRuntimeConfig::new(
+                    &root,
+                    &workspace,
+                    port,
+                    CodingToolsPermissionMode::Trusted,
+                ),
+                InternalBearer::new("LB_CANCEL_TRANSPORT_SYNTHETIC_BEARER").unwrap(),
+                Duration::from_secs(10),
+            )
+            .expect("bundled coding runtime for the transport-outage regression");
+            let executions = ExecutionRegistry::for_workspace(runtime.workspace()).unwrap();
+            let mut facade =
+                AgentFacade::from_coding_runtime_with_executions(runtime, policy(), executions)
+                    .unwrap();
+
+            let submit = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "exec_command",
+                    json!({
+                        "command":"Start-Sleep -Seconds 120",
+                        "shell":"windows_powershell",
+                        "yield_time_ms":0,
+                        "timeout_ms":180000,
+                        "max_output_bytes":4096
+                    }),
+                    None,
+                    |_| {},
+                )
+                .expect("detached scenario command started");
+            assert_eq!(
+                submit["structuredContent"]["data"]["status"], "running",
+                "{submit:#}"
+            );
+            let public_session = submit["structuredContent"]["data"]["session_id"]
+                .as_str()
+                .expect("running command has PublicSessionId")
+                .to_string();
+            let session_key = PublicSessionId::new(public_session.clone());
+
+            let fault = || {
+                if exited {
+                    CodingToolsRuntimeError::McpExited
+                } else {
+                    CodingToolsRuntimeError::ConnectionUnavailable
+                }
+            };
+            let expected = if exited {
+                "RuntimeUnavailable"
+            } else {
+                "SessionUnavailable"
+            };
+            facade
+                .adapter
+                .public_commands
+                .append_pending(&public_session, "UNDELIVERED_OUTPUT\n");
+            facade.adapter.runtime.inject_tool_fault(fault());
+            let failed = facade.call_tool(PermissionMode::Full, "command_control",
+                json!({"action":"kill", "session_id":public_session, "signal":"KILL", "wait_ms":0}), None, |_| {}).unwrap();
+            assert_eq!(failed["isError"], true, "{failed:#}");
+            assert_eq!(failed["structuredContent"]["error"]["code"], expected);
+            assert_eq!(failed["structuredContent"]["error"]["retryable"], true);
+            assert!(
+                facade.adapter.pending_runtime_fault.is_some(),
+                "production fault reporting remains enabled"
+            );
+            assert!(
+                facade
+                    .adapter
+                    .durable_command_terminal(&public_session)
+                    .is_none()
+            );
+            assert_eq!(
+                facade
+                    .adapter
+                    .executions
+                    .cancellation_signal(&session_key)
+                    .as_deref(),
+                Some("KILL")
+            );
+            assert_eq!(
+                facade.adapter.public_commands.sessions[&public_session].pending_output,
+                "UNDELIVERED_OUTPUT\n"
+            );
+            // Deliver the pending bytes once before injecting the poll fault;
+            // a poll with cached output legitimately bypasses the upstream.
+            let buffered = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "command_control",
+                    json!({"action":"poll", "session_id":public_session, "wait_ms":0}),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                buffered["structuredContent"]["data"]["output"],
+                "UNDELIVERED_OUTPUT\n"
+            );
+            facade.adapter.runtime.inject_tool_fault(fault());
+            let failed_poll = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "command_control",
+                    json!({"action":"poll", "session_id":public_session, "wait_ms":0}),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                failed_poll["structuredContent"]["error"]["code"], expected,
+                "{failed_poll:#}"
+            );
+            assert_eq!(failed_poll["structuredContent"]["error"]["retryable"], true);
+            assert!(
+                facade
+                    .adapter
+                    .durable_command_terminal(&public_session)
+                    .is_none()
+            );
+            assert_eq!(
+                facade
+                    .adapter
+                    .executions
+                    .cancellation_signal(&session_key)
+                    .as_deref(),
+                Some("KILL")
+            );
+            assert!(matches!(
+                facade
+                    .adapter
+                    .executions
+                    .execution_for_public_session(&session_key)
+                    .unwrap()
+                    .state,
+                crate::domain::execution::ExecutionState::Running
+            ));
+            let recovered = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "command_control",
+                    json!({"action":"poll", "session_id":public_session, "wait_ms":0}),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                recovered["structuredContent"]["data"]["status"], "running",
+                "{recovered:#}"
+            );
+            assert_eq!(
+                recovered["structuredContent"]["data"]["session_id"],
+                public_session
+            );
+            assert!(!recovered.to_string().contains("UNDELIVERED_OUTPUT"));
+            let _kill = facade.call_tool(PermissionMode::Full, "command_control",
+                json!({"action":"kill", "session_id":public_session, "signal":"KILL", "wait_ms":1000}), None, |_| {}).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let polled = facade
+                    .call_tool(
+                        PermissionMode::Full,
+                        "command_control",
+                        json!({"action":"poll", "session_id":public_session, "wait_ms":100}),
+                        None,
+                        |_| {},
+                    )
+                    .unwrap();
+                if polled["structuredContent"]["data"]["status"] == "cancelled" {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real cancellation did not settle: {polled:#}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let terminal = facade
+                .adapter
+                .durable_command_terminal(&public_session)
+                .unwrap();
+            // A late upstream fault cannot replace the already durable terminal.
+            facade.adapter.runtime.inject_tool_fault(fault());
+            for _ in 0..2 {
+                let replay = facade
+                    .call_tool(
+                        PermissionMode::Full,
+                        "command_control",
+                        json!({"action":"poll", "session_id":public_session, "wait_ms":0}),
+                        None,
+                        |_| {},
+                    )
+                    .unwrap();
+                assert_eq!(replay["structuredContent"]["data"]["status"], "cancelled");
+                assert!(!replay.to_string().contains("UNDELIVERED_OUTPUT"));
+                assert_eq!(
+                    facade
+                        .adapter
+                        .durable_command_terminal(&public_session)
+                        .unwrap(),
+                    terminal
+                );
+            }
+            let unknown = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "command_control",
+                    json!({"action":"poll", "session_id":"unknown-session", "wait_ms":0}),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                unknown["structuredContent"]["error"]["retryable"], false,
+                "{unknown:#}"
+            );
+            let mut runtime = facade.into_runtime();
+            runtime.stop().unwrap();
+            assert_eq!(runtime.active_processes().unwrap(), 0);
+            eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
+        }
     }
 }

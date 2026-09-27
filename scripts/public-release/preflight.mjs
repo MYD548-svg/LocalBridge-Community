@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, extname, resolve, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -206,10 +206,11 @@ async function verifyLicenseInventory() {
 }
 
 async function cleanCheckoutBuild() {
-  const checkout = resolve(evidenceRoot, "clean-checkout");
-  const stubBin = resolve(evidenceRoot, "no-python-bin");
-  await rm(checkout, { recursive: true, force: true });
-  await rm(stubBin, { recursive: true, force: true });
+  await mkdir(evidenceRoot, { recursive: true });
+  const retained = await mkdtemp(resolve(evidenceRoot, "clean-build-"));
+  console.log(`TEST_WORKSPACE_RETAINED path=${retained}`);
+  const checkout = resolve(retained, "checkout");
+  const stubBin = resolve(retained, "no-python-bin");
   await mkdir(stubBin, { recursive: true });
   for (const name of ["python.cmd", "python3.cmd", "py.cmd"]) await writeFile(resolve(stubBin, name), "@echo off\r\necho PRE_RELEASE_EXTERNAL_PYTHON_FORBIDDEN 1>&2\r\nexit /b 91\r\n", "utf8");
   git(["clone", "--no-hardlinks", "--local", ".", checkout]);
@@ -263,7 +264,7 @@ function verifyPinnedRuntimeCommitBytes(output, tracked) {
 
 async function exportPublicSource() {
   const output = resolve(evidenceRoot, "public-source");
-  await rm(output, { recursive: true, force: true });
+  if (existsSync(output)) throw new Error(`Output already exists; retain or move it manually before exporting: ${output}`);
   await mkdir(output, { recursive: true });
   const tracked = git(["ls-files", "-z"]).split("\0").filter(Boolean);
   let copied = 0;

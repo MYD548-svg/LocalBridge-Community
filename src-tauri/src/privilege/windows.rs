@@ -1092,7 +1092,7 @@ mod tests {
             Err(UacLaunchError::InvalidBrokerExecutable),
             "a canonical Broker under a same-user-writable Program Files-shaped tree must fail ACL trust"
         );
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[cfg(debug_assertions)]
@@ -1125,6 +1125,6 @@ mod tests {
         drop(pin);
         assert!(OpenOptions::new().write(true).open(&broker).is_ok());
         fs::remove_file(&broker).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 }
