@@ -1,3 +1,99 @@
+# Shared public command output delivery - 2026-09-28
+
+## Delivery boundary and verified cloud baseline
+
+This change starts from `fe3c18b011a39f0b6837135cabbb595213c52fbb` on
+`codex/fix-ci-validation`. The new change's cloud acceptance is **UNVERIFIED**.
+Delivery ends after one push and a remote branch SHA comparison. Do not query,
+poll, rerun or monitor new Actions, merge the PR, or publish a release.
+
+The following results were audited before this implementation. PR jobs checked
+out merge `ebdeda3239bab8c3f71c8b3f1934cfd8d3739429`, based on
+`012adf917b06b8a3866b0d77a564ae481c289b4f`.
+
+| Run | Verified result for fe3c18b |
+| --- | --- |
+| [CI push 36324843555](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36324843555) | PASS: 19 stages, Rust library 413/413, verified installer uploaded |
+| [CI PR 36324847625](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36324847625) | PASS: 19 stages, Rust library 413/413, verified installer uploaded |
+| [Community PR 36324847644](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36324847644) | Linux PASS; Windows first 14 stages PASS; Rust library 412 PASS / 1 FAIL |
+
+All three passed the 11 Python regressions and ten authentication probes.
+Community failed `full_scripts_share_current_user_authority_independent_of_path_spelling`
+at the NUL assertion (old server.rs:8320): scripts emitted their markers, but
+`echo hidden>nul && echo hidden-error 1>nul 2>nul && echo LB_SCHEMA42_NUL_OK`
+returned completed / exit 0 with zero accumulated output. Later standalone
+Clippy, NSIS, package integrity and installer artifacts were NOT_RUN for that
+Community job. CI installer existence was checked; independent download,
+extraction and clean-machine installation were NOT_RUN.
+
+## Repair and evidence limits
+
+- Move pending output, bounded stderr protocol fragments and sticky truncation /
+  incomplete diagnostics into one in-memory owner keyed by ExecutionId. The
+  facade, background observer and busy direct control route share that owner.
+  Execution records retain their existing persistent format. Output owners are
+  evicted with their execution records; the existing 1 MiB pending / 256 KiB
+  stderr limits are preserved.
+- Register an RAII collection guard before upstream calls, and release it after
+  returned bytes and diagnostics are staged. No output mutex is held over I/O.
+  Delivery keeps reporting running while another collection is outstanding;
+  it does not consume pending bytes until all collections have settled. Kill
+  retains its bounded timeout response while a competing collection is pending.
+- Deliver incremental output exactly once across routes, including terminal
+  replay. Preserve authoritative outcomes when another caller finalizes first.
+  The busy route now uses the same stderr filtering and fixed incomplete-output
+  warning. Warnings stay in structuredContent.warnings, not command data.
+- Background retryable transport failures no longer commit a lost terminal.
+  Existing cancellation intent and retryable-control regressions remain intact.
+- Retain all marker assertions. NUL failures print the complete envelope and
+  accumulated output; test logs identify facade/direct delivery paths.
+- Move the existing pure stderr-filter functions into the shared module to obey
+  the domain/MCP dependency boundary. This does not change the filtering algorithm.
+
+The original direct-terminal regression was added before implementation and
+exposes the old empty-output branch by construction. Rust execution was not
+available locally, so no locally observed Rust red/green result is claimed.
+The cloud logs do not prove that this specific interleaving caused the NUL
+failure; the production gap is independently established by code inspection.
+
+## New local evidence
+
+- PASS: test-base, 32 Node tests, including the bundled Python output suite.
+- PASS: Python suite, 11 tests; .cmd, .bat, PowerShell and NUL command cases each
+  run exactly ten times (40/40), with marker once, exit 0 and empty terminal
+  replay. NUL cases also reject leaked hidden text and pseudo nul files.
+- PASS: 24-command retained-output/handle regression, 271 -> 271 handles,
+  maximum allowed growth 8. All fixtures remain retained.
+- PASS: format, public release policy, license audit (166 npm / 484 cargo),
+  schema44 architecture scan, frontend tests (18 tests / 6 files), TS/Vite build.
+- PASS: bundled integrity; no runtime payload, manifest, metadata or pinned hash
+  changed. Historical installer attestations are not new-change evidence.
+- PASS: isolated Rust 1.85 metadata/type check of command_output.rs including
+  its three concurrency/filter tests. This emits metadata only, not a linked
+  test executable, and is not a full-crate compilation or test execution.
+- ADDED / NOT_RUN locally: cross-route facade regression; actual HTTP direct
+  control regression forced by holding the facade mutex, covering completed,
+  failed, cancelled and timed_out output plus warnings/replay; pending-collector
+  kill/poll regression; shared-buffer barrier/channel tests. Existing transport
+  outage and cancellation regressions remain required.
+- NOT_RUN locally: full Rust compilation, Clippy, Rust test execution, public MCP
+  E2E, authenticated Tunnel repetitions, NSIS packaging and installation. MSVC /
+  Windows SDK are unavailable and were not installed, per user preference.
+
+An intermediate schema44 check rejected an MCP dependency from the new shared
+module; moving the pure filter resolved it without changing the gate. The
+standalone bundled rustc distribution lacked std; the already installed Rust
+1.85 toolchain completed the isolated metadata check. Neither attempt is
+represented as a full Rust PASS.
+
+Validation uses the existing gate: test-base, then format through frontend-build;
+selected-stage reports remain PARTIAL. Keep all 19 cloud stages, ten auth probes,
+workflow triggers and toolchain versions unchanged. No retry-until-success test
+logic, Actions rerun, assertion weakening, credential extraction or bulk deletion
+was introduced.
+
+## Earlier reports (historical evidence only)
+
 # Command output settlement repair - 2026-09-27
 
 ## Delivery boundary

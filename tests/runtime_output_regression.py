@@ -268,14 +268,17 @@ class OutputSettlementTests(unittest.TestCase):
     def test_real_windows_shells_ten_runs_each(self):
         workspace = Path(tempfile.mkdtemp(prefix="localbridge-output-regression-"))
         print(f"TEST_WORKSPACE_RETAINED path={workspace}", flush=True)
-        for extension in ("cmd", "bat", "ps1"):
+        for extension in ("cmd", "bat", "ps1", "nul"):
             for iteration in range(10):
                 with self.subTest(shell=extension, iteration=iteration):
                     marker = f"OUTPUT_{extension}_{iteration}_OK"
                     script = workspace / f"probe-{iteration}.{extension}"
-                    script.write_text((f"Write-Output '{marker}'\r\n" if extension == "ps1" else f"@echo {marker}\r\n"), encoding="ascii", newline="")
+                    if extension != "nul":
+                        script.write_text((f"Write-Output '{marker}'\r\n" if extension == "ps1" else f"@echo {marker}\r\n"), encoding="ascii", newline="")
                     system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
                     args = ([str(system / "WindowsPowerShell/v1.0/powershell.exe"), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)] if extension == "ps1" else [str(system / "cmd.exe"), "/d", "/c", str(script)])
+                    if extension == "nul":
+                        args = [str(system / "cmd.exe"), "/d", "/c", f"echo hidden>nul && echo hidden-error 1>nul 2>nul && echo {marker}"]
                     process = subprocess.Popen(args, cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
                     session = ExecSession(f"real-{extension}-{iteration}", process)
                     start_reader_threads(session)
@@ -293,6 +296,9 @@ class OutputSettlementTests(unittest.TestCase):
                         self.assertEqual(response["exit_code"], 0, trace)
                         self.assertFalse(response["truncated"], trace)
                         self.assertEqual(output.count(marker), 1, trace)
+                        if extension == "nul":
+                            self.assertNotIn("hidden", output, trace)
+                            self.assertFalse({"nul", "nul.localbridge"} & {entry.name.lower() for entry in workspace.iterdir()}, trace)
                         replay = runtime.write_stdin({"session_id": session.session_id, "chars": "", "yield_time_ms": 0})
                         self.assertEqual(replay["stdout"] + replay["stderr"], "", trace)
                     finally:

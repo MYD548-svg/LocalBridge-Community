@@ -84,6 +84,7 @@ pub(crate) struct RuntimeCommandObservation {
     pub(crate) stdout: String,
     pub(crate) stderr: String,
     pub(crate) truncated: Option<bool>,
+    pub(crate) output_incomplete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +124,7 @@ pub(crate) struct CommandControlResult {
     pub(crate) exit_code: Option<i64>,
     pub(crate) signal: Option<String>,
     pub(crate) truncated: Option<bool>,
+    pub(crate) output_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,12 +147,21 @@ pub(crate) fn control_command_during_work(
     {
         return Err(CommandControlError::InvalidRequest);
     }
+    let output = executions
+        .command_output(&request.public_session_id)
+        .ok_or(CommandControlError::SessionUnavailable)?;
+    let collection = output.begin();
     let execution = executions
         .execution_for_public_session(&request.public_session_id)
         .ok_or(CommandControlError::SessionUnavailable)?;
     if let ExecutionState::Terminal(terminal) = &execution.state {
         return if request.action == CommandControlAction::Poll {
-            Ok(result_from_terminal(&execution, terminal))
+            drop(collection);
+            deliver_output(
+                result_from_terminal(&execution, terminal),
+                &output,
+                request.action,
+            )
         } else {
             Err(CommandControlError::SessionUnavailable)
         };
@@ -199,7 +210,12 @@ pub(crate) fn control_command_during_work(
                 let ExecutionState::Terminal(terminal) = &settled.state else {
                     return Err(CommandControlError::ExecutionConflict);
                 };
-                return Ok(result_from_terminal(&settled, terminal));
+                drop(collection);
+                return deliver_output(
+                    result_from_terminal(&settled, terminal),
+                    &output,
+                    request.action,
+                );
             }
             if matches!(
                 error,
@@ -212,6 +228,21 @@ pub(crate) fn control_command_during_work(
         }
     };
 
+    let stderr = output.filter_stderr(&observation.stderr);
+    let combined = [observation.stdout.as_str(), stderr.as_str()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(if observation.stdout.is_empty() || stderr.is_empty() {
+            ""
+        } else {
+            "\n"
+        });
+    output.append(&combined);
+    output.annotate(
+        observation.truncated.unwrap_or(false),
+        observation.output_incomplete,
+    );
     let cancellation_signal = executions.cancellation_signal(&request.public_session_id);
     if request.action == CommandControlAction::Kill
         && observation.status == RuntimeCommandStatus::Running
@@ -262,32 +293,56 @@ pub(crate) fn control_command_during_work(
                 let ExecutionState::Terminal(terminal) = &settled.state else {
                     return Err(CommandControlError::ExecutionConflict);
                 };
-                let mut replayed = result_from_terminal(&settled, terminal);
-                replayed.stdout = observation.stdout;
-                replayed.stderr = observation.stderr;
-                replayed.exit_code = observation.exit_code;
-                replayed.truncated = observation.truncated;
-                return Ok(replayed);
+                let replayed = result_from_terminal(&settled, terminal);
+                drop(collection);
+                return deliver_output(replayed, &output, request.action);
             }
             Err(error) => return Err(map_execution_error(error)),
         }
     }
 
-    Ok(CommandControlResult {
-        status: if terminal_outcome == Some(TerminalOutcome::Cancelled) {
-            RuntimeCommandStatus::Cancelled
-        } else {
-            observation.status
+    drop(collection);
+    deliver_output(
+        CommandControlResult {
+            status: if terminal_outcome == Some(TerminalOutcome::Cancelled) {
+                RuntimeCommandStatus::Cancelled
+            } else {
+                observation.status
+            },
+            public_session_id: request.public_session_id,
+            task_id: execution.task_id,
+            stdout: String::new(),
+            stderr: String::new(),
+            elapsed_ms: unix_time_ms().saturating_sub(execution.started_at_ms),
+            exit_code: observation.exit_code,
+            signal: observation.signal.or(cancellation_signal),
+            truncated: observation.truncated,
+            output_incomplete: false,
         },
-        public_session_id: request.public_session_id,
-        task_id: execution.task_id,
-        stdout: observation.stdout,
-        stderr: observation.stderr,
-        elapsed_ms: unix_time_ms().saturating_sub(execution.started_at_ms),
-        exit_code: observation.exit_code,
-        signal: observation.signal.or(cancellation_signal),
-        truncated: observation.truncated,
-    })
+        &output,
+        request.action,
+    )
+}
+
+fn deliver_output(
+    mut result: CommandControlResult,
+    output: &super::command_output::CommandOutput,
+    action: CommandControlAction,
+) -> Result<CommandControlResult, CommandControlError> {
+    let delivery = output.take();
+    if delivery.collecting && action == CommandControlAction::Kill {
+        return Err(CommandControlError::OperationTimedOut);
+    }
+    result.stdout = delivery.output;
+    result.stderr.clear();
+    result.truncated = Some(delivery.truncated);
+    result.output_incomplete = delivery.incomplete;
+    if delivery.collecting {
+        result.status = RuntimeCommandStatus::Running;
+        result.exit_code = None;
+        result.signal = None;
+    }
+    Ok(result)
 }
 
 fn result_from_terminal(
@@ -312,6 +367,7 @@ fn result_from_terminal(
         exit_code: terminal.exit_code,
         signal: terminal.signal.clone(),
         truncated: None,
+        output_incomplete: false,
     }
 }
 
@@ -401,6 +457,44 @@ mod tests {
     }
 
     #[test]
+    fn collection_blocks_terminal_delivery_without_consuming_bytes_or_blocking_kill() {
+        let output = super::super::command_output::CommandOutput::default();
+        let collection = output.begin();
+        output.append("UNDELIVERED");
+        output.annotate(false, true);
+        let terminal = CommandControlResult {
+            status: RuntimeCommandStatus::Cancelled,
+            public_session_id: PublicSessionId::new("public-collection"),
+            task_id: TaskId::new("task-collection"),
+            stdout: String::new(),
+            stderr: String::new(),
+            elapsed_ms: 0,
+            exit_code: Some(0),
+            signal: Some("KILL".into()),
+            truncated: None,
+            output_incomplete: false,
+        };
+        let polled = deliver_output(terminal.clone(), &output, CommandControlAction::Poll).unwrap();
+        assert_eq!(polled.status, RuntimeCommandStatus::Running);
+        assert!(polled.stdout.is_empty());
+        assert_eq!(polled.exit_code, None);
+        assert_eq!(
+            deliver_output(terminal.clone(), &output, CommandControlAction::Kill),
+            Err(CommandControlError::OperationTimedOut)
+        );
+        drop(collection);
+        let final_output =
+            deliver_output(terminal.clone(), &output, CommandControlAction::Poll).unwrap();
+        assert_eq!(final_output.status, RuntimeCommandStatus::Cancelled);
+        assert_eq!(final_output.stdout, "UNDELIVERED");
+        assert!(final_output.output_incomplete);
+        assert_eq!(final_output.truncated, Some(true));
+        let replay = deliver_output(terminal, &output, CommandControlAction::Poll).unwrap();
+        assert!(replay.stdout.is_empty());
+        assert!(replay.output_incomplete);
+    }
+
+    #[test]
     fn terminal_observation_is_committed_by_control_plane_owner() {
         let root = std::env::temp_dir().join(format!(
             "localbridge-command-control-{}-{}",
@@ -430,6 +524,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             truncated: Some(false),
+            output_incomplete: false,
         })));
 
         let result = control_command_during_work(
@@ -512,6 +607,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 truncated: Some(false),
+                output_incomplete: false,
             }))),
         )
         .expect("poll result");
@@ -568,6 +664,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 truncated: Some(false),
+                output_incomplete: false,
             }))),
         );
 
@@ -681,6 +778,7 @@ mod tests {
                 stdout: "RACING_OBSERVED_OUTPUT".to_string(),
                 stderr: String::new(),
                 truncated: Some(false),
+                output_incomplete: false,
             })
         }
     }
@@ -836,6 +934,7 @@ mod tests {
                 stdout: "REAL_TERMINAL_OUTPUT".to_string(),
                 stderr: String::new(),
                 truncated: Some(false),
+                output_incomplete: false,
             }))),
         )
         .expect("the recovered poll resolves the real terminal");

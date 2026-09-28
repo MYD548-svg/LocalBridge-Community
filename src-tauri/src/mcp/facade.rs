@@ -1,3 +1,6 @@
+use crate::control_plane::command_output::{
+    CommandOutput, INCOMPLETE_COMMAND_OUTPUT, public_command_stderr,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::Cursor;
@@ -944,11 +947,6 @@ pub trait WorkspaceRuntimeAdapter {
     }
 }
 
-const MAX_PENDING_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_STDERR_PROTOCOL_BYTES: usize = 256 * 1024;
-const INCOMPLETE_COMMAND_OUTPUT: &str =
-    "Output incomplete: pipe readers did not finish within 5 seconds after process exit.";
-
 fn annotate_incomplete_output(result: &mut Value, incomplete: bool) {
     if incomplete {
         result["structuredContent"]["data"]["truncated"] = Value::Bool(true);
@@ -964,10 +962,7 @@ fn next_public_handle(prefix: &str) -> String {
 struct PublicCommandSession {
     execution_id: ExecutionId,
     started_at: Instant,
-    pending_output: String,
-    pending_output_truncated: bool,
-    output_incomplete: bool,
-    stderr_protocol_buffer: String,
+    output: CommandOutput,
 }
 
 #[derive(Debug, Default)]
@@ -999,10 +994,9 @@ impl PublicCommandSessions {
             PublicCommandSession {
                 execution_id: started.execution_id,
                 started_at: Instant::now(),
-                pending_output: String::new(),
-                pending_output_truncated: false,
-                output_incomplete: false,
-                stderr_protocol_buffer: String::new(),
+                output: executions
+                    .command_output(&PublicSessionId::new(public.clone()))
+                    .expect("started execution output"),
             },
         );
         Ok(StartedPublicCommand {
@@ -1171,65 +1165,59 @@ impl PublicCommandSessions {
     }
 
     fn append_pending(&mut self, public_session_id: &str, output: &str) {
-        if output.is_empty() {
-            return;
+        if let Some(session) = self.sessions.get(public_session_id) {
+            session.output.append(output);
         }
-        if let Some(session) = self.sessions.get_mut(public_session_id) {
-            session.pending_output.push_str(output);
-            session.pending_output_truncated |=
-                trim_utf8_front(&mut session.pending_output, MAX_PENDING_OUTPUT_BYTES);
-        }
-    }
-
-    fn take_pending(&mut self, public_session_id: &str) -> String {
-        let Some(session) = self.sessions.get_mut(public_session_id) else {
-            return String::new();
-        };
-        let mut output = std::mem::take(&mut session.pending_output);
-        if std::mem::take(&mut session.pending_output_truncated) {
-            output.insert_str(0, "[earlier command output truncated]\n");
-        }
-        output
     }
 
     fn terminal_with_pending(&mut self, public_session_id: &str, terminal: Value) -> Value {
-        let pending = self.take_pending(public_session_id);
-        command_result_with_output(terminal, pending)
+        let Some(session) = self.sessions.get(public_session_id) else {
+            return terminal;
+        };
+        let delivery = session.output.take();
+        #[cfg(test)]
+        eprintln!(
+            "COMMAND_ROUTE facade session={public_session_id} collecting={}",
+            delivery.collecting
+        );
+        let mut result = if delivery.collecting {
+            let mut data = stable_data(&terminal);
+            if let Some(object) = data.as_object_mut() {
+                object.insert("status".into(), json!("running"));
+                object.remove("exit_code");
+                object.remove("signal");
+            }
+            stable_success(data, "Command running")
+        } else {
+            terminal
+        };
+        result = command_result_with_output(result, delivery.output);
+        if delivery.truncated {
+            result["structuredContent"]["data"]["truncated"] = Value::Bool(true);
+        }
+        annotate_incomplete_output(&mut result, delivery.incomplete);
+        result
     }
 
     fn running_with_pending(&mut self, public_session_id: &str) -> Option<Value> {
-        let pending = self.take_pending(public_session_id);
-        (!pending.is_empty()).then(|| {
+        let session = self.sessions.get(public_session_id)?;
+        if !session.output.has_pending() {
+            return None;
+        }
+        Some(self.terminal_with_pending(
+            public_session_id,
             stable_success(
-                json!({
-                    "status":"running",
-                    "session_id":public_session_id,
-                    "output":pending
-                }),
+                json!({"status":"running","session_id":public_session_id}),
                 "Command running",
-            )
-        })
+            ),
+        ))
     }
 
     fn filter_private_stderr(&mut self, public_session_id: &str, stderr: &str) -> String {
-        if stderr.is_empty() {
-            return String::new();
-        }
-        let Some(session) = self.sessions.get_mut(public_session_id) else {
-            return public_command_stderr(stderr);
-        };
-        session.stderr_protocol_buffer.push_str(stderr);
-        if trim_utf8_front(
-            &mut session.stderr_protocol_buffer,
-            MAX_STDERR_PROTOCOL_BYTES,
-        ) {
-            let retained = std::mem::take(&mut session.stderr_protocol_buffer);
-            return format!(
-                "[stderr protocol fragment truncated]\n{}",
-                public_command_stderr(&retained)
-            );
-        }
-        drain_public_stderr_protocol_buffer(&mut session.stderr_protocol_buffer)
+        self.sessions.get(public_session_id).map_or_else(
+            || public_command_stderr(stderr),
+            |session| session.output.filter_stderr(stderr),
+        )
     }
 
     fn mark_all_running_lost(&mut self, executions: &ExecutionRegistry) -> Result<(), FacadeError> {
@@ -1805,6 +1793,11 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
         )?;
         let public_session_id = started_public.public_session_id;
         let adoption_token = started_public.adoption_token;
+        let output = self
+            .executions
+            .command_output(&PublicSessionId::new(public_session_id.clone()))
+            .ok_or_else(session_unavailable)?;
+        let collection = output.begin();
         let outcome = (|| {
             let invocation = self
                 .shell_executor
@@ -1857,8 +1850,11 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
             }
             Ok(result)
         })();
+        drop(collection);
         match outcome {
-            Ok(result) => Ok(result),
+            Ok(result) => Ok(self
+                .public_commands
+                .terminal_with_pending(&public_session_id, result)),
             Err(error) => {
                 self.public_commands.mark_error_terminal(
                     &public_session_id,
@@ -2073,12 +2069,11 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
             }
             CommandControlAction::Read => unreachable!(),
         };
-        let pending =
-            if action == CommandControlAction::Write || action == CommandControlAction::Kill {
-                self.public_commands.take_pending(&public_session_id)
-            } else {
-                String::new()
-            };
+        let output = self
+            .executions
+            .command_output(&public_session_key)
+            .ok_or_else(session_unavailable)?;
+        let collection = output.begin();
         let call = match action {
             CommandControlAction::Poll | CommandControlAction::Write => {
                 let wait_ms = object
@@ -2112,11 +2107,13 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
             Ok(raw) => {
                 let result =
                     self.normalize_command_result(&raw, &public_session_id, Some(action))?;
-                Ok(command_result_prepend_output(result, pending))
+                drop(collection);
+                Ok(self
+                    .public_commands
+                    .terminal_with_pending(&public_session_id, result))
             }
             Err(error) => {
-                self.public_commands
-                    .append_pending(&public_session_id, &pending);
+                drop(collection);
                 let cancellation_signal = self.executions.cancellation_signal(&public_session_key);
                 // "The upstream answered that this session is gone" and "the
                 // transport could not reach the upstream" are different facts.
@@ -2375,21 +2372,21 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
                 "max_output_bytes": 65536,
                 "verbosity":"full"
             });
+            let output = self
+                .executions
+                .command_output(&PublicSessionId::new(public_session_id.clone()))
+                .ok_or_else(session_unavailable)?;
+            let _collection = output.begin();
             match self.private_call("write_stdin", private, None) {
                 Ok(raw) => {
-                    let normalized = self.normalize_command_result(
+                    self.normalize_command_result(
                         &raw,
                         &public_session_id,
                         Some(CommandControlAction::Poll),
                     )?;
-                    let delta = normalized
-                        .pointer("/structuredContent/data/output")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    self.public_commands
-                        .append_pending(&public_session_id, &delta);
                 }
+                Err(error)
+                    if error.retryable || error.code == FacadeErrorCode::OperationTimedOut => {}
                 Err(error) => {
                     self.public_commands.mark_error_terminal(
                         &public_session_id,
@@ -2494,7 +2491,7 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
                 self.public_commands
                     .sessions
                     .get(session_id)
-                    .is_some_and(|session| session.output_incomplete),
+                    .is_some_and(|session| session.output.incomplete()),
             );
         }
         result
@@ -2573,10 +2570,18 @@ impl CodingToolsRuntimeAdapter {
                     .any(|warning| warning.as_str() == Some(INCOMPLETE_COMMAND_OUTPUT))
             });
         if let Some(session) = self.public_commands.sessions.get_mut(public_session_id) {
-            session.output_incomplete |= incomplete;
+            session.output.annotate(
+                structured
+                    .and_then(|object| object.get("truncated"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                incomplete,
+            );
         }
         let output = self.safe_command_output_for_session(raw, public_session_id);
-        data.insert("output".into(), Value::String(output));
+        self.public_commands
+            .append_pending(public_session_id, &output);
+        data.insert("output".into(), Value::String(String::new()));
         self.map_private_output_refs(structured, &mut data, public_session_id);
 
         let mut result = match public_status {
@@ -2604,7 +2609,7 @@ impl CodingToolsRuntimeAdapter {
             self.public_commands
                 .sessions
                 .get(public_session_id)
-                .is_some_and(|session| session.output_incomplete),
+                .is_some_and(|session| session.output.incomplete()),
         );
         if public_status != "running" {
             self.public_commands.mark_terminal(
@@ -2612,6 +2617,24 @@ impl CodingToolsRuntimeAdapter {
                 result.clone(),
                 &self.executions,
             )?;
+            // A competing control call may have committed the authoritative
+            // outcome. Preserve its status while delivering our queued bytes.
+            if let Some(mut terminal) = self.durable_command_terminal(public_session_id) {
+                if terminal
+                    .pointer("/structuredContent/data/status")
+                    .and_then(Value::as_str)
+                    != Some(public_status)
+                {
+                    for key in ["task_id", "execution_id", "elapsed_ms"] {
+                        if let Some(value) =
+                            result.pointer(&format!("/structuredContent/data/{key}"))
+                        {
+                            terminal["structuredContent"]["data"][key] = value.clone();
+                        }
+                    }
+                    result = terminal;
+                }
+            }
         }
         if action == Some(CommandControlAction::Kill) && public_status == "cancelled" {
             self.mark_owner_workflow_waiting_after_kill(public_session_id)?;
@@ -7498,18 +7521,6 @@ fn command_result_with_output(mut result: Value, output: String) -> Value {
     result
 }
 
-fn command_result_prepend_output(result: Value, prefix: String) -> Value {
-    if prefix.is_empty() {
-        return result;
-    }
-    let suffix = result
-        .pointer("/structuredContent/data/output")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    command_result_with_output(result, format!("{prefix}{suffix}"))
-}
-
 #[cfg(test)]
 fn safe_command_output(raw: &Value) -> String {
     let Some(structured) = raw.get("structuredContent").and_then(Value::as_object) else {
@@ -7541,221 +7552,6 @@ fn safe_command_output(raw: &Value) -> String {
         }
     }
     String::new()
-}
-
-pub(crate) fn public_command_stderr(stderr: &str) -> String {
-    if !looks_like_clixml_protocol(stderr) {
-        return stderr.to_string();
-    }
-    let lower = stderr.to_ascii_lowercase();
-    if !lower.contains("s=\"error\"") {
-        return String::new();
-    }
-    strip_private_powershell_prologue(&extract_clixml_error_strings(stderr))
-}
-
-fn strip_private_powershell_prologue(value: &str) -> String {
-    let contains_private_prologue = value.contains("PSModuleAutoLoadingPreference")
-        || value.contains("Microsoft.PowerShell.Management.psd1")
-        || value.contains("System.Text.UTF8Encoding")
-        || value.contains("[Console]::OutputEncoding");
-    if !contains_private_prologue {
-        return value.to_string();
-    }
-    const END: &str = "$OutputEncoding=[Console]::OutputEncoding;";
-    let Some(end) = find_ignoring_line_breaks(value, END) else {
-        return String::new();
-    };
-    value[end..].trim_start_matches(['\r', '\n']).to_string()
-}
-
-fn find_ignoring_line_breaks(value: &str, needle: &str) -> Option<usize> {
-    let expected = needle.as_bytes();
-    let mut matched = 0usize;
-    for (index, ch) in value.char_indices() {
-        if matches!(ch, '\r' | '\n') {
-            continue;
-        }
-        if ch.is_ascii() && expected.get(matched).copied() == Some(ch as u8) {
-            matched += 1;
-            if matched == expected.len() {
-                return Some(index + ch.len_utf8());
-            }
-        } else {
-            matched = usize::from(ch.is_ascii() && expected.first().copied() == Some(ch as u8));
-        }
-    }
-    None
-}
-
-fn drain_public_stderr_protocol_buffer(buffer: &mut String) -> String {
-    let mut visible = String::new();
-    loop {
-        if buffer.is_empty() {
-            break;
-        }
-
-        if let Some(start) = clixml_envelope_start(buffer) {
-            if start > 0 {
-                visible.push_str(&buffer[..start]);
-                buffer.drain(..start);
-                continue;
-            }
-            let lower = buffer.to_ascii_lowercase();
-            let Some(end_start) = lower.find("</objs>") else {
-                break;
-            };
-            let end = end_start + "</objs>".len();
-            let envelope = buffer[..end].to_string();
-            visible.push_str(&public_command_stderr(&envelope));
-            buffer.drain(..end);
-            continue;
-        }
-
-        if looks_like_clixml_protocol(buffer) {
-            let fragment = std::mem::take(buffer);
-            visible.push_str(&public_command_stderr(&fragment));
-            break;
-        }
-
-        let hold = clixml_marker_prefix_suffix_len(buffer);
-        if hold > 0 {
-            let emit = buffer.len() - hold;
-            visible.push_str(&buffer[..emit]);
-            buffer.drain(..emit);
-            break;
-        }
-
-        visible.push_str(buffer);
-        buffer.clear();
-        break;
-    }
-    visible
-}
-
-fn trim_utf8_front(value: &mut String, max_bytes: usize) -> bool {
-    if value.len() <= max_bytes {
-        return false;
-    }
-    let mut start = value.len().saturating_sub(max_bytes);
-    while !value.is_char_boundary(start) {
-        start += 1;
-    }
-    value.drain(..start);
-    true
-}
-
-fn clixml_envelope_start(value: &str) -> Option<usize> {
-    let lower = value.to_ascii_lowercase();
-    [lower.find("#< clixml"), lower.find("<objs")]
-        .into_iter()
-        .flatten()
-        .min()
-}
-
-fn clixml_marker_prefix_suffix_len(value: &str) -> usize {
-    let lower = value.to_ascii_lowercase();
-    ["#< clixml", "<objs"]
-        .into_iter()
-        .map(|marker| {
-            (1..marker.len())
-                .rev()
-                .find(|length| lower.ends_with(&marker[..*length]))
-                .unwrap_or(0)
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-fn looks_like_clixml_protocol(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    lower.contains("#< clixml")
-        || lower.contains("<objs")
-        || lower.contains("</objs>")
-        || lower.contains("<obj")
-        || lower.contains("</obj>")
-        || lower.contains("<ms")
-        || lower.contains("</ms>")
-        || lower.contains("s=\"progress\"")
-        || lower.contains("s=\"error\"")
-}
-
-fn extract_clixml_error_strings(stderr: &str) -> String {
-    let mut values = Vec::new();
-    let lower = stderr.to_ascii_lowercase();
-    let mut cursor = 0usize;
-    while cursor < lower.len() {
-        let Some(relative_start) = lower[cursor..].find("<s") else {
-            break;
-        };
-        let start = cursor + relative_start;
-        let Some(relative_open_end) = lower[start..].find('>') else {
-            break;
-        };
-        let open_end = start + relative_open_end;
-        let open = &lower[start..=open_end];
-        let Some(relative_close) = lower[open_end + 1..].find("</s>") else {
-            break;
-        };
-        let close = open_end + 1 + relative_close;
-        if open == "<s>" || open.contains("s=\"error\"") {
-            let decoded = decode_clixml_text(&stderr[open_end + 1..close]);
-            if !decoded.trim().is_empty() {
-                values.push(decoded);
-            }
-        }
-        cursor = close + "</s>".len();
-    }
-    values.concat()
-}
-
-fn decode_clixml_text(value: &str) -> String {
-    let xml = value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&");
-    decode_clixml_utf16_escapes(&xml)
-}
-
-fn decode_clixml_utf16_escapes(value: &str) -> String {
-    fn escaped_unit(value: &str, index: usize) -> Option<u16> {
-        let token = value.get(index..index + 7)?;
-        (token.starts_with("_x") && token.ends_with('_'))
-            .then(|| u16::from_str_radix(&token[2..6], 16).ok())
-            .flatten()
-    }
-
-    let mut decoded = String::with_capacity(value.len());
-    let mut index = 0usize;
-    while index < value.len() {
-        if let Some(unit) = escaped_unit(value, index) {
-            if (0xD800..=0xDBFF).contains(&unit) {
-                if let Some(low) = escaped_unit(value, index + 7) {
-                    if (0xDC00..=0xDFFF).contains(&low) {
-                        let scalar =
-                            0x10000 + (((unit as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
-                        if let Some(ch) = char::from_u32(scalar) {
-                            decoded.push(ch);
-                            index += 14;
-                            continue;
-                        }
-                    }
-                }
-            } else if !(0xDC00..=0xDFFF).contains(&unit) {
-                if let Some(ch) = char::from_u32(unit as u32) {
-                    decoded.push(ch);
-                    index += 7;
-                    continue;
-                }
-            }
-        }
-        let ch = value[index..].chars().next().expect("valid UTF-8 boundary");
-        decoded.push(ch);
-        index += ch.len_utf8();
-    }
-    decoded
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10127,10 +9923,7 @@ mod tests {
             PublicCommandSession {
                 execution_id: ExecutionId::new("expired-execution"),
                 started_at: Instant::now(),
-                pending_output: String::new(),
-                pending_output_truncated: false,
-                output_incomplete: false,
-                stderr_protocol_buffer: String::new(),
+                output: CommandOutput::default(),
             },
         );
         let output =
@@ -10700,6 +10493,72 @@ mod tests {
     }
 
     #[test]
+    fn direct_terminal_poll_delivers_background_output_once() {
+        use crate::control_plane::command_control::{
+            CommandControlRequest, RuntimeCommandControl, RuntimeCommandControlError,
+            RuntimeCommandObservation, control_command_during_work,
+        };
+        struct NoRuntime;
+        impl RuntimeCommandControl for NoRuntime {
+            fn control_command(
+                &self,
+                _: &crate::control_plane::command_control::RuntimeCommandRequest,
+            ) -> Result<RuntimeCommandObservation, RuntimeCommandControlError> {
+                panic!("terminal replay must not poll upstream");
+            }
+        }
+        let registry = test_task_state("background-direct-output");
+        let mut sessions = PublicCommandSessions::default();
+        let public = bind_test_session(&mut sessions, &registry, "PRIVATE_BACKGROUND");
+        sessions.append_pending(&public, "BACKGROUND_MARKER\n");
+        sessions
+            .mark_terminal(
+                &public,
+                stable_success(json!({"status":"completed","exit_code":0}), "done"),
+                &registry,
+            )
+            .unwrap();
+        for expected in ["BACKGROUND_MARKER\n", ""] {
+            let result = control_command_during_work(
+                CommandControlRequest {
+                    action: crate::control_plane::command_control::CommandControlAction::Poll,
+                    chars: None,
+                    signal: None,
+                    wait_ms: 0,
+                    request_id: crate::domain::RpcRequestId::Number(1),
+                    public_session_id: PublicSessionId::new(public.clone()),
+                },
+                &registry,
+                &NoRuntime,
+            )
+            .unwrap();
+            assert_eq!(result.stdout, expected);
+        }
+        let shared = registry
+            .command_output(&PublicSessionId::new(public.clone()))
+            .unwrap();
+        let collection = shared.begin();
+        shared.append("LATE_STDOUT");
+        let error = shared.filter_stderr("LATE_STDERR");
+        shared.append(&error);
+        shared.annotate(true, true);
+        let terminal = stable_success(json!({"status":"completed","exit_code":0}), "done");
+        let waiting = sessions.terminal_with_pending(&public, terminal.clone());
+        assert_eq!(waiting["structuredContent"]["data"]["status"], "running");
+        assert_eq!(waiting["structuredContent"]["data"]["output"], "");
+        drop(collection);
+        for expected in ["LATE_STDOUTLATE_STDERR", ""] {
+            let delivered = sessions.terminal_with_pending(&public, terminal.clone());
+            assert_eq!(delivered["structuredContent"]["data"]["output"], expected);
+            assert_eq!(delivered["structuredContent"]["data"]["truncated"], true);
+            assert_eq!(
+                delivered["structuredContent"]["warnings"],
+                json!([INCOMPLETE_COMMAND_OUTPUT])
+            );
+        }
+    }
+
+    #[test]
     fn public_session_pending_output_is_incremental_and_terminal_does_not_replay() {
         let task_state = test_task_state("incremental");
         let mut sessions = PublicCommandSessions::default();
@@ -11255,7 +11114,9 @@ mod tests {
                 Some("KILL")
             );
             assert_eq!(
-                facade.adapter.public_commands.sessions[&public_session].pending_output,
+                facade.adapter.public_commands.sessions[&public_session]
+                    .output
+                    .pending(),
                 "UNDELIVERED_OUTPUT\n"
             );
             // Deliver the pending bytes once before injecting the poll fault;

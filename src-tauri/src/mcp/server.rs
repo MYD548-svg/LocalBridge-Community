@@ -68,7 +68,7 @@ use super::facade::{
     AGENT_API_REVISION, AgentFacade, CodingRuntimeHealth, CodingToolsRuntimeAdapter,
     FacadeCallError, FacadeDenied, FacadeError, FacadeErrorCode, FilesystemAction,
     FilesystemRequest, TaskCallIdentity, normalize_path_authority_error, parse_filesystem_request,
-    public_command_stderr, public_error_output_schema, public_safe_summary, public_task_kind,
+    public_error_output_schema, public_safe_summary, public_task_kind,
     run_workspace_filesystem_with_authority, stable_command_error, stable_public_tool_catalog,
     stable_success, validate_workspace_context_probe,
 };
@@ -2761,6 +2761,12 @@ fn direct_command_control_during_work(
         || WorkflowCheckpointStore::for_workspace(workspace)
             .and_then(|store| store.settle_command_kill::<Value>(result.public_session_id.as_str()))
             .is_ok();
+    #[cfg(test)]
+    eprintln!(
+        "COMMAND_ROUTE direct session={} status={}",
+        result.public_session_id.as_str(),
+        result.status.as_str()
+    );
     direct_command_result_to_mcp(result, action, checkpoint_settled)
 }
 
@@ -2769,7 +2775,7 @@ fn direct_command_result_to_mcp(
     _action: CommandControlAction,
     checkpoint_settled: bool,
 ) -> Value {
-    let stderr = public_command_stderr(&result.stderr);
+    let stderr = &result.stderr;
     let output = [result.stdout.as_str(), stderr.as_str()]
         .into_iter()
         .filter(|value| !value.is_empty())
@@ -2800,28 +2806,38 @@ fn direct_command_result_to_mcp(
     if let Some(truncated) = result.truncated {
         data.insert("truncated".into(), Value::Bool(truncated));
     }
-    if !checkpoint_settled {
-        return stable_command_error(
+    let mut response = if !checkpoint_settled {
+        stable_command_error(
             FacadeErrorCode::RuntimeUnavailable,
             "命令已终止，但工作流恢复状态不可用",
             data,
-        );
+        )
+    } else {
+        match result.status {
+            RuntimeCommandStatus::Running => stable_success(Value::Object(data), "Command running"),
+            RuntimeCommandStatus::Completed => {
+                stable_success(Value::Object(data), "Command completed")
+            }
+            RuntimeCommandStatus::Cancelled => {
+                stable_success(Value::Object(data), "Command cancelled")
+            }
+            RuntimeCommandStatus::TimedOut => {
+                stable_command_error(FacadeErrorCode::ProcessTimedOut, "Command timed out", data)
+            }
+            RuntimeCommandStatus::Failed => {
+                stable_command_error(FacadeErrorCode::ProcessFailed, "Command failed", data)
+            }
+            RuntimeCommandStatus::Lost => {
+                stable_command_error(FacadeErrorCode::SessionUnavailable, "Command lost", data)
+            }
+        }
+    };
+    if result.output_incomplete {
+        response["structuredContent"]["data"]["truncated"] = Value::Bool(true);
+        response["structuredContent"]["warnings"] =
+            json!([crate::control_plane::command_output::INCOMPLETE_COMMAND_OUTPUT]);
     }
-
-    match result.status {
-        RuntimeCommandStatus::Running => stable_success(Value::Object(data), "Command running"),
-        RuntimeCommandStatus::Completed => stable_success(Value::Object(data), "Command completed"),
-        RuntimeCommandStatus::Cancelled => stable_success(Value::Object(data), "Command cancelled"),
-        RuntimeCommandStatus::TimedOut => {
-            stable_command_error(FacadeErrorCode::ProcessTimedOut, "Command timed out", data)
-        }
-        RuntimeCommandStatus::Failed => {
-            stable_command_error(FacadeErrorCode::ProcessFailed, "Command failed", data)
-        }
-        RuntimeCommandStatus::Lost => {
-            stable_command_error(FacadeErrorCode::SessionUnavailable, "Command lost", data)
-        }
-    }
+    response
 }
 
 fn task_control_snapshot_with_terminal(
@@ -8227,6 +8243,112 @@ mod tests {
     }
 
     #[test]
+    fn busy_http_control_delivers_shared_terminal_output_and_waits_for_collectors() {
+        let root = repo_root();
+        let workspace = temp_workspace();
+        let coding = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                free_port(),
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let pep =
+            PolicyEnforcementRuntime::start(coding, policy(&root), PermissionMode::Full).unwrap();
+        let session = initialize(pep.port(), 9700).session.unwrap();
+        let registry = pep.control_plane.executions();
+        // Holding the actual facade mutex forces the production HTTP try_lock
+        // branch to use direct control, with no scheduler timing assumptions.
+        let held = pep.guard.as_ref().unwrap().lock().unwrap();
+        for (index, outcome) in [
+            TerminalOutcome::Completed,
+            TerminalOutcome::Failed,
+            TerminalOutcome::Cancelled,
+            TerminalOutcome::TimedOut,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let public = PublicSessionId::new(format!("lb-session-delivery-{index}"));
+            let started = registry
+                .start_owned(
+                    TaskId::new(format!("delivery-task-{index}")),
+                    public.clone(),
+                    Some(McpSessionId::new(session.clone())),
+                )
+                .unwrap();
+            let output = registry.command_output(&public).unwrap();
+            let collection = output.begin();
+            output.append("BACKGROUND_STDOUT\n");
+            let stderr = output.filter_stderr("BACKGROUND_STDERR\n");
+            output.append(&stderr);
+            output.annotate(true, true);
+            registry
+                .finish(
+                    &started.execution_id,
+                    ExecutionTerminal {
+                        outcome,
+                        exit_code: Some(if outcome == TerminalOutcome::Completed {
+                            0
+                        } else {
+                            1
+                        }),
+                        signal: None,
+                        output_refs: Vec::new(),
+                        error_code: None,
+                        completed_at_ms: unix_time_ms(),
+                    },
+                )
+                .unwrap();
+            let call = |id| {
+                public_tool_call(
+                    pep.port(),
+                    &session,
+                    id,
+                    "command_control",
+                    json!({"action":"poll","session_id":public.as_str(),"wait_ms":0}),
+                )
+            };
+            let waiting = call(9710 + index as u64 * 3);
+            assert_eq!(
+                waiting.body["result"]["structuredContent"]["data"]["status"], "running",
+                "{:#?}",
+                waiting.body
+            );
+            assert_eq!(
+                waiting.body["result"]["structuredContent"]["data"]["output"],
+                ""
+            );
+            drop(collection);
+            for (offset, expected) in [(1, "BACKGROUND_STDOUT\nBACKGROUND_STDERR\n"), (2, "")] {
+                let response = call(9710 + index as u64 * 3 + offset);
+                let envelope = &response.body["result"]["structuredContent"];
+                assert_eq!(
+                    envelope["data"]["status"],
+                    outcome.as_str(),
+                    "{:#?}",
+                    response.body
+                );
+                assert_eq!(envelope["data"]["output"], expected, "{:#?}", response.body);
+                assert_eq!(envelope["data"]["truncated"], true);
+                assert_eq!(
+                    envelope["warnings"],
+                    json!([crate::control_plane::command_output::INCOMPLETE_COMMAND_OUTPUT])
+                );
+                assert!(envelope["data"].get("warnings").is_none());
+            }
+        }
+        drop(held);
+        let mut coding = pep.stop().unwrap();
+        coding.stop().unwrap();
+        cleanup_test_directory(&workspace);
+    }
+
+    #[test]
     fn full_scripts_share_current_user_authority_independent_of_path_spelling() {
         let root = repo_root();
         let workspace = temp_workspace();
@@ -8317,7 +8439,11 @@ mod tests {
         );
         let (nul, nul_output) = settle_public_command(pep.port(), &session, 20_705, nul);
         assert_eq!(nul.body["result"]["isError"], false, "{:#?}", nul.body);
-        assert!(nul_output.contains("LB_SCHEMA42_NUL_OK"));
+        assert!(
+            nul_output.contains("LB_SCHEMA42_NUL_OK"),
+            "NUL accumulated_output={nul_output:?} response={:#?}",
+            nul.body
+        );
         for entry in fs::read_dir(&workspace).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
             assert_ne!(name, "nul");

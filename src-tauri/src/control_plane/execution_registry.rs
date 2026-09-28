@@ -1,3 +1,4 @@
+use super::command_output::CommandOutput;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -87,6 +88,7 @@ struct ExecutionRegistryInner {
     path: PathBuf,
     state: PersistedExecutionState,
     cancellation_signals: HashMap<ExecutionId, String>,
+    command_outputs: HashMap<ExecutionId, CommandOutput>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +163,21 @@ pub(crate) struct AdoptedExecution {
 impl std::error::Error for ExecutionRegistryError {}
 
 impl ExecutionRegistry {
+    pub(crate) fn command_output(&self, public: &PublicSessionId) -> Option<CommandOutput> {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = inner
+            .state
+            .executions
+            .iter()
+            .find(|record| &record.public_session_id == public)?
+            .id
+            .clone();
+        Some(inner.command_outputs.entry(id).or_default().clone())
+    }
+
     pub(crate) fn for_workspace(workspace: &Path) -> Result<Self, ExecutionRegistryError> {
         Self::open_at(default_execution_state_path(workspace))
     }
@@ -212,6 +229,7 @@ impl ExecutionRegistry {
             path,
             state,
             cancellation_signals: HashMap::new(),
+            command_outputs: HashMap::new(),
         }))))
     }
 
@@ -721,6 +739,9 @@ impl ExecutionRegistry {
         trim_state(&mut next);
         persist_state(&inner.path, &next)
             .map_err(|_| ExecutionRegistryError::Storage(operation))?;
+        inner
+            .command_outputs
+            .retain(|id, _| next.executions.iter().any(|record| &record.id == id));
         inner.state = next;
         Ok(())
     }

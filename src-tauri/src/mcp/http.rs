@@ -263,6 +263,15 @@ impl RuntimeCommandControl for McpCancellationClient {
                 .unwrap_or_default()
                 .to_string(),
             truncated: structured.get("truncated").and_then(Value::as_bool),
+            output_incomplete: structured
+                .get("warnings")
+                .and_then(Value::as_array)
+                .is_some_and(|warnings| {
+                    warnings.iter().any(|warning| {
+                        warning.as_str()
+                            == Some(crate::control_plane::command_output::INCOMPLETE_COMMAND_OUTPUT)
+                    })
+                }),
         })
     }
 }
