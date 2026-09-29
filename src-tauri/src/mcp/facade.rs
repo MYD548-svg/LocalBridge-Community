@@ -984,6 +984,7 @@ impl PublicCommandSessions {
         owner_task_id: Option<String>,
         owner_session: Option<McpSessionId>,
     ) -> Result<StartedPublicCommand, FacadeError> {
+        self.outputs = executions.output_handles();
         let public = next_public_handle("lb-session");
         let task_id = TaskId::new(owner_task_id.unwrap_or_else(|| next_public_handle("lb-task")));
         let started = executions
@@ -1024,6 +1025,7 @@ impl PublicCommandSessions {
             .map_err(normalize_execution_registry_error)
     }
 
+    #[cfg(test)]
     fn public_output_for_private(
         &mut self,
         private_output_ref: &str,
@@ -1118,6 +1120,7 @@ impl PublicCommandSessions {
         }
     }
 
+    #[cfg(test)]
     fn output_refs_by_stream(&self, output_refs: &[String]) -> Map<String, Value> {
         output_refs
             .iter()
@@ -1149,9 +1152,12 @@ impl PublicCommandSessions {
         }
         match executions.finish(&execution_id, terminal) {
             Ok(()) => {}
-            Err(ExecutionRegistryError::AlreadyTerminal { .. }) => return Ok(()),
+            Err(ExecutionRegistryError::AlreadyTerminal { .. }) => {}
             Err(error) => return Err(normalize_execution_registry_error(error)),
         }
+        executions
+            .enrich_terminal_output_refs(&execution_id)
+            .map_err(normalize_execution_registry_error)?;
         Ok(())
     }
 
@@ -1299,7 +1305,10 @@ impl CodingToolsRuntimeAdapter {
             workspace_lifetime_pin,
             shell_executor: ShellExecutor::default(),
             toolbox,
-            public_commands: PublicCommandSessions::default(),
+            public_commands: PublicCommandSessions {
+                outputs: executions.output_handles(),
+                ..PublicCommandSessions::default()
+            },
             executions,
             workflow_checkpoint,
             cached_default_cwd: None,
@@ -2451,15 +2460,10 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
         if let Some(signal) = terminal.signal {
             data.insert("signal".into(), Value::String(signal));
         }
-        let output_refs = self
-            .public_commands
-            .output_refs_by_stream(&terminal.output_refs);
-        if !output_refs.is_empty() {
-            if let Some(stdout) = output_refs.get("stdout").cloned() {
-                data.insert("output_ref".into(), stdout);
-            }
-            data.insert("output_refs".into(), Value::Object(output_refs));
-        }
+        let refs = self
+            .executions
+            .command_output_refs(&PublicSessionId::new(session_id));
+        insert_public_output_refs(&mut data, &refs);
         let mut result = match terminal.outcome {
             TerminalOutcome::Completed => Some(stable_success(
                 Value::Object(data),
@@ -2582,7 +2586,7 @@ impl CodingToolsRuntimeAdapter {
         self.public_commands
             .append_pending(public_session_id, &output);
         data.insert("output".into(), Value::String(String::new()));
-        self.map_private_output_refs(structured, &mut data, public_session_id);
+        self.map_private_output_refs(structured, &mut data, public_session_id)?;
 
         let mut result = match public_status {
             "running" => stable_success(Value::Object(data), command_summary("running")),
@@ -2741,55 +2745,38 @@ impl CodingToolsRuntimeAdapter {
         structured: Option<&Map<String, Value>>,
         data: &mut Map<String, Value>,
         public_session_id: &str,
-    ) {
-        let Some(structured) = structured else {
-            return;
-        };
-        if let Some(private) = structured.get("output_ref").and_then(Value::as_str) {
-            let stream = primary_output_stream(structured, private);
-            data.insert(
-                "output_ref".into(),
-                Value::String(self.public_commands.public_output_for_private(
-                    private,
-                    public_session_id,
-                    stream,
-                )),
-            );
+    ) -> Result<(), FacadeError> {
+        if let Some(structured) = structured {
+            let refs = super::http::runtime_output_references(structured)
+                .map_err(|_| runtime_capability_mismatch())?;
+            self.executions
+                .register_command_output_refs(&PublicSessionId::new(public_session_id), &refs)
+                .map_err(normalize_execution_registry_error)?;
         }
-        if let Some(private_refs) = structured.get("output_refs").and_then(Value::as_object) {
-            let mut public_refs = Map::new();
-            for stream in ["stdout", "stderr"] {
-                if let Some(private) = private_refs.get(stream).and_then(Value::as_str) {
-                    public_refs.insert(
-                        stream.into(),
-                        Value::String(self.public_commands.public_output_for_private(
-                            private,
-                            public_session_id,
-                            stream,
-                        )),
-                    );
-                }
-            }
-            if !public_refs.is_empty() {
-                data.insert("output_refs".into(), Value::Object(public_refs));
-            }
-        }
+        let refs = self
+            .executions
+            .command_output_refs(&PublicSessionId::new(public_session_id));
+        insert_public_output_refs(data, &refs);
+        Ok(())
     }
 }
 
-fn primary_output_stream<'a>(structured: &'a Map<String, Value>, output_ref: &str) -> &'a str {
-    // The private primary handle may select stderr. Its stream ownership must
-    // not depend on whether this response or the terminal observer arrives first.
-    structured
-        .get("output_refs")
-        .and_then(Value::as_object)
-        .and_then(|refs| {
-            ["stdout", "stderr"]
-                .into_iter()
-                .find(|stream| refs.get(*stream).and_then(Value::as_str) == Some(output_ref))
-        })
-        .or_else(|| structured.get("output_stream").and_then(Value::as_str))
-        .unwrap_or("stdout")
+pub(crate) fn insert_public_output_refs(
+    data: &mut Map<String, Value>,
+    refs: &crate::execution::output_handles::OutputReferences,
+) {
+    if let Some(primary) = &refs.primary {
+        data.insert("output_ref".into(), Value::String(primary.clone()));
+    }
+    let mut streams = Map::new();
+    for (stream, value) in [("stdout", &refs.stdout), ("stderr", &refs.stderr)] {
+        if let Some(value) = value {
+            streams.insert(stream.into(), Value::String(value.clone()));
+        }
+    }
+    if !streams.is_empty() {
+        data.insert("output_refs".into(), Value::Object(streams));
+    }
 }
 
 fn public_local_output_page(
@@ -10605,9 +10592,8 @@ mod tests {
             "output_stream":"stderr",
             "output_refs":{"stdout":"private-stdout","stderr":"private-stderr"}
         });
-        let primary_stream = primary_output_stream(raw.as_object().unwrap(), "private-stderr");
-        assert_eq!(primary_stream, "stderr");
-        let primary = sessions.public_output_for_private("private-stderr", &public, primary_stream);
+        let parsed = crate::mcp::http::runtime_output_references(raw.as_object().unwrap()).unwrap();
+        let primary = sessions.outputs.register(&public, &parsed).primary.unwrap();
         let stdout = sessions.public_output_for_private("private-stdout", &public, "stdout");
         let stderr = sessions.public_output_for_private("private-stderr", &public, "stderr");
         let refs = sessions.output_refs_by_stream(&[stdout.clone(), stderr.clone()]);
@@ -10615,6 +10601,45 @@ mod tests {
         assert_eq!(refs["stdout"], stdout);
         assert_eq!(refs["stderr"], stderr);
         assert_eq!(primary, stderr);
+    }
+
+    #[test]
+    fn late_output_handles_enrich_an_existing_terminal_without_replacing_its_facts() {
+        let executions = test_task_state("late-terminal-refs");
+        let mut sessions = PublicCommandSessions::default();
+        let public = bind_test_session(&mut sessions, &executions, "private-late-refs");
+        let result = stable_command_error(
+            FacadeErrorCode::ProcessFailed,
+            "failed",
+            json!({"status":"failed","session_id":public,"exit_code":7})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        sessions
+            .mark_terminal(&public, result.clone(), &executions)
+            .unwrap();
+        let before = executions
+            .execution_for_public_session(&PublicSessionId::new(&public))
+            .unwrap();
+        let stderr = sessions.public_output_for_private("private-stderr", &public, "stderr");
+        let mut late = result;
+        late["structuredContent"]["data"]["output_refs"] = json!({"stderr":stderr});
+        late["structuredContent"]["data"]["exit_code"] = json!(99);
+        sessions.mark_terminal(&public, late, &executions).unwrap();
+        let after = executions
+            .execution_for_public_session(&PublicSessionId::new(&public))
+            .unwrap();
+        let ExecutionState::Terminal(before) = before.state else {
+            panic!("terminal");
+        };
+        let ExecutionState::Terminal(after) = after.state else {
+            panic!("terminal");
+        };
+        assert_eq!(after.output_refs, vec![stderr]);
+        assert_eq!(after.exit_code, before.exit_code);
+        assert_eq!(after.outcome, before.outcome);
+        assert_eq!(after.completed_at_ms, before.completed_at_ms);
     }
 
     #[test]

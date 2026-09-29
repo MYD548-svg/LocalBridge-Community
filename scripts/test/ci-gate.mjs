@@ -34,6 +34,7 @@ export const CI_STAGES = validateStages([
       "--test",
       "tests/black-box/chatgpt/client.test.mjs",
       "tests/black-box/chatgpt/command_lifecycle.test.mjs",
+      "tests/black-box/chatgpt/output_reference.test.mjs",
       "scripts/test/ci-gate.test.mjs",
       "scripts/test/structure.test.mjs",
       "scripts/test/build-regression.test.mjs",

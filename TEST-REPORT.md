@@ -1,3 +1,96 @@
+# Shared command output references - 2026-09-29
+
+## Audited cloud baseline (8a72729)
+
+Base commit: 8a72729af5738c82ac901409dd85e9d9c02e97e6 on codex/fix-ci-validation.
+Both PR runs checked out cd4993840cb8dbc6a1b886cc78b428cd1ceac520, merging into
+012adf917b06b8a3866b0d77a564ae481c289b4f. All runs were attempt 1.
+
+| Run | Verified result |
+| --- | --- |
+| [CI push 36513245524](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36513245524) | FAIL: first 14 stages PASS; Rust library 419/419; external client 1 PASS / 1 FAIL |
+| [CI PR 36513249337](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36513249337) | PASS: all 19 stages, Rust library 419/419, verified bundled installer uploaded |
+| [Community PR 36513249348](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36513249348) | Linux PASS; Windows all 19 stages, Rust library 419/419, verified community installer uploaded |
+
+All three passed Python 11/11 and ten authentication probes. CI push failed
+revision46_reported_failures_are_rechecked_through_the_external_client:
+revision46.mjs:953 accessed data.output_refs.stderr after a successful
+ProcessFailed assertion, but output_refs was undefined. Subsequent standalone
+Clippy, packaging and final artifact verification were NOT_RUN in that push
+run; compile-preflight Clippy had passed. The two PR installer artifacts exist;
+independent download, extraction and clean-machine installation were NOT_RUN.
+
+Code inspection confirms the direct route discarded private references,
+committed empty reference lists, and could not enrich an existing terminal.
+The cloud log lacks the response envelopes and route trace needed to identify
+the exact interleaving. This report does not claim that interleaving was proven.
+
+## Repair
+
+- Share the bounded output handle registry through ExecutionRegistry. The
+  facade, background observation, direct control and retained reads use the
+  same mapping. Private identity includes owner and stream to prevent aliasing.
+- Decode typed stdout/stderr/primary references at the transport boundary and
+  register them within the existing collection guard, before terminal delivery.
+  Direct results and facade replays use one public-reference projection.
+- Keep references across repeated delivery while consuming inline text once.
+  Enrich late terminal references without changing the authoritative outcome,
+  exit code, cancellation signal or completion time. Persist only public handles
+  in the existing format; no schema/version migration is introduced.
+- Keep private/local FIFO bounds at 256/8. Reap mappings with removed executions,
+  reject registration for removed sessions and never regenerate handles from
+  terminal replay. Account for eviction of an old primary during dual-stream
+  registration so a response cannot publish that expired primary.
+- Handle locks are short and never span network calls or persistence. Existing
+  cancellation, retryable errors, output truncation and warning semantics remain.
+- Keep the original retained-stderr assertion. Missing/malformed references now
+  fail with request ID and initial/terminal/replay envelopes instead of TypeError;
+  diagnostics do not include client authentication headers.
+
+## Local evidence and test limits
+
+- PASS: bundled integrity and all eight existing stages from bundled-integrity
+  through frontend-build. Selected gate status remains PARTIAL, not full PASS.
+- PASS: Node base/build-contract suite 34/34, including two new diagnostic cases.
+- PASS: bundled Python 11/11; .cmd, .bat, PowerShell and NUL exactly ten times
+  each (40/40), with unchanged marker, replay and leakage assertions.
+- PASS: handle regression 263 -> 263 (maximum growth 8), fixtures retained.
+- PASS: format, public release, licenses (166 npm / 484 cargo), schema44,
+  frontend 18 tests / 6 files, TypeScript and Vite build.
+- PASS: Rust 1.85 isolated Clippy metadata analysis of output_handles.rs and its
+  tests, using a temporary harness with minimal identity/random-ID stubs and
+  command-local -A dead_code -D warnings. This checks that module only; it is
+  not full-crate compilation, linking, production randomness or test execution.
+- ADDED / NOT_RUN locally: late terminal enrichment regression (added before
+  implementation), event-ordered late registration and execution cleanup;
+  concurrent duplicate registration, FIFO eviction and primary-stream boundary;
+  direct observation/replay for completed/failed/cancelled/timed_out; parser
+  validation; forced busy HTTP replay with references and incomplete warnings;
+  real PowerShell retained stderr, owner/stream rejection, filesystem-signalled
+  direct-first terminal followed by explicit ordinary-facade replay and reading.
+- The HTTP read helper retries only explicit retryable RuntimeUnavailable or
+  OperationTimedOut envelopes within 30 seconds, matching existing busy-route
+  semantics. It never retries missing references, wrong content or assertions.
+- NOT_RUN locally: full Rust compilation, complete-crate Clippy, Rust test and
+  public-interface execution, authenticated Tunnel repetitions, NSIS packaging
+  and clean installation. MSVC/Windows SDK are unavailable and were not installed.
+  No locally observed Rust red/green test execution is claimed.
+
+No Python runtime payload, pinned hashes, manifest, public schema, workflow,
+toolchain or gate count changed. The only gate-list edit includes the new Node
+case in existing test-base. Preserve 19 stages and ten authentication probes.
+Historical cloud/installer results above do not validate this new commit.
+
+## Delivery boundary
+
+Review and explicitly stage only the implementation, regression and report files.
+Push once to codex/fix-ci-validation, compare remote and local SHAs, then stop.
+New cloud acceptance remains UNVERIFIED. Do not query new Actions, poll, rerun,
+monitor, merge or publish. Preserve unrelated untracked files and all fixtures;
+no bulk deletion. If push is rejected, retain local work without force.
+
+## Historical reports
+
 # Clippy test-module placement repair - 2026-09-29
 
 ## Audited cloud result for 9c43453

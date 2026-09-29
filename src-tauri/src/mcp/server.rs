@@ -2806,6 +2806,7 @@ fn direct_command_result_to_mcp(
     if let Some(truncated) = result.truncated {
         data.insert("truncated".into(), Value::Bool(truncated));
     }
+    super::facade::insert_public_output_refs(&mut data, &result.output_refs);
     let mut response = if !checkpoint_settled {
         stable_command_error(
             FacadeErrorCode::RuntimeUnavailable,
@@ -8287,6 +8288,14 @@ mod tests {
             let stderr = output.filter_stderr("BACKGROUND_STDERR\n");
             output.append(&stderr);
             output.annotate(true, true);
+            let refs = registry.output_handles().register(
+                public.as_str(),
+                &crate::execution::output_handles::OutputReferences {
+                    primary: Some(format!("private-stderr-{index}")),
+                    stdout: Some(format!("private-stdout-{index}")),
+                    stderr: Some(format!("private-stderr-{index}")),
+                },
+            );
             registry
                 .finish(
                     &started.execution_id,
@@ -8323,6 +8332,9 @@ mod tests {
                 waiting.body["result"]["structuredContent"]["data"]["output"],
                 ""
             );
+            registry
+                .enrich_terminal_output_refs(&started.execution_id)
+                .unwrap();
             drop(collection);
             for (offset, expected) in [(1, "BACKGROUND_STDOUT\nBACKGROUND_STDERR\n"), (2, "")] {
                 let response = call(9710 + index as u64 * 3 + offset);
@@ -8340,9 +8352,223 @@ mod tests {
                     json!([crate::control_plane::command_output::INCOMPLETE_COMMAND_OUTPUT])
                 );
                 assert!(envelope["data"].get("warnings").is_none());
+                assert_eq!(
+                    envelope["data"]["output_refs"]["stdout"].as_str(),
+                    refs.stdout.as_deref(),
+                    "direct {:#?}",
+                    response.body
+                );
+                assert_eq!(
+                    envelope["data"]["output_refs"]["stderr"].as_str(),
+                    refs.stderr.as_deref(),
+                    "direct {:#?}",
+                    response.body
+                );
+                assert_eq!(
+                    envelope["data"]["output_ref"].as_str(),
+                    refs.primary.as_deref()
+                );
             }
         }
         drop(held);
+        let mut coding = pep.stop().unwrap();
+        coding.stop().unwrap();
+        cleanup_test_directory(&workspace);
+    }
+
+    #[test]
+    fn busy_terminal_replay_retains_readable_stderr_and_its_owner() {
+        let root = repo_root();
+        let workspace = temp_workspace();
+        let coding = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                free_port(),
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let pep =
+            PolicyEnforcementRuntime::start(coding, policy(&root), PermissionMode::Full).unwrap();
+        let owner = initialize(pep.port(), 9800).session.unwrap();
+        let other = initialize(pep.port(), 9801).session.unwrap();
+        let control_read = |session: &str, request_id: u64, arguments: Value| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let response = public_tool_call(
+                    pep.port(),
+                    session,
+                    request_id,
+                    "command_control",
+                    arguments.clone(),
+                );
+                let error = &response.body["result"]["structuredContent"]["error"];
+                if error["retryable"] != true
+                    || !matches!(
+                        error["code"].as_str(),
+                        Some("RuntimeUnavailable" | "OperationTimedOut")
+                    )
+                {
+                    break response;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "read transport remained busy: {:#?}",
+                    response.body
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let initial = public_tool_call(
+            pep.port(),
+            &owner,
+            9802,
+            "exec_command",
+            json!({"command":"Write-Error LB_SHARED_RETAINED_STDERR", "shell":"windows_powershell", "yield_time_ms":0,"timeout_ms":120000}),
+        );
+        let (terminal, _) = settle_public_command(pep.port(), &owner, 98_100, initial);
+        assert_tool_error(&terminal, "ProcessFailed");
+        let data = &terminal.body["result"]["structuredContent"]["data"];
+        let public = data["session_id"].as_str().unwrap();
+        let stderr = data["output_refs"]["stderr"]
+            .as_str()
+            .expect("terminal stderr reference");
+        let held = pep.guard.as_ref().unwrap().lock().unwrap();
+        for id in [9803, 9804] {
+            let replay = public_tool_call(
+                pep.port(),
+                &owner,
+                id,
+                "command_control",
+                json!({"action":"poll","session_id":public,"wait_ms":0}),
+            );
+            assert_tool_error(&replay, "ProcessFailed");
+            assert_eq!(
+                replay.body["result"]["structuredContent"]["data"]["output_refs"]["stderr"], stderr,
+                "direct {:#?}",
+                replay.body
+            );
+            assert_eq!(
+                replay.body["result"]["structuredContent"]["data"]["output"],
+                ""
+            );
+        }
+        drop(held);
+        let read = control_read(
+            &owner,
+            9805,
+            json!({"action":"read","output_ref":stderr,"stream":"stderr","limit":1048576}),
+        );
+        assert!(
+            read.body["result"]["structuredContent"]["data"]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("LB_SHARED_RETAINED_STDERR")),
+            "{:#?}",
+            read.body
+        );
+        let denied = control_read(
+            &other,
+            9806,
+            json!({"action":"read","output_ref":stderr,"stream":"stderr"}),
+        );
+        assert_tool_error(&denied, "OutputNotFound");
+        let mismatch = control_read(
+            &owner,
+            9807,
+            json!({"action":"read","output_ref":stderr,"stream":"stdout"}),
+        );
+        assert_tool_error(&mismatch, "InvalidArgument");
+        let replay = public_tool_call(
+            pep.port(),
+            &owner,
+            9808,
+            "command_control",
+            json!({"action":"poll","session_id":public,"wait_ms":0}),
+        );
+        assert_eq!(
+            replay.body["result"]["structuredContent"]["data"]["output_refs"]["stderr"],
+            stderr
+        );
+        // A filesystem event holds the command open until the facade lock is
+        // held; terminal collection must then use the real direct HTTP path.
+        let initial = public_tool_call(
+            pep.port(),
+            &owner,
+            9810,
+            "exec_command",
+            json!({
+                "command":"while (-not (Test-Path 'release-stderr.txt')) { Start-Sleep -Milliseconds 20 }; Write-Error LB_DIRECT_FIRST_STDERR",
+                "shell":"windows_powershell","yield_time_ms":0,"timeout_ms":120000
+            }),
+        );
+        assert_eq!(
+            initial.body["result"]["structuredContent"]["data"]["status"], "running",
+            "{:#?}",
+            initial.body
+        );
+        let mut held = pep.guard.as_ref().unwrap().lock().unwrap();
+        fs::write(workspace.join("release-stderr.txt"), "release").unwrap();
+        let (direct, accumulated) = settle_public_command(pep.port(), &owner, 99_000, initial);
+        assert_tool_error(&direct, "ProcessFailed");
+        assert!(
+            accumulated.contains("LB_DIRECT_FIRST_STDERR"),
+            "{accumulated:?}"
+        );
+        let direct_data = &direct.body["result"]["structuredContent"]["data"];
+        let direct_session = direct_data["session_id"].as_str().unwrap();
+        let direct_ref = direct_data["output_refs"]["stderr"]
+            .as_str()
+            .expect("direct terminal reference");
+        let ordinary = held
+            .call_tool_for_task(
+                PermissionMode::Full,
+                "command_control",
+                json!({"action":"poll","session_id":direct_session,"wait_ms":0}),
+                TaskCallIdentity {
+                    request_id: None,
+                    task_id: TaskId::new("ordinary-replay"),
+                    owner_session: Some(McpSessionId::new(owner.clone())),
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            ordinary["structuredContent"]["data"]["output_refs"]["stderr"], direct_ref,
+            "facade {ordinary:#}"
+        );
+        assert_eq!(ordinary["structuredContent"]["data"]["output"], "");
+        drop(held);
+        let normal = public_tool_call(
+            pep.port(),
+            &owner,
+            9811,
+            "command_control",
+            json!({"action":"poll","session_id":direct_session,"wait_ms":0}),
+        );
+        assert_tool_error(&normal, "ProcessFailed");
+        assert_eq!(
+            normal.body["result"]["structuredContent"]["data"]["output_refs"]["stderr"],
+            direct_ref
+        );
+        assert_eq!(
+            normal.body["result"]["structuredContent"]["data"]["output"],
+            ""
+        );
+        let retained = control_read(
+            &owner,
+            9812,
+            json!({"action":"read","output_ref":direct_ref,"stream":"stderr","limit":1048576}),
+        );
+        assert!(
+            retained.body["result"]["structuredContent"]["data"]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("LB_DIRECT_FIRST_STDERR")),
+            "{:#?}",
+            retained.body
+        );
         let mut coding = pep.stop().unwrap();
         coding.stop().unwrap();
         cleanup_test_directory(&workspace);

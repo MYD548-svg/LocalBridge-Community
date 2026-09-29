@@ -2,6 +2,7 @@ use crate::domain::{
     ExecutionRecord, ExecutionState, ExecutionTerminal, PublicSessionId, RpcRequestId, TaskId,
     TerminalOutcome,
 };
+use crate::execution::output_handles::OutputReferences;
 
 use super::execution_registry::{ExecutionRegistry, ExecutionRegistryError};
 
@@ -85,6 +86,7 @@ pub(crate) struct RuntimeCommandObservation {
     pub(crate) stderr: String,
     pub(crate) truncated: Option<bool>,
     pub(crate) output_incomplete: bool,
+    pub(crate) output_refs: OutputReferences,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +127,7 @@ pub(crate) struct CommandControlResult {
     pub(crate) signal: Option<String>,
     pub(crate) truncated: Option<bool>,
     pub(crate) output_incomplete: bool,
+    pub(crate) output_refs: OutputReferences,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +141,16 @@ pub(crate) enum CommandControlError {
 }
 
 pub(crate) fn control_command_during_work(
+    request: CommandControlRequest,
+    executions: &ExecutionRegistry,
+    runtime: &dyn RuntimeCommandControl,
+) -> Result<CommandControlResult, CommandControlError> {
+    let mut result = collect_command_during_work(request, executions, runtime)?;
+    result.output_refs = executions.command_output_refs(&result.public_session_id);
+    Ok(result)
+}
+
+fn collect_command_during_work(
     request: CommandControlRequest,
     executions: &ExecutionRegistry,
     runtime: &dyn RuntimeCommandControl,
@@ -196,7 +209,9 @@ pub(crate) fn control_command_during_work(
                     outcome: TerminalOutcome::Cancelled,
                     exit_code: None,
                     signal: cancellation_signal,
-                    output_refs: Vec::new(),
+                    output_refs: executions
+                        .command_output_refs(&request.public_session_id)
+                        .values(),
                     error_code: Some("ProcessCancelled".to_string()),
                     completed_at_ms: unix_time_ms(),
                 };
@@ -228,6 +243,9 @@ pub(crate) fn control_command_during_work(
         }
     };
 
+    executions
+        .register_command_output_refs(&request.public_session_id, &observation.output_refs)
+        .map_err(map_execution_error)?;
     let stderr = output.filter_stderr(&observation.stderr);
     let combined = [observation.stdout.as_str(), stderr.as_str()]
         .into_iter()
@@ -271,11 +289,16 @@ pub(crate) fn control_command_during_work(
                     .signal
                     .clone()
                     .or_else(|| cancellation_signal.clone()),
-                output_refs: Vec::new(),
+                output_refs: executions
+                    .command_output_refs(&request.public_session_id)
+                    .values(),
                 error_code: terminal_error_code(outcome).map(str::to_string),
                 completed_at_ms: unix_time_ms(),
             },
         );
+        executions
+            .enrich_terminal_output_refs(&execution.id)
+            .map_err(map_execution_error)?;
         match finish_result {
             Ok(()) => {}
             Err(ExecutionRegistryError::AlreadyTerminal { .. }) => {
@@ -318,6 +341,7 @@ pub(crate) fn control_command_during_work(
             signal: observation.signal.or(cancellation_signal),
             truncated: observation.truncated,
             output_incomplete: false,
+            output_refs: OutputReferences::default(),
         },
         &output,
         request.action,
@@ -368,6 +392,7 @@ fn result_from_terminal(
         signal: terminal.signal.clone(),
         truncated: None,
         output_incomplete: false,
+        output_refs: OutputReferences::default(),
     }
 }
 
@@ -473,6 +498,7 @@ mod tests {
             signal: Some("KILL".into()),
             truncated: None,
             output_incomplete: false,
+            output_refs: OutputReferences::default(),
         };
         let polled = deliver_output(terminal.clone(), &output, CommandControlAction::Poll).unwrap();
         assert_eq!(polled.status, RuntimeCommandStatus::Running);
@@ -525,6 +551,7 @@ mod tests {
             stderr: String::new(),
             truncated: Some(false),
             output_incomplete: false,
+            output_refs: OutputReferences::default(),
         })));
 
         let result = control_command_during_work(
@@ -608,6 +635,7 @@ mod tests {
                 stderr: String::new(),
                 truncated: Some(false),
                 output_incomplete: false,
+                output_refs: OutputReferences::default(),
             }))),
         )
         .expect("poll result");
@@ -665,6 +693,7 @@ mod tests {
                 stderr: String::new(),
                 truncated: Some(false),
                 output_incomplete: false,
+                output_refs: OutputReferences::default(),
             }))),
         );
 
@@ -779,6 +808,11 @@ mod tests {
                 stderr: String::new(),
                 truncated: Some(false),
                 output_incomplete: false,
+                output_refs: OutputReferences {
+                    primary: Some("late-stderr".into()),
+                    stdout: Some("late-stdout".into()),
+                    stderr: Some("late-stderr".into()),
+                },
             })
         }
     }
@@ -829,6 +863,41 @@ mod tests {
         // not seen it yet, and dropping it breaks output-accumulating consumers
         // (the schema27/r1 terminal-poll failures on 37659cc).
         assert_eq!(polled.stdout, "RACING_OBSERVED_OUTPUT");
+        assert!(
+            polled
+                .output_refs
+                .stderr
+                .as_deref()
+                .unwrap()
+                .starts_with("lb-output-")
+        );
+        assert_eq!(polled.output_refs.primary, polled.output_refs.stderr);
+        let saved = registry
+            .execution_for_public_session(&public_session)
+            .unwrap();
+        let ExecutionState::Terminal(saved) = saved.state else {
+            panic!("terminal");
+        };
+        assert!(
+            saved
+                .output_refs
+                .contains(polled.output_refs.stderr.as_ref().unwrap())
+        );
+        let replay = control_command_during_work(
+            CommandControlRequest {
+                action: CommandControlAction::Poll,
+                chars: None,
+                signal: None,
+                wait_ms: 0,
+                request_id: RpcRequestId::String("replay".into()),
+                public_session_id: public_session.clone(),
+            },
+            &registry,
+            &TimedOutRuntime,
+        )
+        .unwrap();
+        assert_eq!(replay.output_refs, polled.output_refs);
+        assert!(replay.stdout.is_empty());
         assert!(matches!(
             registry
                 .execution_for_public_session(&public_session)
@@ -935,6 +1004,7 @@ mod tests {
                 stderr: String::new(),
                 truncated: Some(false),
                 output_incomplete: false,
+                output_refs: OutputReferences::default(),
             }))),
         )
         .expect("the recovered poll resolves the real terminal");
@@ -990,5 +1060,84 @@ mod tests {
             })
         ));
         eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+    }
+    #[test]
+    fn direct_observations_publish_stable_references_for_every_terminal_status() {
+        for (index, status) in [
+            RuntimeCommandStatus::Completed,
+            RuntimeCommandStatus::Failed,
+            RuntimeCommandStatus::Cancelled,
+            RuntimeCommandStatus::TimedOut,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = std::env::temp_dir().join(format!(
+                "lb-direct-refs-{}-{}-{index}",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let registry = ExecutionRegistry::open_at(root.join("executions.json")).unwrap();
+            let public = PublicSessionId::new("public-refs");
+            let id = registry.start(TaskId::new("task"), public.clone()).unwrap();
+            registry
+                .bind_runtime_handle(&id, RuntimeCommandHandle::new("private-session"))
+                .unwrap();
+            let request = CommandControlRequest {
+                action: CommandControlAction::Poll,
+                chars: None,
+                signal: None,
+                wait_ms: 0,
+                request_id: RpcRequestId::String("first".into()),
+                public_session_id: public.clone(),
+            };
+            let first = control_command_during_work(
+                request.clone(),
+                &registry,
+                &FakeRuntime(Mutex::new(Some(RuntimeCommandObservation {
+                    status,
+                    exit_code: Some(if status == RuntimeCommandStatus::Completed {
+                        0
+                    } else {
+                        1
+                    }),
+                    signal: None,
+                    stdout: "once".into(),
+                    stderr: String::new(),
+                    truncated: Some(true),
+                    output_incomplete: true,
+                    output_refs: OutputReferences {
+                        primary: Some("private-stderr".into()),
+                        stdout: Some("private-stdout".into()),
+                        stderr: Some("private-stderr".into()),
+                    },
+                }))),
+            )
+            .unwrap();
+            let replay = control_command_during_work(request, &registry, &TimedOutRuntime).unwrap();
+            assert_eq!(first.status, status);
+            assert_eq!(first.stdout, "once");
+            assert!(replay.stdout.is_empty());
+            assert_eq!(first.output_refs, replay.output_refs);
+            assert_eq!(first.output_refs.primary, first.output_refs.stderr);
+            assert_eq!(
+                registry
+                    .output_handles()
+                    .stream(first.output_refs.stderr.as_ref().unwrap())
+                    .as_deref(),
+                Some("stderr")
+            );
+            assert!(replay.output_incomplete);
+            let ExecutionState::Terminal(saved) = registry
+                .execution_for_public_session(&public)
+                .unwrap()
+                .state
+            else {
+                panic!("terminal");
+            };
+            assert_eq!(saved.output_refs, first.output_refs.values());
+            eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        }
     }
 }

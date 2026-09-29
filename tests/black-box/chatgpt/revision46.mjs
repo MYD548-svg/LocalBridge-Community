@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
+import { requireRetainedOutputReference } from "./output_reference.mjs";
 
 import {
   ChatGptMcpClient,
@@ -950,8 +951,10 @@ export async function runRevision46Scenario({ endpoint, workspace, extraHeaders 
       action: "poll", session_id: structured(stderrTerminal).data.session_id, wait_ms: 0,
     }, "stderr-cached-terminal");
     assertToolError(stderrReplay, "ProcessFailed");
-    const stderrRef = structured(stderrReplay).data.output_refs.stderr;
-    assert.equal(typeof stderrRef, "string");
+    const stderrRef = requireRetainedOutputReference({
+      initial: stderrInitial, terminal: stderrTerminal, replay: stderrReplay,
+      stream: "stderr", requestId: "stderr-cached-terminal",
+    });
     const retainedStderr = assertSuccess(await toolCall(client, "command_control", {
       action: "read", output_ref: stderrRef, stream: "stderr",
     }, "stderr-retained-read"));
