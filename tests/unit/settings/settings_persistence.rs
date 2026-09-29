@@ -57,7 +57,7 @@ fn atomic_write_replaces_target_and_preserves_previous_rollback_point() {
             .to_string_lossy()
             .contains(".tmp-")
     }));
-    fs::remove_dir_all(dir).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
 }
 
 #[test]

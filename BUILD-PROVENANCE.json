@@ -1,36 +1,8 @@
-﻿{
-  "community_version": "0.1.5-community.1",
-  "upstream_version": "0.1.5",
-  "upstream_commit": "c8118e73e96b05ef9090b260837a44788aeafaff",
-  "openai_tunnel_client": {
-    "source": "https://github.com/openai/tunnel-client",
-    "version": "0.0.11",
-    "commit": "8d55683eeef80bc5e360d95abf4692454fafc615",
-    "sha256": "7d3c7d492ce84b52835e11865a835a8a5bcd4a669dee84e169aa11b314dc952a",
-    "build_type": "source-built"
-  },
-  "privileged_broker": {
-    "target": "localbridge-privileged-broker",
-    "source_path": "src-tauri/bin/privileged-broker/main.rs",
-    "build_command": "cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bin localbridge-privileged-broker",
-    "build_type": "source-built"
-  },
-  "runtime_lock": {
-    "file": "provenance/runtime-lock.json",
-    "lock_version": "1.0",
-    "sha256": "b8fafe7f5ef29f538b1eee4255e8954d09e8fd7c3e50fddc8df848c80f492e70"
-  },
-  "build_environment": {
-    "os": "Microsoft Windows 11 x64",
-    "node": "v24.16.0",
-    "npm": "11.13.0",
-    "python": "3.12.8",
-    "git": "git version 2.46.0.windows.1",
-    "target_triple": "x86_64-pc-windows-msvc"
-  },
-  "security_review": {
-    "security_behavior_changes": "NONE",
-    "secret_leaks": false,
-    "fail_closed_validation": true
-  }
+{
+  "status": "NOT_VERIFIED",
+  "reason": "Historical registration is not evidence of a successful build. Prior Actions failed; local repairs await Rust and remote CI validation.",
+  "baseline_commit": "012adf917b06b8a3866b0d77a564ae481c289b4f",
+  "current_build_evidence": "tests/artifacts/ci/BUILD-PROVENANCE.json",
+  "current_test_evidence": "tests/artifacts/ci/TEST-REPORT.json",
+  "environment_acceptance": "NOT_RUN"
 }

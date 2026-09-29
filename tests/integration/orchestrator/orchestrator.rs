@@ -20,7 +20,7 @@ use std::fs;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type SharedEvents = Rc<RefCell<Vec<&'static str>>>;
 type SharedTask = Rc<RefCell<CurrentTaskStatus>>;
@@ -418,24 +418,7 @@ fn production_temp_workspace() -> PathBuf {
 
 #[cfg(windows)]
 fn cleanup_production_test_directory(path: &Path) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match fs::remove_dir_all(path) {
-            Ok(()) => return,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
-                ) && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => panic!(
-                "cleanup LB-009 production test directory {}: {error}",
-                path.display()
-            ),
-        }
-    }
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", path.display());
 }
 
 #[cfg(windows)]

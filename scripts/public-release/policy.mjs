@@ -47,10 +47,20 @@ const PUBLIC_EXACT = new Set([
   "runtime-policy.toml",
   "scripts/prepare-toolbox.mjs",
   "scripts/prepare-lb018-resources.mjs",
+  "scripts/build-community.ps1",
+  "scripts/build-tunnel-client.ps1",
+  "scripts/verify-runtime.ps1",
+  "scripts/generate-checksums.ps1",
+  "docs/COMMUNITY-BUILD.md",
+  "TEST-REPORT.md",
+  "BUILD-PROVENANCE.json",
+  "COMMUNITY-VERSION",
+  "SHA256SUMS.txt",
   "compatibility/coding-tools/0.2.2/tools-list.json",
 ]);
 
 const PUBLIC_PREFIXES = [
+  "provenance/",
   ".github/",
   "assets/",
   "schema/",

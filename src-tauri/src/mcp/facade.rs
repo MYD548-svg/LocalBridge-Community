@@ -1,3 +1,6 @@
+use crate::control_plane::command_output::{
+    CommandOutput, INCOMPLETE_COMMAND_OUTPUT, public_command_stderr,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::Cursor;
@@ -944,8 +947,12 @@ pub trait WorkspaceRuntimeAdapter {
     }
 }
 
-const MAX_PENDING_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_STDERR_PROTOCOL_BYTES: usize = 256 * 1024;
+fn annotate_incomplete_output(result: &mut Value, incomplete: bool) {
+    if incomplete {
+        result["structuredContent"]["data"]["truncated"] = Value::Bool(true);
+        result["structuredContent"]["warnings"] = json!([INCOMPLETE_COMMAND_OUTPUT]);
+    }
+}
 
 fn next_public_handle(prefix: &str) -> String {
     crate::security::random_prefixed_id(&format!("{prefix}-"))
@@ -955,9 +962,7 @@ fn next_public_handle(prefix: &str) -> String {
 struct PublicCommandSession {
     execution_id: ExecutionId,
     started_at: Instant,
-    pending_output: String,
-    pending_output_truncated: bool,
-    stderr_protocol_buffer: String,
+    output: CommandOutput,
 }
 
 #[derive(Debug, Default)]
@@ -979,6 +984,7 @@ impl PublicCommandSessions {
         owner_task_id: Option<String>,
         owner_session: Option<McpSessionId>,
     ) -> Result<StartedPublicCommand, FacadeError> {
+        self.outputs = executions.output_handles();
         let public = next_public_handle("lb-session");
         let task_id = TaskId::new(owner_task_id.unwrap_or_else(|| next_public_handle("lb-task")));
         let started = executions
@@ -989,9 +995,9 @@ impl PublicCommandSessions {
             PublicCommandSession {
                 execution_id: started.execution_id,
                 started_at: Instant::now(),
-                pending_output: String::new(),
-                pending_output_truncated: false,
-                stderr_protocol_buffer: String::new(),
+                output: executions
+                    .command_output(&PublicSessionId::new(public.clone()))
+                    .expect("started execution output"),
             },
         );
         Ok(StartedPublicCommand {
@@ -1019,6 +1025,7 @@ impl PublicCommandSessions {
             .map_err(normalize_execution_registry_error)
     }
 
+    #[cfg(test)]
     fn public_output_for_private(
         &mut self,
         private_output_ref: &str,
@@ -1113,6 +1120,7 @@ impl PublicCommandSessions {
         }
     }
 
+    #[cfg(test)]
     fn output_refs_by_stream(&self, output_refs: &[String]) -> Map<String, Value> {
         output_refs
             .iter()
@@ -1144,9 +1152,12 @@ impl PublicCommandSessions {
         }
         match executions.finish(&execution_id, terminal) {
             Ok(()) => {}
-            Err(ExecutionRegistryError::AlreadyTerminal { .. }) => return Ok(()),
+            Err(ExecutionRegistryError::AlreadyTerminal { .. }) => {}
             Err(error) => return Err(normalize_execution_registry_error(error)),
         }
+        executions
+            .enrich_terminal_output_refs(&execution_id)
+            .map_err(normalize_execution_registry_error)?;
         Ok(())
     }
 
@@ -1160,65 +1171,59 @@ impl PublicCommandSessions {
     }
 
     fn append_pending(&mut self, public_session_id: &str, output: &str) {
-        if output.is_empty() {
-            return;
+        if let Some(session) = self.sessions.get(public_session_id) {
+            session.output.append(output);
         }
-        if let Some(session) = self.sessions.get_mut(public_session_id) {
-            session.pending_output.push_str(output);
-            session.pending_output_truncated |=
-                trim_utf8_front(&mut session.pending_output, MAX_PENDING_OUTPUT_BYTES);
-        }
-    }
-
-    fn take_pending(&mut self, public_session_id: &str) -> String {
-        let Some(session) = self.sessions.get_mut(public_session_id) else {
-            return String::new();
-        };
-        let mut output = std::mem::take(&mut session.pending_output);
-        if std::mem::take(&mut session.pending_output_truncated) {
-            output.insert_str(0, "[earlier command output truncated]\n");
-        }
-        output
     }
 
     fn terminal_with_pending(&mut self, public_session_id: &str, terminal: Value) -> Value {
-        let pending = self.take_pending(public_session_id);
-        command_result_with_output(terminal, pending)
+        let Some(session) = self.sessions.get(public_session_id) else {
+            return terminal;
+        };
+        let delivery = session.output.take();
+        #[cfg(test)]
+        eprintln!(
+            "COMMAND_ROUTE facade session={public_session_id} collecting={}",
+            delivery.collecting
+        );
+        let mut result = if delivery.collecting {
+            let mut data = stable_data(&terminal);
+            if let Some(object) = data.as_object_mut() {
+                object.insert("status".into(), json!("running"));
+                object.remove("exit_code");
+                object.remove("signal");
+            }
+            stable_success(data, "Command running")
+        } else {
+            terminal
+        };
+        result = command_result_with_output(result, delivery.output);
+        if delivery.truncated {
+            result["structuredContent"]["data"]["truncated"] = Value::Bool(true);
+        }
+        annotate_incomplete_output(&mut result, delivery.incomplete);
+        result
     }
 
     fn running_with_pending(&mut self, public_session_id: &str) -> Option<Value> {
-        let pending = self.take_pending(public_session_id);
-        (!pending.is_empty()).then(|| {
+        let session = self.sessions.get(public_session_id)?;
+        if !session.output.has_pending() {
+            return None;
+        }
+        Some(self.terminal_with_pending(
+            public_session_id,
             stable_success(
-                json!({
-                    "status":"running",
-                    "session_id":public_session_id,
-                    "output":pending
-                }),
+                json!({"status":"running","session_id":public_session_id}),
                 "Command running",
-            )
-        })
+            ),
+        ))
     }
 
     fn filter_private_stderr(&mut self, public_session_id: &str, stderr: &str) -> String {
-        if stderr.is_empty() {
-            return String::new();
-        }
-        let Some(session) = self.sessions.get_mut(public_session_id) else {
-            return public_command_stderr(stderr);
-        };
-        session.stderr_protocol_buffer.push_str(stderr);
-        if trim_utf8_front(
-            &mut session.stderr_protocol_buffer,
-            MAX_STDERR_PROTOCOL_BYTES,
-        ) {
-            let retained = std::mem::take(&mut session.stderr_protocol_buffer);
-            return format!(
-                "[stderr protocol fragment truncated]\n{}",
-                public_command_stderr(&retained)
-            );
-        }
-        drain_public_stderr_protocol_buffer(&mut session.stderr_protocol_buffer)
+        self.sessions.get(public_session_id).map_or_else(
+            || public_command_stderr(stderr),
+            |session| session.output.filter_stderr(stderr),
+        )
     }
 
     fn mark_all_running_lost(&mut self, executions: &ExecutionRegistry) -> Result<(), FacadeError> {
@@ -1300,7 +1305,10 @@ impl CodingToolsRuntimeAdapter {
             workspace_lifetime_pin,
             shell_executor: ShellExecutor::default(),
             toolbox,
-            public_commands: PublicCommandSessions::default(),
+            public_commands: PublicCommandSessions {
+                outputs: executions.output_handles(),
+                ..PublicCommandSessions::default()
+            },
             executions,
             workflow_checkpoint,
             cached_default_cwd: None,
@@ -1794,6 +1802,11 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
         )?;
         let public_session_id = started_public.public_session_id;
         let adoption_token = started_public.adoption_token;
+        let output = self
+            .executions
+            .command_output(&PublicSessionId::new(public_session_id.clone()))
+            .ok_or_else(session_unavailable)?;
+        let collection = output.begin();
         let outcome = (|| {
             let invocation = self
                 .shell_executor
@@ -1846,8 +1859,11 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
             }
             Ok(result)
         })();
+        drop(collection);
         match outcome {
-            Ok(result) => Ok(result),
+            Ok(result) => Ok(self
+                .public_commands
+                .terminal_with_pending(&public_session_id, result)),
             Err(error) => {
                 self.public_commands.mark_error_terminal(
                     &public_session_id,
@@ -2062,12 +2078,11 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
             }
             CommandControlAction::Read => unreachable!(),
         };
-        let pending =
-            if action == CommandControlAction::Write || action == CommandControlAction::Kill {
-                self.public_commands.take_pending(&public_session_id)
-            } else {
-                String::new()
-            };
+        let output = self
+            .executions
+            .command_output(&public_session_key)
+            .ok_or_else(session_unavailable)?;
+        let collection = output.begin();
         let call = match action {
             CommandControlAction::Poll | CommandControlAction::Write => {
                 let wait_ms = object
@@ -2101,16 +2116,27 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
             Ok(raw) => {
                 let result =
                     self.normalize_command_result(&raw, &public_session_id, Some(action))?;
-                Ok(command_result_prepend_output(result, pending))
+                drop(collection);
+                Ok(self
+                    .public_commands
+                    .terminal_with_pending(&public_session_id, result))
             }
             Err(error) => {
-                self.public_commands
-                    .append_pending(&public_session_id, &pending);
+                drop(collection);
                 let cancellation_signal = self.executions.cancellation_signal(&public_session_key);
+                // "The upstream answered that this session is gone" and "the
+                // transport could not reach the upstream" are different facts.
+                // normalize_private_error answers carry retryable=false;
+                // normalize_runtime_error transport failures carry
+                // retryable=true. Only the former may combine with a recorded
+                // cancellation intent into a durable cancelled terminal — a
+                // transport failure leaves the process state unknown, so the
+                // intent stays recorded and the caller can retry.
                 if matches!(
                     error.code,
                     FacadeErrorCode::SessionUnavailable | FacadeErrorCode::RuntimeUnavailable
-                ) && cancellation_signal.is_some()
+                ) && !error.retryable
+                    && cancellation_signal.is_some()
                 {
                     self.public_commands.mark_terminal(
                         &public_session_id,
@@ -2132,7 +2158,13 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
                         .public_commands
                         .terminal_with_pending(&public_session_id, terminal));
                 }
-                if error.code != FacadeErrorCode::OperationTimedOut {
+                if error.code != FacadeErrorCode::OperationTimedOut && !error.retryable {
+                    // Retryable transport/control-lane transients keep the
+                    // Execution non-terminal, like OperationTimedOut: the
+                    // envelope promises the caller can poll the same session
+                    // later, and terminalizing it here (execution_terminal_from_result
+                    // maps SessionUnavailable/RuntimeUnavailable to Lost) would
+                    // turn one transient hiccup into a permanently lost command.
                     if action == CommandControlAction::Kill {
                         self.executions.clear_cancellation(&public_session_key);
                     }
@@ -2349,21 +2381,21 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
                 "max_output_bytes": 65536,
                 "verbosity":"full"
             });
+            let output = self
+                .executions
+                .command_output(&PublicSessionId::new(public_session_id.clone()))
+                .ok_or_else(session_unavailable)?;
+            let _collection = output.begin();
             match self.private_call("write_stdin", private, None) {
                 Ok(raw) => {
-                    let normalized = self.normalize_command_result(
+                    self.normalize_command_result(
                         &raw,
                         &public_session_id,
                         Some(CommandControlAction::Poll),
                     )?;
-                    let delta = normalized
-                        .pointer("/structuredContent/data/output")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    self.public_commands
-                        .append_pending(&public_session_id, &delta);
                 }
+                Err(error)
+                    if error.retryable || error.code == FacadeErrorCode::OperationTimedOut => {}
                 Err(error) => {
                     self.public_commands.mark_error_terminal(
                         &public_session_id,
@@ -2428,16 +2460,11 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
         if let Some(signal) = terminal.signal {
             data.insert("signal".into(), Value::String(signal));
         }
-        let output_refs = self
-            .public_commands
-            .output_refs_by_stream(&terminal.output_refs);
-        if !output_refs.is_empty() {
-            if let Some(stdout) = output_refs.get("stdout").cloned() {
-                data.insert("output_ref".into(), stdout);
-            }
-            data.insert("output_refs".into(), Value::Object(output_refs));
-        }
-        match terminal.outcome {
+        let refs = self
+            .executions
+            .command_output_refs(&PublicSessionId::new(session_id));
+        insert_public_output_refs(&mut data, &refs);
+        let mut result = match terminal.outcome {
             TerminalOutcome::Completed => Some(stable_success(
                 Value::Object(data),
                 command_summary("completed"),
@@ -2461,7 +2488,17 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
                 "命令会话不可用",
                 data,
             )),
+        };
+        if let Some(value) = result.as_mut() {
+            annotate_incomplete_output(
+                value,
+                self.public_commands
+                    .sessions
+                    .get(session_id)
+                    .is_some_and(|session| session.output.incomplete()),
+            );
         }
+        result
     }
 }
 
@@ -2526,11 +2563,32 @@ impl CodingToolsRuntimeAdapter {
                 data.insert("truncated".into(), value.clone());
             }
         }
+        // Only propagate the fixed diagnostic; arbitrary private warnings may
+        // contain runtime paths or other implementation details.
+        let incomplete = structured
+            .and_then(|object| object.get("warnings"))
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| {
+                warnings
+                    .iter()
+                    .any(|warning| warning.as_str() == Some(INCOMPLETE_COMMAND_OUTPUT))
+            });
+        if let Some(session) = self.public_commands.sessions.get_mut(public_session_id) {
+            session.output.annotate(
+                structured
+                    .and_then(|object| object.get("truncated"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                incomplete,
+            );
+        }
         let output = self.safe_command_output_for_session(raw, public_session_id);
-        data.insert("output".into(), Value::String(output));
-        self.map_private_output_refs(structured, &mut data, public_session_id);
+        self.public_commands
+            .append_pending(public_session_id, &output);
+        data.insert("output".into(), Value::String(String::new()));
+        self.map_private_output_refs(structured, &mut data, public_session_id)?;
 
-        let result = match public_status {
+        let mut result = match public_status {
             "running" => stable_success(Value::Object(data), command_summary("running")),
             "completed" => stable_success(Value::Object(data), command_summary("completed")),
             "failed" => stable_command_error(
@@ -2550,12 +2608,37 @@ impl CodingToolsRuntimeAdapter {
                 data,
             ),
         };
+        annotate_incomplete_output(
+            &mut result,
+            self.public_commands
+                .sessions
+                .get(public_session_id)
+                .is_some_and(|session| session.output.incomplete()),
+        );
         if public_status != "running" {
             self.public_commands.mark_terminal(
                 public_session_id,
                 result.clone(),
                 &self.executions,
             )?;
+            // A competing control call may have committed the authoritative
+            // outcome. Preserve its status while delivering our queued bytes.
+            if let Some(mut terminal) = self.durable_command_terminal(public_session_id) {
+                if terminal
+                    .pointer("/structuredContent/data/status")
+                    .and_then(Value::as_str)
+                    != Some(public_status)
+                {
+                    for key in ["task_id", "execution_id", "elapsed_ms"] {
+                        if let Some(value) =
+                            result.pointer(&format!("/structuredContent/data/{key}"))
+                        {
+                            terminal["structuredContent"]["data"][key] = value.clone();
+                        }
+                    }
+                    result = terminal;
+                }
+            }
         }
         if action == Some(CommandControlAction::Kill) && public_status == "cancelled" {
             self.mark_owner_workflow_waiting_after_kill(public_session_id)?;
@@ -2662,55 +2745,38 @@ impl CodingToolsRuntimeAdapter {
         structured: Option<&Map<String, Value>>,
         data: &mut Map<String, Value>,
         public_session_id: &str,
-    ) {
-        let Some(structured) = structured else {
-            return;
-        };
-        if let Some(private) = structured.get("output_ref").and_then(Value::as_str) {
-            let stream = primary_output_stream(structured, private);
-            data.insert(
-                "output_ref".into(),
-                Value::String(self.public_commands.public_output_for_private(
-                    private,
-                    public_session_id,
-                    stream,
-                )),
-            );
+    ) -> Result<(), FacadeError> {
+        if let Some(structured) = structured {
+            let refs = super::http::runtime_output_references(structured)
+                .map_err(|_| runtime_capability_mismatch())?;
+            self.executions
+                .register_command_output_refs(&PublicSessionId::new(public_session_id), &refs)
+                .map_err(normalize_execution_registry_error)?;
         }
-        if let Some(private_refs) = structured.get("output_refs").and_then(Value::as_object) {
-            let mut public_refs = Map::new();
-            for stream in ["stdout", "stderr"] {
-                if let Some(private) = private_refs.get(stream).and_then(Value::as_str) {
-                    public_refs.insert(
-                        stream.into(),
-                        Value::String(self.public_commands.public_output_for_private(
-                            private,
-                            public_session_id,
-                            stream,
-                        )),
-                    );
-                }
-            }
-            if !public_refs.is_empty() {
-                data.insert("output_refs".into(), Value::Object(public_refs));
-            }
-        }
+        let refs = self
+            .executions
+            .command_output_refs(&PublicSessionId::new(public_session_id));
+        insert_public_output_refs(data, &refs);
+        Ok(())
     }
 }
 
-fn primary_output_stream<'a>(structured: &'a Map<String, Value>, output_ref: &str) -> &'a str {
-    // The private primary handle may select stderr. Its stream ownership must
-    // not depend on whether this response or the terminal observer arrives first.
-    structured
-        .get("output_refs")
-        .and_then(Value::as_object)
-        .and_then(|refs| {
-            ["stdout", "stderr"]
-                .into_iter()
-                .find(|stream| refs.get(*stream).and_then(Value::as_str) == Some(output_ref))
-        })
-        .or_else(|| structured.get("output_stream").and_then(Value::as_str))
-        .unwrap_or("stdout")
+pub(crate) fn insert_public_output_refs(
+    data: &mut Map<String, Value>,
+    refs: &crate::execution::output_handles::OutputReferences,
+) {
+    if let Some(primary) = &refs.primary {
+        data.insert("output_ref".into(), Value::String(primary.clone()));
+    }
+    let mut streams = Map::new();
+    for (stream, value) in [("stdout", &refs.stdout), ("stderr", &refs.stderr)] {
+        if let Some(value) = value {
+            streams.insert(stream.into(), Value::String(value.clone()));
+        }
+    }
+    if !streams.is_empty() {
+        data.insert("output_refs".into(), Value::Object(streams));
+    }
 }
 
 fn public_local_output_page(
@@ -6989,8 +7055,8 @@ mod schema43_filesystem_facade_tests {
             FacadeErrorCode::WorkspaceDenied
         );
 
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 }
 
@@ -7442,18 +7508,6 @@ fn command_result_with_output(mut result: Value, output: String) -> Value {
     result
 }
 
-fn command_result_prepend_output(result: Value, prefix: String) -> Value {
-    if prefix.is_empty() {
-        return result;
-    }
-    let suffix = result
-        .pointer("/structuredContent/data/output")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    command_result_with_output(result, format!("{prefix}{suffix}"))
-}
-
 #[cfg(test)]
 fn safe_command_output(raw: &Value) -> String {
     let Some(structured) = raw.get("structuredContent").and_then(Value::as_object) else {
@@ -7485,221 +7539,6 @@ fn safe_command_output(raw: &Value) -> String {
         }
     }
     String::new()
-}
-
-pub(crate) fn public_command_stderr(stderr: &str) -> String {
-    if !looks_like_clixml_protocol(stderr) {
-        return stderr.to_string();
-    }
-    let lower = stderr.to_ascii_lowercase();
-    if !lower.contains("s=\"error\"") {
-        return String::new();
-    }
-    strip_private_powershell_prologue(&extract_clixml_error_strings(stderr))
-}
-
-fn strip_private_powershell_prologue(value: &str) -> String {
-    let contains_private_prologue = value.contains("PSModuleAutoLoadingPreference")
-        || value.contains("Microsoft.PowerShell.Management.psd1")
-        || value.contains("System.Text.UTF8Encoding")
-        || value.contains("[Console]::OutputEncoding");
-    if !contains_private_prologue {
-        return value.to_string();
-    }
-    const END: &str = "$OutputEncoding=[Console]::OutputEncoding;";
-    let Some(end) = find_ignoring_line_breaks(value, END) else {
-        return String::new();
-    };
-    value[end..].trim_start_matches(['\r', '\n']).to_string()
-}
-
-fn find_ignoring_line_breaks(value: &str, needle: &str) -> Option<usize> {
-    let expected = needle.as_bytes();
-    let mut matched = 0usize;
-    for (index, ch) in value.char_indices() {
-        if matches!(ch, '\r' | '\n') {
-            continue;
-        }
-        if ch.is_ascii() && expected.get(matched).copied() == Some(ch as u8) {
-            matched += 1;
-            if matched == expected.len() {
-                return Some(index + ch.len_utf8());
-            }
-        } else {
-            matched = usize::from(ch.is_ascii() && expected.first().copied() == Some(ch as u8));
-        }
-    }
-    None
-}
-
-fn drain_public_stderr_protocol_buffer(buffer: &mut String) -> String {
-    let mut visible = String::new();
-    loop {
-        if buffer.is_empty() {
-            break;
-        }
-
-        if let Some(start) = clixml_envelope_start(buffer) {
-            if start > 0 {
-                visible.push_str(&buffer[..start]);
-                buffer.drain(..start);
-                continue;
-            }
-            let lower = buffer.to_ascii_lowercase();
-            let Some(end_start) = lower.find("</objs>") else {
-                break;
-            };
-            let end = end_start + "</objs>".len();
-            let envelope = buffer[..end].to_string();
-            visible.push_str(&public_command_stderr(&envelope));
-            buffer.drain(..end);
-            continue;
-        }
-
-        if looks_like_clixml_protocol(buffer) {
-            let fragment = std::mem::take(buffer);
-            visible.push_str(&public_command_stderr(&fragment));
-            break;
-        }
-
-        let hold = clixml_marker_prefix_suffix_len(buffer);
-        if hold > 0 {
-            let emit = buffer.len() - hold;
-            visible.push_str(&buffer[..emit]);
-            buffer.drain(..emit);
-            break;
-        }
-
-        visible.push_str(buffer);
-        buffer.clear();
-        break;
-    }
-    visible
-}
-
-fn trim_utf8_front(value: &mut String, max_bytes: usize) -> bool {
-    if value.len() <= max_bytes {
-        return false;
-    }
-    let mut start = value.len().saturating_sub(max_bytes);
-    while !value.is_char_boundary(start) {
-        start += 1;
-    }
-    value.drain(..start);
-    true
-}
-
-fn clixml_envelope_start(value: &str) -> Option<usize> {
-    let lower = value.to_ascii_lowercase();
-    [lower.find("#< clixml"), lower.find("<objs")]
-        .into_iter()
-        .flatten()
-        .min()
-}
-
-fn clixml_marker_prefix_suffix_len(value: &str) -> usize {
-    let lower = value.to_ascii_lowercase();
-    ["#< clixml", "<objs"]
-        .into_iter()
-        .map(|marker| {
-            (1..marker.len())
-                .rev()
-                .find(|length| lower.ends_with(&marker[..*length]))
-                .unwrap_or(0)
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-fn looks_like_clixml_protocol(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    lower.contains("#< clixml")
-        || lower.contains("<objs")
-        || lower.contains("</objs>")
-        || lower.contains("<obj")
-        || lower.contains("</obj>")
-        || lower.contains("<ms")
-        || lower.contains("</ms>")
-        || lower.contains("s=\"progress\"")
-        || lower.contains("s=\"error\"")
-}
-
-fn extract_clixml_error_strings(stderr: &str) -> String {
-    let mut values = Vec::new();
-    let lower = stderr.to_ascii_lowercase();
-    let mut cursor = 0usize;
-    while cursor < lower.len() {
-        let Some(relative_start) = lower[cursor..].find("<s") else {
-            break;
-        };
-        let start = cursor + relative_start;
-        let Some(relative_open_end) = lower[start..].find('>') else {
-            break;
-        };
-        let open_end = start + relative_open_end;
-        let open = &lower[start..=open_end];
-        let Some(relative_close) = lower[open_end + 1..].find("</s>") else {
-            break;
-        };
-        let close = open_end + 1 + relative_close;
-        if open == "<s>" || open.contains("s=\"error\"") {
-            let decoded = decode_clixml_text(&stderr[open_end + 1..close]);
-            if !decoded.trim().is_empty() {
-                values.push(decoded);
-            }
-        }
-        cursor = close + "</s>".len();
-    }
-    values.concat()
-}
-
-fn decode_clixml_text(value: &str) -> String {
-    let xml = value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&");
-    decode_clixml_utf16_escapes(&xml)
-}
-
-fn decode_clixml_utf16_escapes(value: &str) -> String {
-    fn escaped_unit(value: &str, index: usize) -> Option<u16> {
-        let token = value.get(index..index + 7)?;
-        (token.starts_with("_x") && token.ends_with('_'))
-            .then(|| u16::from_str_radix(&token[2..6], 16).ok())
-            .flatten()
-    }
-
-    let mut decoded = String::with_capacity(value.len());
-    let mut index = 0usize;
-    while index < value.len() {
-        if let Some(unit) = escaped_unit(value, index) {
-            if (0xD800..=0xDBFF).contains(&unit) {
-                if let Some(low) = escaped_unit(value, index + 7) {
-                    if (0xDC00..=0xDFFF).contains(&low) {
-                        let scalar =
-                            0x10000 + (((unit as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
-                        if let Some(ch) = char::from_u32(scalar) {
-                            decoded.push(ch);
-                            index += 14;
-                            continue;
-                        }
-                    }
-                }
-            } else if !(0xDC00..=0xDFFF).contains(&unit) {
-                if let Some(ch) = char::from_u32(unit as u32) {
-                    decoded.push(ch);
-                    index += 7;
-                    continue;
-                }
-            }
-        }
-        let ch = value[index..].chars().next().expect("valid UTF-8 boundary");
-        decoded.push(ch);
-        index += ch.len_utf8();
-    }
-    decoded
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8101,7 +7940,7 @@ mod tests {
         let mut runtime = facade.into_runtime();
         runtime.stop().unwrap();
         drop(runtime);
-        std::fs::remove_dir_all(workspace).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
     }
 
     fn test_task_state(label: &str) -> ExecutionRegistry {
@@ -10071,9 +9910,7 @@ mod tests {
             PublicCommandSession {
                 execution_id: ExecutionId::new("expired-execution"),
                 started_at: Instant::now(),
-                pending_output: String::new(),
-                pending_output_truncated: false,
-                stderr_protocol_buffer: String::new(),
+                output: CommandOutput::default(),
             },
         );
         let output =
@@ -10606,6 +10443,109 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_output_keeps_the_warning_in_the_public_envelope() {
+        let mut data = Map::new();
+        data.insert("output".into(), Value::String("already-read".into()));
+        let mut result = stable_success(Value::Object(data), "Command completed");
+        annotate_incomplete_output(&mut result, true);
+        assert!(
+            result["structuredContent"]["data"]
+                .get("warnings")
+                .is_none()
+        );
+        assert_eq!(result["structuredContent"]["data"]["truncated"], true);
+        assert_eq!(
+            result["structuredContent"]["warnings"],
+            json!([INCOMPLETE_COMMAND_OUTPUT])
+        );
+        assert_eq!(
+            result["structuredContent"]["data"]["output"],
+            "already-read"
+        );
+        let mut complete = stable_success(json!({"status":"completed"}), "Command completed");
+        let original = complete.clone();
+        annotate_incomplete_output(&mut complete, false);
+        assert_eq!(complete, original);
+        let mut error = stable_command_error(
+            FacadeErrorCode::ProcessTimedOut,
+            "Command timed out",
+            Map::new(),
+        );
+        annotate_incomplete_output(&mut error, true);
+        assert_eq!(
+            error["structuredContent"]["warnings"],
+            json!([INCOMPLETE_COMMAND_OUTPUT])
+        );
+        assert_eq!(error["structuredContent"]["data"]["truncated"], true);
+    }
+
+    #[test]
+    fn direct_terminal_poll_delivers_background_output_once() {
+        use crate::control_plane::command_control::{
+            CommandControlRequest, RuntimeCommandControl, RuntimeCommandControlError,
+            RuntimeCommandObservation, control_command_during_work,
+        };
+        struct NoRuntime;
+        impl RuntimeCommandControl for NoRuntime {
+            fn control_command(
+                &self,
+                _: &crate::control_plane::command_control::RuntimeCommandRequest,
+            ) -> Result<RuntimeCommandObservation, RuntimeCommandControlError> {
+                panic!("terminal replay must not poll upstream");
+            }
+        }
+        let registry = test_task_state("background-direct-output");
+        let mut sessions = PublicCommandSessions::default();
+        let public = bind_test_session(&mut sessions, &registry, "PRIVATE_BACKGROUND");
+        sessions.append_pending(&public, "BACKGROUND_MARKER\n");
+        sessions
+            .mark_terminal(
+                &public,
+                stable_success(json!({"status":"completed","exit_code":0}), "done"),
+                &registry,
+            )
+            .unwrap();
+        for expected in ["BACKGROUND_MARKER\n", ""] {
+            let result = control_command_during_work(
+                CommandControlRequest {
+                    action: crate::control_plane::command_control::CommandControlAction::Poll,
+                    chars: None,
+                    signal: None,
+                    wait_ms: 0,
+                    request_id: crate::domain::RpcRequestId::Number(1),
+                    public_session_id: PublicSessionId::new(public.clone()),
+                },
+                &registry,
+                &NoRuntime,
+            )
+            .unwrap();
+            assert_eq!(result.stdout, expected);
+        }
+        let shared = registry
+            .command_output(&PublicSessionId::new(public.clone()))
+            .unwrap();
+        let collection = shared.begin();
+        shared.append("LATE_STDOUT");
+        let error = shared.filter_stderr("LATE_STDERR");
+        shared.append(&error);
+        shared.annotate(true, true);
+        let terminal = stable_success(json!({"status":"completed","exit_code":0}), "done");
+        let waiting = sessions.terminal_with_pending(&public, terminal.clone());
+        assert_eq!(waiting["structuredContent"]["data"]["status"], "running");
+        assert_eq!(waiting["structuredContent"]["data"]["output"], "");
+        drop(collection);
+        for expected in ["LATE_STDOUTLATE_STDERR", ""] {
+            let delivered = sessions.terminal_with_pending(&public, terminal.clone());
+            assert_eq!(delivered["structuredContent"]["data"]["output"], expected);
+            assert_eq!(delivered["structuredContent"]["data"]["truncated"], true);
+            assert_eq!(
+                delivered["structuredContent"]["warnings"],
+                json!([INCOMPLETE_COMMAND_OUTPUT])
+            );
+        }
+    }
+
+    #[test]
     fn public_session_pending_output_is_incremental_and_terminal_does_not_replay() {
         let task_state = test_task_state("incremental");
         let mut sessions = PublicCommandSessions::default();
@@ -10652,9 +10592,8 @@ mod tests {
             "output_stream":"stderr",
             "output_refs":{"stdout":"private-stdout","stderr":"private-stderr"}
         });
-        let primary_stream = primary_output_stream(raw.as_object().unwrap(), "private-stderr");
-        assert_eq!(primary_stream, "stderr");
-        let primary = sessions.public_output_for_private("private-stderr", &public, primary_stream);
+        let parsed = crate::mcp::http::runtime_output_references(raw.as_object().unwrap()).unwrap();
+        let primary = sessions.outputs.register(&public, &parsed).primary.unwrap();
         let stdout = sessions.public_output_for_private("private-stdout", &public, "stdout");
         let stderr = sessions.public_output_for_private("private-stderr", &public, "stderr");
         let refs = sessions.output_refs_by_stream(&[stdout.clone(), stderr.clone()]);
@@ -10662,6 +10601,45 @@ mod tests {
         assert_eq!(refs["stdout"], stdout);
         assert_eq!(refs["stderr"], stderr);
         assert_eq!(primary, stderr);
+    }
+
+    #[test]
+    fn late_output_handles_enrich_an_existing_terminal_without_replacing_its_facts() {
+        let executions = test_task_state("late-terminal-refs");
+        let mut sessions = PublicCommandSessions::default();
+        let public = bind_test_session(&mut sessions, &executions, "private-late-refs");
+        let result = stable_command_error(
+            FacadeErrorCode::ProcessFailed,
+            "failed",
+            json!({"status":"failed","session_id":public,"exit_code":7})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        sessions
+            .mark_terminal(&public, result.clone(), &executions)
+            .unwrap();
+        let before = executions
+            .execution_for_public_session(&PublicSessionId::new(&public))
+            .unwrap();
+        let stderr = sessions.public_output_for_private("private-stderr", &public, "stderr");
+        let mut late = result;
+        late["structuredContent"]["data"]["output_refs"] = json!({"stderr":stderr});
+        late["structuredContent"]["data"]["exit_code"] = json!(99);
+        sessions.mark_terminal(&public, late, &executions).unwrap();
+        let after = executions
+            .execution_for_public_session(&PublicSessionId::new(&public))
+            .unwrap();
+        let ExecutionState::Terminal(before) = before.state else {
+            panic!("terminal");
+        };
+        let ExecutionState::Terminal(after) = after.state else {
+            panic!("terminal");
+        };
+        assert_eq!(after.output_refs, vec![stderr]);
+        assert_eq!(after.exit_code, before.exit_code);
+        assert_eq!(after.outcome, before.outcome);
+        assert_eq!(after.completed_at_ms, before.completed_at_ms);
     }
 
     #[test]
@@ -10818,8 +10796,8 @@ mod tests {
             }
         }
 
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::remove_dir_all(&other).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", other.display());
     }
 
     #[test]
@@ -10879,5 +10857,429 @@ mod tests {
             public_task_kind("exec_command", &json!({"command":"npm run build"})),
             TaskKind::Build
         );
+    }
+
+    /// Regression for the cancelled-on-retryable-transport-error defect: a
+    /// kill records the cancellation intent BEFORE the upstream call, and a
+    /// transport outage during that call must not be promoted into a durable
+    /// cancelled terminal. The intent, the Running execution and the public
+    /// session identity must all survive so the caller can retry against the
+    /// same execution.
+    #[cfg(windows)]
+    #[test]
+    fn kill_with_retryable_transport_failure_keeps_the_execution_and_cancel_intent() {
+        use crate::mcp::{CodingToolsPermissionMode, CodingToolsRuntimeConfig, InternalBearer};
+        use std::time::Duration;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "localbridge-cancel-transport-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let runtime = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                port,
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new("LB_CANCEL_TRANSPORT_SYNTHETIC_BEARER").unwrap(),
+            Duration::from_secs(10),
+        )
+        .expect("bundled coding runtime for the transport-outage regression");
+        let executions = ExecutionRegistry::for_workspace(runtime.workspace()).unwrap();
+        let mut facade =
+            AgentFacade::from_coding_runtime_with_executions(runtime, policy(), executions)
+                .unwrap();
+
+        let submit = facade
+            .call_tool(
+                PermissionMode::Full,
+                "exec_command",
+                json!({
+                    "command":"Start-Sleep -Seconds 20",
+                    "shell":"windows_powershell",
+                    "yield_time_ms":0,
+                    "timeout_ms":60000,
+                    "max_output_bytes":4096
+                }),
+                None,
+                |_| {},
+            )
+            .expect("detached scenario command started");
+        assert_eq!(
+            submit["structuredContent"]["data"]["status"], "running",
+            "{submit:#}"
+        );
+        let public_session = submit["structuredContent"]["data"]["session_id"]
+            .as_str()
+            .expect("running command has PublicSessionId")
+            .to_string();
+        let session_key = PublicSessionId::new(public_session.clone());
+
+        // Inject a REAL transport outage: stop the upstream process. The
+        // kill below now fails inside private_call_with_timeout with a
+        // retryable transport error while the cancellation intent is already
+        // recorded - the exact shape the defective branch turned into a
+        // fabricated cancelled terminal.
+        facade.adapter.runtime.stop().unwrap();
+
+        let kill = facade
+            .call_tool(
+                PermissionMode::Full,
+                "command_control",
+                json!({"action":"kill","session_id":public_session,"signal":"KILL","wait_ms":0}),
+                None,
+                |_| {},
+            )
+            .expect("the kill answers an MCP envelope, not a fabricated cancelled terminal");
+        // The outage surfaces as the contract's retryable error envelope
+        // instead of a cancelled success.
+        assert_eq!(kill["isError"], true, "{kill:#}");
+        assert_eq!(
+            kill["structuredContent"]["error"]["code"], "SessionUnavailable",
+            "{kill:#}"
+        );
+        assert_eq!(
+            kill["structuredContent"]["error"]["retryable"], true,
+            "the outage is retryable by contract: {kill:#}"
+        );
+
+        // Cancellation intent, delivery and process termination are different
+        // facts: the intent stays recorded, the execution stays Running and no
+        // durable terminal was fabricated.
+        assert_eq!(
+            facade
+                .adapter
+                .executions
+                .cancellation_signal(&session_key)
+                .as_deref(),
+            Some("KILL"),
+            "the recorded cancel intent must survive a retryable transport failure"
+        );
+        let execution = facade
+            .adapter
+            .executions
+            .execution_for_public_session(&session_key)
+            .expect("the execution must remain registered");
+        assert!(
+            matches!(
+                execution.state,
+                crate::domain::execution::ExecutionState::Running
+            ),
+            "a retryable transport failure must not terminalize the execution: {execution:#?}"
+        );
+        assert!(
+            facade
+                .adapter
+                .durable_command_terminal(&public_session)
+                .is_none(),
+            "no terminal may be fabricated from a transport outage"
+        );
+
+        // The same holds for polls issued while the intent is pending (C):
+        // a transient error must not be converted into a cancelled success.
+        let poll = facade
+            .call_tool(
+                PermissionMode::Full,
+                "command_control",
+                json!({"action":"poll","session_id":public_session,"wait_ms":0}),
+                None,
+                |_| {},
+            )
+            .expect("the poll answers an MCP envelope during the outage");
+        assert_eq!(poll["isError"], true, "{poll:#}");
+        assert_eq!(
+            poll["structuredContent"]["error"]["code"], "SessionUnavailable",
+            "{poll:#}"
+        );
+        assert_eq!(
+            poll["structuredContent"]["error"]["retryable"], true,
+            "{poll:#}"
+        );
+        let execution = facade
+            .adapter
+            .executions
+            .execution_for_public_session(&session_key)
+            .expect("the execution must remain registered after the failed poll");
+        assert!(matches!(
+            execution.state,
+            crate::domain::execution::ExecutionState::Running
+        ));
+        assert_eq!(
+            facade
+                .adapter
+                .executions
+                .cancellation_signal(&session_key)
+                .as_deref(),
+            Some("KILL")
+        );
+
+        let mut runtime = facade.into_runtime();
+        let _ = runtime.stop();
+        drop(runtime);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
+    }
+
+    // Fault injection exercises the facade mapping without destroying the
+    // upstream process. It does not claim supervisor-level recovery from a
+    // genuinely exited process (the real-stop regression remains separate).
+    #[cfg(windows)]
+    #[test]
+    fn retryable_control_faults_preserve_session_output_and_recover() {
+        use crate::mcp::{CodingToolsPermissionMode, CodingToolsRuntimeConfig, InternalBearer};
+        use std::time::{Duration, Instant};
+        for exited in [false, true] {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let workspace = std::env::temp_dir().join(format!(
+                "localbridge-cancel-transport-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&workspace).unwrap();
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let runtime = CodingToolsRuntime::start(
+                CodingToolsRuntimeConfig::new(
+                    &root,
+                    &workspace,
+                    port,
+                    CodingToolsPermissionMode::Trusted,
+                ),
+                InternalBearer::new("LB_CANCEL_TRANSPORT_SYNTHETIC_BEARER").unwrap(),
+                Duration::from_secs(10),
+            )
+            .expect("bundled coding runtime for the transport-outage regression");
+            let executions = ExecutionRegistry::for_workspace(runtime.workspace()).unwrap();
+            let mut facade =
+                AgentFacade::from_coding_runtime_with_executions(runtime, policy(), executions)
+                    .unwrap();
+
+            let submit = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "exec_command",
+                    json!({
+                        "command":"Start-Sleep -Seconds 120",
+                        "shell":"windows_powershell",
+                        "yield_time_ms":0,
+                        "timeout_ms":180000,
+                        "max_output_bytes":4096
+                    }),
+                    None,
+                    |_| {},
+                )
+                .expect("detached scenario command started");
+            assert_eq!(
+                submit["structuredContent"]["data"]["status"], "running",
+                "{submit:#}"
+            );
+            let public_session = submit["structuredContent"]["data"]["session_id"]
+                .as_str()
+                .expect("running command has PublicSessionId")
+                .to_string();
+            let session_key = PublicSessionId::new(public_session.clone());
+
+            let fault = || {
+                if exited {
+                    CodingToolsRuntimeError::McpExited
+                } else {
+                    CodingToolsRuntimeError::ConnectionUnavailable
+                }
+            };
+            let expected = if exited {
+                "RuntimeUnavailable"
+            } else {
+                "SessionUnavailable"
+            };
+            facade
+                .adapter
+                .public_commands
+                .append_pending(&public_session, "UNDELIVERED_OUTPUT\n");
+            facade.adapter.runtime.inject_tool_fault(fault());
+            let failed = facade.call_tool(PermissionMode::Full, "command_control",
+                json!({"action":"kill", "session_id":public_session, "signal":"KILL", "wait_ms":0}), None, |_| {}).unwrap();
+            assert_eq!(failed["isError"], true, "{failed:#}");
+            assert_eq!(failed["structuredContent"]["error"]["code"], expected);
+            assert_eq!(failed["structuredContent"]["error"]["retryable"], true);
+            assert!(
+                facade.adapter.pending_runtime_fault.is_some(),
+                "production fault reporting remains enabled"
+            );
+            assert!(
+                facade
+                    .adapter
+                    .durable_command_terminal(&public_session)
+                    .is_none()
+            );
+            assert_eq!(
+                facade
+                    .adapter
+                    .executions
+                    .cancellation_signal(&session_key)
+                    .as_deref(),
+                Some("KILL")
+            );
+            assert_eq!(
+                facade.adapter.public_commands.sessions[&public_session]
+                    .output
+                    .pending(),
+                "UNDELIVERED_OUTPUT\n"
+            );
+            // Deliver the pending bytes once before injecting the poll fault;
+            // a poll with cached output legitimately bypasses the upstream.
+            let buffered = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "command_control",
+                    json!({"action":"poll", "session_id":public_session, "wait_ms":0}),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                buffered["structuredContent"]["data"]["output"],
+                "UNDELIVERED_OUTPUT\n"
+            );
+            facade.adapter.runtime.inject_tool_fault(fault());
+            let failed_poll = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "command_control",
+                    json!({"action":"poll", "session_id":public_session, "wait_ms":0}),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                failed_poll["structuredContent"]["error"]["code"], expected,
+                "{failed_poll:#}"
+            );
+            assert_eq!(failed_poll["structuredContent"]["error"]["retryable"], true);
+            assert!(
+                facade
+                    .adapter
+                    .durable_command_terminal(&public_session)
+                    .is_none()
+            );
+            assert_eq!(
+                facade
+                    .adapter
+                    .executions
+                    .cancellation_signal(&session_key)
+                    .as_deref(),
+                Some("KILL")
+            );
+            assert!(matches!(
+                facade
+                    .adapter
+                    .executions
+                    .execution_for_public_session(&session_key)
+                    .unwrap()
+                    .state,
+                crate::domain::execution::ExecutionState::Running
+            ));
+            let recovered = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "command_control",
+                    json!({"action":"poll", "session_id":public_session, "wait_ms":0}),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                recovered["structuredContent"]["data"]["status"], "running",
+                "{recovered:#}"
+            );
+            assert_eq!(
+                recovered["structuredContent"]["data"]["session_id"],
+                public_session
+            );
+            assert!(!recovered.to_string().contains("UNDELIVERED_OUTPUT"));
+            let _kill = facade.call_tool(PermissionMode::Full, "command_control",
+                json!({"action":"kill", "session_id":public_session, "signal":"KILL", "wait_ms":1000}), None, |_| {}).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let polled = facade
+                    .call_tool(
+                        PermissionMode::Full,
+                        "command_control",
+                        json!({"action":"poll", "session_id":public_session, "wait_ms":100}),
+                        None,
+                        |_| {},
+                    )
+                    .unwrap();
+                if polled["structuredContent"]["data"]["status"] == "cancelled" {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real cancellation did not settle: {polled:#}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let terminal = facade
+                .adapter
+                .durable_command_terminal(&public_session)
+                .unwrap();
+            // A late upstream fault cannot replace the already durable terminal.
+            facade.adapter.runtime.inject_tool_fault(fault());
+            for _ in 0..2 {
+                let replay = facade
+                    .call_tool(
+                        PermissionMode::Full,
+                        "command_control",
+                        json!({"action":"poll", "session_id":public_session, "wait_ms":0}),
+                        None,
+                        |_| {},
+                    )
+                    .unwrap();
+                assert_eq!(replay["structuredContent"]["data"]["status"], "cancelled");
+                assert!(!replay.to_string().contains("UNDELIVERED_OUTPUT"));
+                assert_eq!(
+                    facade
+                        .adapter
+                        .durable_command_terminal(&public_session)
+                        .unwrap(),
+                    terminal
+                );
+            }
+            let unknown = facade
+                .call_tool(
+                    PermissionMode::Full,
+                    "command_control",
+                    json!({"action":"poll", "session_id":"unknown-session", "wait_ms":0}),
+                    None,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                unknown["structuredContent"]["error"]["retryable"], false,
+                "{unknown:#}"
+            );
+            let mut runtime = facade.into_runtime();
+            runtime.stop().unwrap();
+            assert_eq!(runtime.active_processes().unwrap(), 0);
+            eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
+        }
     }
 }

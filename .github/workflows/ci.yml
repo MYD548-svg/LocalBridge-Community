@@ -1,17 +1,16 @@
 name: CI
-
 on:
   push:
   pull_request:
-
 permissions:
   contents: read
-
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -20,8 +19,19 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
-      - run: npm ci
-      - run: cargo fetch --manifest-path src-tauri/Cargo.toml --locked
-      # Local release candidates and GitHub execute this exact ordered gate.
-      # Add or change a stage in scripts/test/ci-gate.mjs, never in two places.
-      - run: node scripts/test/ci-gate.mjs
+      - name: Shared build and verification gate
+        run: node scripts/test/ci-gate.mjs
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-diagnostics
+          path: tests/artifacts/ci/
+          if-no-files-found: warn
+      - name: Upload verified installer
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundled-verified-installer
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error

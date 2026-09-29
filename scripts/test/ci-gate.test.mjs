@@ -8,6 +8,10 @@ test("the shared local and CI gate has stable unique stages", () => {
   assert.deepEqual(
     CI_STAGES.map((stage) => stage.id),
     [
+      "toolchains",
+      "dependencies",
+      "tunnel-source",
+      "bundled-integrity",
       "test-base",
       "format",
       "public-release",
@@ -16,9 +20,13 @@ test("the shared local and CI gate has stable unique stages", () => {
       "frontend-test",
       "frontend-build",
       "runtime-resources",
+      "staged-integrity",
+      "auth-repeat",
       "rust-test",
       "rust-clippy",
       "nsis-package",
+      "package-integrity",
+      "artifacts",
     ],
   );
   assert.throws(
@@ -34,6 +42,8 @@ test("targeted local diagnosis reuses the declared gate instead of copying comma
   assert.deepEqual(selectStages(CI_STAGES, { from: "rust-clippy" }).map(({ id }) => id), [
     "rust-clippy",
     "nsis-package",
+    "package-integrity",
+    "artifacts",
   ]);
   assert.deepEqual(
     selectStages(CI_STAGES, { from: "schema44", through: "frontend-build" }).map(({ id }) => id),
@@ -60,4 +70,9 @@ test("a running desktop binary can use the same Rust gate with an isolated targe
     cargoCommand(["test"], { LOCALBRIDGE_CARGO_TARGET_DIR: "src-tauri/target/local-gate" }).args,
     ["+1.85.0", "test", "--target-dir", "src-tauri/target/local-gate"],
   );
+});
+
+test("only the shared resource gate opts into compile preflight", () => {
+  const resources = CI_STAGES.find((stage) => stage.id === "runtime-resources");
+  assert.deepEqual(resources.args, ["scripts/prepare-lb018-resources.mjs", "--compile-preflight"]);
 });

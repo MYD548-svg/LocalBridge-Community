@@ -670,7 +670,7 @@ mod tests {
         assert!(!moved.exists());
         assert!(!protected.join("innocent.txt").exists());
         fs::remove_dir(&alias).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -735,7 +735,7 @@ mod tests {
         })
         .unwrap();
         assert!(!dir.exists());
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -755,7 +755,7 @@ mod tests {
             .unwrap()
             .workspace_identity_token()
             .unwrap();
-        fs::remove_dir_all(&safe).unwrap();
+        fs::rename(&safe, root.join("safe-retained")).unwrap();
         let status = Command::new("cmd.exe")
             .args(["/d", "/c", "mklink", "/J"])
             .arg(&safe)
@@ -804,7 +804,7 @@ mod tests {
         assert!(!destination.exists());
 
         fs::remove_dir(&safe).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -856,6 +856,6 @@ mod tests {
         run_administrator_filesystem(normal_write).unwrap();
         assert_eq!(fs::read(&ordinary).unwrap(), b"new");
 
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 }

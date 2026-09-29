@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use crate::domain::McpSessionId;
 pub(crate) const MAX_LOCAL_RETAINED_OUTPUT_HANDLES: usize = 8;
@@ -25,21 +26,26 @@ pub(crate) enum OutputOwner {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct OutputHandleRegistry {
+struct OutputHandleState {
     handles: HashMap<String, OutputHandle>,
-    private_to_public: HashMap<String, String>,
+    private_to_public: HashMap<(String, String, String), String>,
     private_order: VecDeque<String>,
     local_order: VecDeque<String>,
+    primary: HashMap<String, String>,
 }
 
-impl OutputHandleRegistry {
+impl OutputHandleState {
     pub(crate) fn public_for_private(
         &mut self,
         private_output_ref: &str,
         owner_public_session_id: &str,
         stream: &str,
     ) -> String {
-        if let Some(public) = self.private_to_public.get(private_output_ref) {
+        if let Some(public) = self.private_to_public.get(&(
+            owner_public_session_id.into(),
+            stream.into(),
+            private_output_ref.into(),
+        )) {
             return public.clone();
         }
         while self.private_order.len() >= MAX_PRIVATE_RETAINED_OUTPUT_HANDLES {
@@ -48,8 +54,14 @@ impl OutputHandleRegistry {
             }
         }
         let public = next_output_handle();
-        self.private_to_public
-            .insert(private_output_ref.to_owned(), public.clone());
+        self.private_to_public.insert(
+            (
+                owner_public_session_id.into(),
+                stream.into(),
+                private_output_ref.into(),
+            ),
+            public.clone(),
+        );
         self.handles.insert(
             public.clone(),
             OutputHandle::Private {
@@ -146,11 +158,157 @@ impl OutputHandleRegistry {
 
     fn remove(&mut self, public_output_ref: &str) {
         if let Some(OutputHandle::Private {
-            private_output_ref, ..
+            private_output_ref,
+            owner_public_session_id,
+            stream,
         }) = self.handles.remove(public_output_ref)
         {
-            self.private_to_public.remove(&private_output_ref);
+            self.private_to_public
+                .remove(&(owner_public_session_id, stream, private_output_ref));
+            self.primary.retain(|_, value| value != public_output_ref);
         }
+    }
+}
+
+/// Public and private references use the same typed shape, but only public values
+/// leave the control plane. Clones share one bounded mapping registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OutputReferences {
+    pub(crate) primary: Option<String>,
+    pub(crate) stdout: Option<String>,
+    pub(crate) stderr: Option<String>,
+}
+impl OutputReferences {
+    pub(crate) fn values(&self) -> Vec<String> {
+        let mut values = Vec::new();
+        for value in [&self.primary, &self.stdout, &self.stderr]
+            .into_iter()
+            .flatten()
+        {
+            if !values.contains(value) {
+                values.push(value.clone());
+            }
+        }
+        values
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OutputHandleRegistry(Arc<Mutex<OutputHandleState>>);
+impl OutputHandleRegistry {
+    #[cfg(test)]
+    pub(crate) fn public_for_private(&self, private: &str, owner: &str, stream: &str) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .public_for_private(private, owner, stream)
+    }
+    pub(crate) fn register(&self, owner: &str, refs: &OutputReferences) -> OutputReferences {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stdout = refs
+            .stdout
+            .as_deref()
+            .map(|value| state.public_for_private(value, owner, "stdout"));
+        let stderr = refs
+            .stderr
+            .as_deref()
+            .map(|value| state.public_for_private(value, owner, "stderr"));
+        // Adding the second stream can evict an older first-stream handle.
+        // Never publish a reference that the same registration just expired.
+        let stdout = stdout.filter(|value| state.handles.contains_key(value));
+        let stderr = stderr.filter(|value| state.handles.contains_key(value));
+        let primary = refs.primary.as_ref().and_then(|value| {
+            if Some(value) == refs.stderr.as_ref() {
+                stderr.clone()
+            } else if Some(value) == refs.stdout.as_ref() {
+                stdout.clone()
+            } else {
+                None
+            }
+        });
+        if let Some(primary) = &primary {
+            state.primary.insert(owner.into(), primary.clone());
+        }
+        OutputReferences {
+            primary,
+            stdout,
+            stderr,
+        }
+    }
+    pub(crate) fn for_session(&self, owner: &str) -> OutputReferences {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut refs = OutputReferences::default();
+        for public in &state.private_order {
+            if let Some(OutputHandle::Private {
+                owner_public_session_id,
+                stream,
+                ..
+            }) = state.handles.get(public)
+            {
+                if owner_public_session_id == owner {
+                    match stream.as_str() {
+                        "stdout" => refs.stdout = Some(public.clone()),
+                        "stderr" => refs.stderr = Some(public.clone()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        refs.primary = state
+            .primary
+            .get(owner)
+            .filter(|value| state.handles.contains_key(*value))
+            .cloned()
+            .or_else(|| refs.stdout.clone())
+            .or_else(|| refs.stderr.clone());
+        refs
+    }
+    pub(crate) fn retain_local(
+        &self,
+        owner: McpSessionId,
+        stream: &str,
+        content: String,
+    ) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain_local(owner, stream, content)
+    }
+    pub(crate) fn private(&self, public: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .private(public)
+    }
+    pub(crate) fn local(&self, public: &str) -> Option<(String, String)> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .local(public)
+    }
+    pub(crate) fn stream(&self, public: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stream(public)
+    }
+    pub(crate) fn owner(&self, public: &str) -> Option<OutputOwner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owner(public)
+    }
+    pub(crate) fn reap_owned_by(&self, sessions: &[String]) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reap_owned_by(sessions);
     }
 }
 
@@ -164,14 +322,14 @@ mod tests {
 
     #[test]
     fn local_and_private_handles_have_independent_bounded_fifo_retention() {
-        let mut registry = OutputHandleRegistry::default();
+        let registry = OutputHandleRegistry::default();
         let private_first = registry.public_for_private("private-0", "session-a", "stdout");
         for index in 1..=MAX_PRIVATE_RETAINED_OUTPUT_HANDLES {
             registry.public_for_private(&format!("private-{index}"), "session-a", "stdout");
         }
         assert!(registry.private(&private_first).is_none());
         assert_eq!(
-            registry.private_order.len(),
+            registry.0.lock().unwrap().private_order.len(),
             MAX_PRIVATE_RETAINED_OUTPUT_HANDLES
         );
 
@@ -186,18 +344,98 @@ mod tests {
         }
         assert!(registry.local(&local_first).is_none());
         assert_eq!(
-            registry.local_order.len(),
+            registry.0.lock().unwrap().local_order.len(),
             MAX_LOCAL_RETAINED_OUTPUT_HANDLES
         );
     }
 
     #[test]
     fn private_handles_reap_with_their_public_session_owner() {
-        let mut registry = OutputHandleRegistry::default();
+        let registry = OutputHandleRegistry::default();
         let a = registry.public_for_private("private-a", "session-a", "stdout");
         let b = registry.public_for_private("private-b", "session-b", "stderr");
         registry.reap_owned_by(&["session-a".into()]);
         assert!(registry.private(&a).is_none());
         assert_eq!(registry.private(&b).as_deref(), Some("private-b"));
+    }
+    #[test]
+    fn concurrent_registration_shares_handles_and_retains_primary_stream() {
+        let registry = OutputHandleRegistry::default();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let shared = registry.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    shared.register(
+                        "owner",
+                        &OutputReferences {
+                            primary: Some("err".into()),
+                            stdout: Some("out".into()),
+                            stderr: Some("err".into()),
+                        },
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        let mut results = workers.into_iter().map(|worker| worker.join().unwrap());
+        let first = results.next().unwrap();
+        assert_eq!(Some(first.clone()), results.next());
+        assert_eq!(first.primary, first.stderr);
+        assert_eq!(registry.for_session("owner"), first);
+        assert_eq!(registry.for_session("owner"), first); // metadata is never consumed
+        let other = registry.register(
+            "another-owner",
+            &OutputReferences {
+                stderr: Some("err".into()),
+                ..OutputReferences::default()
+            },
+        );
+        assert_ne!(first.stderr, other.stderr);
+        for index in 0..MAX_PRIVATE_RETAINED_OUTPUT_HANDLES {
+            registry.register(
+                "filler",
+                &OutputReferences {
+                    stdout: Some(format!("out-{index}")),
+                    ..OutputReferences::default()
+                },
+            );
+        }
+        assert_eq!(registry.for_session("owner"), OutputReferences::default());
+        assert_eq!(registry.for_session("owner"), OutputReferences::default());
+        assert!(registry.private(first.stderr.as_ref().unwrap()).is_none());
+        registry.reap_owned_by(&["filler".into()]);
+        assert_eq!(registry.for_session("filler"), OutputReferences::default());
+    }
+    #[test]
+    fn registering_a_second_stream_cannot_publish_an_evicted_primary() {
+        let registry = OutputHandleRegistry::default();
+        let old = registry.register(
+            "owner",
+            &OutputReferences {
+                primary: Some("out".into()),
+                stdout: Some("out".into()),
+                stderr: None,
+            },
+        );
+        for index in 1..MAX_PRIVATE_RETAINED_OUTPUT_HANDLES {
+            registry.public_for_private(&format!("filler-{index}"), "filler", "stdout");
+        }
+        let added = registry.register(
+            "owner",
+            &OutputReferences {
+                primary: Some("out".into()),
+                stdout: Some("out".into()),
+                stderr: Some("err".into()),
+            },
+        );
+        assert!(added.stdout.is_none());
+        assert!(added.primary.is_none());
+        assert!(registry.private(old.primary.as_ref().unwrap()).is_none());
+        let replay = registry.for_session("owner");
+        assert!(replay.stdout.is_none());
+        assert_eq!(replay.primary, replay.stderr);
     }
 }

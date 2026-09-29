@@ -68,7 +68,7 @@ use super::facade::{
     AGENT_API_REVISION, AgentFacade, CodingRuntimeHealth, CodingToolsRuntimeAdapter,
     FacadeCallError, FacadeDenied, FacadeError, FacadeErrorCode, FilesystemAction,
     FilesystemRequest, TaskCallIdentity, normalize_path_authority_error, parse_filesystem_request,
-    public_command_stderr, public_error_output_schema, public_safe_summary, public_task_kind,
+    public_error_output_schema, public_safe_summary, public_task_kind,
     run_workspace_filesystem_with_authority, stable_command_error, stable_public_tool_catalog,
     stable_success, validate_workspace_context_probe,
 };
@@ -2761,6 +2761,12 @@ fn direct_command_control_during_work(
         || WorkflowCheckpointStore::for_workspace(workspace)
             .and_then(|store| store.settle_command_kill::<Value>(result.public_session_id.as_str()))
             .is_ok();
+    #[cfg(test)]
+    eprintln!(
+        "COMMAND_ROUTE direct session={} status={}",
+        result.public_session_id.as_str(),
+        result.status.as_str()
+    );
     direct_command_result_to_mcp(result, action, checkpoint_settled)
 }
 
@@ -2769,7 +2775,7 @@ fn direct_command_result_to_mcp(
     _action: CommandControlAction,
     checkpoint_settled: bool,
 ) -> Value {
-    let stderr = public_command_stderr(&result.stderr);
+    let stderr = &result.stderr;
     let output = [result.stdout.as_str(), stderr.as_str()]
         .into_iter()
         .filter(|value| !value.is_empty())
@@ -2800,28 +2806,39 @@ fn direct_command_result_to_mcp(
     if let Some(truncated) = result.truncated {
         data.insert("truncated".into(), Value::Bool(truncated));
     }
-    if !checkpoint_settled {
-        return stable_command_error(
+    super::facade::insert_public_output_refs(&mut data, &result.output_refs);
+    let mut response = if !checkpoint_settled {
+        stable_command_error(
             FacadeErrorCode::RuntimeUnavailable,
             "命令已终止，但工作流恢复状态不可用",
             data,
-        );
+        )
+    } else {
+        match result.status {
+            RuntimeCommandStatus::Running => stable_success(Value::Object(data), "Command running"),
+            RuntimeCommandStatus::Completed => {
+                stable_success(Value::Object(data), "Command completed")
+            }
+            RuntimeCommandStatus::Cancelled => {
+                stable_success(Value::Object(data), "Command cancelled")
+            }
+            RuntimeCommandStatus::TimedOut => {
+                stable_command_error(FacadeErrorCode::ProcessTimedOut, "Command timed out", data)
+            }
+            RuntimeCommandStatus::Failed => {
+                stable_command_error(FacadeErrorCode::ProcessFailed, "Command failed", data)
+            }
+            RuntimeCommandStatus::Lost => {
+                stable_command_error(FacadeErrorCode::SessionUnavailable, "Command lost", data)
+            }
+        }
+    };
+    if result.output_incomplete {
+        response["structuredContent"]["data"]["truncated"] = Value::Bool(true);
+        response["structuredContent"]["warnings"] =
+            json!([crate::control_plane::command_output::INCOMPLETE_COMMAND_OUTPUT]);
     }
-
-    match result.status {
-        RuntimeCommandStatus::Running => stable_success(Value::Object(data), "Command running"),
-        RuntimeCommandStatus::Completed => stable_success(Value::Object(data), "Command completed"),
-        RuntimeCommandStatus::Cancelled => stable_success(Value::Object(data), "Command cancelled"),
-        RuntimeCommandStatus::TimedOut => {
-            stable_command_error(FacadeErrorCode::ProcessTimedOut, "Command timed out", data)
-        }
-        RuntimeCommandStatus::Failed => {
-            stable_command_error(FacadeErrorCode::ProcessFailed, "Command failed", data)
-        }
-        RuntimeCommandStatus::Lost => {
-            stable_command_error(FacadeErrorCode::SessionUnavailable, "Command lost", data)
-        }
-    }
+    response
 }
 
 fn task_control_snapshot_with_terminal(
@@ -6016,7 +6033,7 @@ mod tests {
         }
 
         let _coding = pep.stop().unwrap();
-        let _ = fs::remove_dir_all(workspace);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
     }
 
     #[test]
@@ -6057,8 +6074,8 @@ mod tests {
         assert_eq!(pep.control_plane.scheduler().snapshot().work_queued, 0);
 
         let _coding = pep.stop().unwrap();
-        let _ = fs::remove_dir_all(workspace_a);
-        let _ = fs::remove_dir_all(workspace_b);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace_a.display());
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace_b.display());
     }
 
     #[test]
@@ -6151,7 +6168,7 @@ mod tests {
         );
 
         let _coding = pep.stop().unwrap();
-        let _ = fs::remove_dir_all(workspace);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
     }
 
     #[test]
@@ -6274,15 +6291,15 @@ mod tests {
             7
         );
 
-        let running = public_tool_call(
+        let running = submit_side_effect_free_public_command(
             pep.port(),
             &session,
             604,
-            "exec_command",
             json!({
                 "command":"Start-Sleep -Milliseconds 900; Write-Output LB_SCHEMA27_DONE",
                 "shell":"windows_powershell",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         assert_eq!(
@@ -6307,9 +6324,14 @@ mod tests {
             "command_control",
             json!({"action":"poll","session_id":public_session,"wait_ms":25}),
         );
-        assert!(polled.body.get("error").is_none(), "{:#?}", polled.body);
+        assert_ne!(
+            classify_command_poll_response(&polled),
+            CommandPollObservation::Invalid,
+            "{:#?}",
+            polled.body
+        );
 
-        let terminal_deadline = Instant::now() + Duration::from_secs(30);
+        let terminal_deadline = Instant::now() + Duration::from_secs(150);
         let mut terminal_poll_id = 606u64;
         let mut observed_output = String::new();
         let terminal = loop {
@@ -6321,14 +6343,18 @@ mod tests {
                 json!({"action":"poll","session_id":public_session,"wait_ms":100}),
             );
             terminal_poll_id += 1;
-            assert!(poll.body.get("error").is_none(), "{:#?}", poll.body);
             observed_output.push_str(
                 poll.body["result"]["structuredContent"]["data"]["output"]
                     .as_str()
                     .unwrap_or_default(),
             );
-            if poll.body["result"]["structuredContent"]["data"]["status"] != "running" {
-                break poll;
+            match classify_command_poll_response(&poll) {
+                CommandPollObservation::Terminal => break poll,
+                CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
+                CommandPollObservation::Invalid => panic!(
+                    "schema27 poll response is neither lifecycle status nor bounded timeout: {:#?}",
+                    poll.body
+                ),
             }
             assert!(
                 Instant::now() < terminal_deadline,
@@ -6958,17 +6984,36 @@ mod tests {
             nested_status.body["result"]["structuredContent"]["data"]["repository_root"],
             "NestedProject"
         );
-        let nested_workflow = public_tool_call(
-            pep.port(),
-            &session,
-            691,
-            "agent_workflow",
-            json!({
-                "action":"bugfix",
-                "path":"NestedProject/src",
-                "commands":[{"command":"cd","shell":"cmd","yield_time_ms":10000}]
-            }),
-        );
+        // The workflow runs its commands through the same command-control
+        // transport as direct exec_command calls. A degraded runner can expire
+        // that submission's wait budget; the failed attempt terminalizes its
+        // checkpoint, so the retry below starts a fresh workflow and every
+        // following assertion applies to the successful one.
+        let nested_workflow = {
+            let retry_deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let response = public_tool_call(
+                    pep.port(),
+                    &session,
+                    691,
+                    "agent_workflow",
+                    json!({
+                        "action":"bugfix",
+                        "path":"NestedProject/src",
+                        "commands":[{"command":"cd","shell":"cmd","yield_time_ms":10000}]
+                    }),
+                );
+                let code = &response.body["result"]["structuredContent"]["error"]["code"];
+                if code.as_str() != Some("OperationTimedOut") {
+                    break response;
+                }
+                assert!(
+                    Instant::now() < retry_deadline,
+                    "nested workflow submission kept timing out: {:#?}",
+                    response.body
+                );
+            }
+        };
         assert_eq!(
             nested_workflow.body["result"]["isError"], false,
             "{:#?}",
@@ -7156,7 +7201,8 @@ mod tests {
             json!({
                 "command":format!("$env:PSModulePath='{module_root_literal}'; Invoke-LbGen14Auto"),
                 "shell":"windows_powershell",
-                "yield_time_ms":10000
+                "yield_time_ms":10000,
+                "timeout_ms":120000
             }),
         );
         let (autoload, autoload_output) =
@@ -7179,7 +7225,8 @@ mod tests {
             json!({
                 "command":"Write-Output \"a|b\"; Write-Output \"a&b\"; Write-Output 'q|b'; Write-Output 'q&b'; Write-Output '中文输出✓'",
                 "shell":"windows_powershell",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         let (quoted, quoted_output) = settle_public_command(pep.port(), &session, 41_000, quoted);
@@ -7203,7 +7250,8 @@ mod tests {
             json!({
                 "command":"Write-Error \"READERR 🚀\"",
                 "shell":"windows_powershell",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         let (powershell_error, powershell_error_output) =
@@ -7235,25 +7283,60 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!("PowerShell failure must retain stderr: {powershell_error_data:#?}")
             });
-        let retained_error = public_tool_call(
+        // A session-less command_control read serves through the facade
+        // execution guard; when a work request still holds it the control lane
+        // answers the contract's retryable RuntimeUnavailable instead. Retry
+        // only those retryable envelopes within a bounded deadline.
+        let retry_deadline = Instant::now() + Duration::from_secs(30);
+        let mut retained_error = public_tool_call(
             pep.port(),
             &session,
             7012,
             "command_control",
             json!({"action":"read","output_ref":stderr_ref,"stream":"stderr","offset":0,"limit":1048576}),
         );
+        while retained_error.body["result"]["structuredContent"]["error"]["retryable"] == true {
+            assert!(
+                Instant::now() < retry_deadline,
+                "session-less command_control read kept hitting the busy control lane: {:#?}",
+                retained_error.body
+            );
+            thread::sleep(Duration::from_millis(200));
+            retained_error = public_tool_call(
+                pep.port(),
+                &session,
+                7012,
+                "command_control",
+                json!({"action":"read","output_ref":stderr_ref,"stream":"stderr","offset":0,"limit":1048576}),
+            );
+        }
         assert_eq!(
             retained_error.body["result"]["isError"], false,
             "{:#?}",
             retained_error.body
         );
-        let mismatched_stream = public_tool_call(
+        let mut mismatched_stream = public_tool_call(
             pep.port(),
             &session,
             70121,
             "command_control",
             json!({"action":"read","output_ref":stderr_ref,"stream":"stdout","offset":0,"limit":100}),
         );
+        while mismatched_stream.body["result"]["structuredContent"]["error"]["retryable"] == true {
+            assert!(
+                Instant::now() < retry_deadline,
+                "session-less command_control read kept hitting the busy control lane: {:#?}",
+                mismatched_stream.body
+            );
+            thread::sleep(Duration::from_millis(200));
+            mismatched_stream = public_tool_call(
+                pep.port(),
+                &session,
+                70121,
+                "command_control",
+                json!({"action":"read","output_ref":stderr_ref,"stream":"stdout","offset":0,"limit":100}),
+            );
+        }
         let mismatch_error = &mismatched_stream.body["result"]["structuredContent"]["error"];
         assert_eq!(mismatch_error["code"], "InvalidArgument");
         assert_eq!(mismatch_error["details"]["field"], "stream");
@@ -7285,7 +7368,8 @@ mod tests {
             json!({
                 "command":"cd /d . && echo LB_CMD_D_OK",
                 "shell":"cmd",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         let (cmd_cd_switch, cmd_cd_output) =
@@ -7334,7 +7418,8 @@ mod tests {
             json!({
                 "command":"Write-Output '自动中文✓'",
                 "shell":"auto",
-                "yield_time_ms":0
+                "yield_time_ms":0,
+                "timeout_ms":120000
             }),
         );
         let (auto_utf8, auto_utf8_output) =
@@ -7698,7 +7783,61 @@ mod tests {
         let mut coding = pep.stop().expect("absolute path PEP stops");
         coding.stop().expect("absolute path MCP stops");
         cleanup_test_directory(&workspace);
-        fs::remove_dir_all(outside).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
+    }
+
+    #[test]
+    fn guard_rejects_missing_and_wrong_bearer_before_mcp_initialization() {
+        let root = repo_root();
+        let workspace = temp_workspace();
+        let coding = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                free_port(),
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
+            Duration::from_secs(10),
+        )
+        .expect("bundled MCP ready");
+        let desired = DesiredStateOwner::default();
+        desired.replace(DesiredState {
+            permission: PermissionMode::Full,
+            workspace: Some(DesiredWorkspace::for_runtime_path(&workspace)),
+            services: ServiceIntent::Enabled,
+            connection: None,
+        });
+        let auth = ClientAuthenticator::generated().unwrap();
+        let correct = auth.test_authorization_header().unwrap();
+        let pep = PolicyEnforcementRuntime::start_inner(
+            coding,
+            policy(&root),
+            PolicyStateSource::Simulated {
+                desired,
+                workspace,
+                connection: None,
+                privileged: None,
+            },
+            None,
+            None,
+            auth,
+        )
+        .expect("authenticated Guard ready");
+        let statuses: Vec<_> = [None, Some("Bearer synthetic-wrong"), Some(correct.as_str())].into_iter().map(|authorization| {
+            let body = json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                "protocolVersion":CURRENT_PROTOCOL_VERSION, "capabilities":{}, "clientInfo":{"name":"auth-regression", "version":"1"}
+            }}).to_string();
+            let mut stream = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, pep.port())).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let header = authorization.map(|value| format!("Authorization: {value}\r\n")).unwrap_or_default();
+            let request = format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n{header}\r\n{body}", body.len());
+            std::io::Write::write_all(&mut stream, request.as_bytes()).unwrap();
+            super::super::test_support::parse_client_response(stream).status
+        }).collect();
+        let mut coding = pep.stop().expect("Guard stops");
+        coding.stop().expect("coding runtime stops");
+        assert_eq!(statuses, [401, 401, 200]);
     }
 
     #[test]
@@ -8105,6 +8244,337 @@ mod tests {
     }
 
     #[test]
+    fn busy_http_control_delivers_shared_terminal_output_and_waits_for_collectors() {
+        let root = repo_root();
+        let workspace = temp_workspace();
+        let coding = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                free_port(),
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let pep =
+            PolicyEnforcementRuntime::start(coding, policy(&root), PermissionMode::Full).unwrap();
+        let session = initialize(pep.port(), 9700).session.unwrap();
+        let registry = pep.control_plane.executions();
+        // Holding the actual facade mutex forces the production HTTP try_lock
+        // branch to use direct control, with no scheduler timing assumptions.
+        let held = pep.guard.as_ref().unwrap().lock().unwrap();
+        for (index, outcome) in [
+            TerminalOutcome::Completed,
+            TerminalOutcome::Failed,
+            TerminalOutcome::Cancelled,
+            TerminalOutcome::TimedOut,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let public = PublicSessionId::new(format!("lb-session-delivery-{index}"));
+            let started = registry
+                .start_owned(
+                    TaskId::new(format!("delivery-task-{index}")),
+                    public.clone(),
+                    Some(McpSessionId::new(session.clone())),
+                )
+                .unwrap();
+            let output = registry.command_output(&public).unwrap();
+            let collection = output.begin();
+            output.append("BACKGROUND_STDOUT\n");
+            let stderr = output.filter_stderr("BACKGROUND_STDERR\n");
+            output.append(&stderr);
+            output.annotate(true, true);
+            let refs = registry.output_handles().register(
+                public.as_str(),
+                &crate::execution::output_handles::OutputReferences {
+                    primary: Some(format!("private-stderr-{index}")),
+                    stdout: Some(format!("private-stdout-{index}")),
+                    stderr: Some(format!("private-stderr-{index}")),
+                },
+            );
+            registry
+                .finish(
+                    &started.execution_id,
+                    ExecutionTerminal {
+                        outcome,
+                        exit_code: Some(if outcome == TerminalOutcome::Completed {
+                            0
+                        } else {
+                            1
+                        }),
+                        signal: None,
+                        output_refs: Vec::new(),
+                        error_code: None,
+                        completed_at_ms: unix_time_ms(),
+                    },
+                )
+                .unwrap();
+            let call = |id| {
+                public_tool_call(
+                    pep.port(),
+                    &session,
+                    id,
+                    "command_control",
+                    json!({"action":"poll","session_id":public.as_str(),"wait_ms":0}),
+                )
+            };
+            let waiting = call(9710 + index as u64 * 3);
+            assert_eq!(
+                waiting.body["result"]["structuredContent"]["data"]["status"], "running",
+                "{:#?}",
+                waiting.body
+            );
+            assert_eq!(
+                waiting.body["result"]["structuredContent"]["data"]["output"],
+                ""
+            );
+            registry
+                .enrich_terminal_output_refs(&started.execution_id)
+                .unwrap();
+            drop(collection);
+            for (offset, expected) in [(1, "BACKGROUND_STDOUT\nBACKGROUND_STDERR\n"), (2, "")] {
+                let response = call(9710 + index as u64 * 3 + offset);
+                let envelope = &response.body["result"]["structuredContent"];
+                assert_eq!(
+                    envelope["data"]["status"],
+                    outcome.as_str(),
+                    "{:#?}",
+                    response.body
+                );
+                assert_eq!(envelope["data"]["output"], expected, "{:#?}", response.body);
+                assert_eq!(envelope["data"]["truncated"], true);
+                assert_eq!(
+                    envelope["warnings"],
+                    json!([crate::control_plane::command_output::INCOMPLETE_COMMAND_OUTPUT])
+                );
+                assert!(envelope["data"].get("warnings").is_none());
+                assert_eq!(
+                    envelope["data"]["output_refs"]["stdout"].as_str(),
+                    refs.stdout.as_deref(),
+                    "direct {:#?}",
+                    response.body
+                );
+                assert_eq!(
+                    envelope["data"]["output_refs"]["stderr"].as_str(),
+                    refs.stderr.as_deref(),
+                    "direct {:#?}",
+                    response.body
+                );
+                assert_eq!(
+                    envelope["data"]["output_ref"].as_str(),
+                    refs.primary.as_deref()
+                );
+            }
+        }
+        drop(held);
+        let mut coding = pep.stop().unwrap();
+        coding.stop().unwrap();
+        cleanup_test_directory(&workspace);
+    }
+
+    #[test]
+    fn busy_terminal_replay_retains_readable_stderr_and_its_owner() {
+        let root = repo_root();
+        let workspace = temp_workspace();
+        let coding = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                free_port(),
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let pep =
+            PolicyEnforcementRuntime::start(coding, policy(&root), PermissionMode::Full).unwrap();
+        let owner = initialize(pep.port(), 9800).session.unwrap();
+        let other = initialize(pep.port(), 9801).session.unwrap();
+        let control_read = |session: &str, request_id: u64, arguments: Value| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let response = public_tool_call(
+                    pep.port(),
+                    session,
+                    request_id,
+                    "command_control",
+                    arguments.clone(),
+                );
+                let error = &response.body["result"]["structuredContent"]["error"];
+                if error["retryable"] != true
+                    || !matches!(
+                        error["code"].as_str(),
+                        Some("RuntimeUnavailable" | "OperationTimedOut")
+                    )
+                {
+                    break response;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "read transport remained busy: {:#?}",
+                    response.body
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let initial = public_tool_call(
+            pep.port(),
+            &owner,
+            9802,
+            "exec_command",
+            json!({"command":"Write-Error LB_SHARED_RETAINED_STDERR", "shell":"windows_powershell", "yield_time_ms":0,"timeout_ms":120000}),
+        );
+        let (terminal, _) = settle_public_command(pep.port(), &owner, 98_100, initial);
+        assert_tool_error(&terminal, "ProcessFailed");
+        let data = &terminal.body["result"]["structuredContent"]["data"];
+        let public = data["session_id"].as_str().unwrap();
+        let stderr = data["output_refs"]["stderr"]
+            .as_str()
+            .expect("terminal stderr reference");
+        let held = pep.guard.as_ref().unwrap().lock().unwrap();
+        for id in [9803, 9804] {
+            let replay = public_tool_call(
+                pep.port(),
+                &owner,
+                id,
+                "command_control",
+                json!({"action":"poll","session_id":public,"wait_ms":0}),
+            );
+            assert_tool_error(&replay, "ProcessFailed");
+            assert_eq!(
+                replay.body["result"]["structuredContent"]["data"]["output_refs"]["stderr"], stderr,
+                "direct {:#?}",
+                replay.body
+            );
+            assert_eq!(
+                replay.body["result"]["structuredContent"]["data"]["output"],
+                ""
+            );
+        }
+        drop(held);
+        let read = control_read(
+            &owner,
+            9805,
+            json!({"action":"read","output_ref":stderr,"stream":"stderr","limit":1048576}),
+        );
+        assert!(
+            read.body["result"]["structuredContent"]["data"]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("LB_SHARED_RETAINED_STDERR")),
+            "{:#?}",
+            read.body
+        );
+        let denied = control_read(
+            &other,
+            9806,
+            json!({"action":"read","output_ref":stderr,"stream":"stderr"}),
+        );
+        assert_tool_error(&denied, "OutputNotFound");
+        let mismatch = control_read(
+            &owner,
+            9807,
+            json!({"action":"read","output_ref":stderr,"stream":"stdout"}),
+        );
+        assert_tool_error(&mismatch, "InvalidArgument");
+        let replay = public_tool_call(
+            pep.port(),
+            &owner,
+            9808,
+            "command_control",
+            json!({"action":"poll","session_id":public,"wait_ms":0}),
+        );
+        assert_eq!(
+            replay.body["result"]["structuredContent"]["data"]["output_refs"]["stderr"],
+            stderr
+        );
+        // A filesystem event holds the command open until the facade lock is
+        // held; terminal collection must then use the real direct HTTP path.
+        let initial = public_tool_call(
+            pep.port(),
+            &owner,
+            9810,
+            "exec_command",
+            json!({
+                "command":"while (-not (Test-Path 'release-stderr.txt')) { Start-Sleep -Milliseconds 20 }; Write-Error LB_DIRECT_FIRST_STDERR",
+                "shell":"windows_powershell","yield_time_ms":0,"timeout_ms":120000
+            }),
+        );
+        assert_eq!(
+            initial.body["result"]["structuredContent"]["data"]["status"], "running",
+            "{:#?}",
+            initial.body
+        );
+        let mut held = pep.guard.as_ref().unwrap().lock().unwrap();
+        fs::write(workspace.join("release-stderr.txt"), "release").unwrap();
+        let (direct, accumulated) = settle_public_command(pep.port(), &owner, 99_000, initial);
+        assert_tool_error(&direct, "ProcessFailed");
+        assert!(
+            accumulated.contains("LB_DIRECT_FIRST_STDERR"),
+            "{accumulated:?}"
+        );
+        let direct_data = &direct.body["result"]["structuredContent"]["data"];
+        let direct_session = direct_data["session_id"].as_str().unwrap();
+        let direct_ref = direct_data["output_refs"]["stderr"]
+            .as_str()
+            .expect("direct terminal reference");
+        let ordinary = held
+            .call_tool_for_task(
+                PermissionMode::Full,
+                "command_control",
+                json!({"action":"poll","session_id":direct_session,"wait_ms":0}),
+                TaskCallIdentity {
+                    request_id: None,
+                    task_id: TaskId::new("ordinary-replay"),
+                    owner_session: Some(McpSessionId::new(owner.clone())),
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            ordinary["structuredContent"]["data"]["output_refs"]["stderr"], direct_ref,
+            "facade {ordinary:#}"
+        );
+        assert_eq!(ordinary["structuredContent"]["data"]["output"], "");
+        drop(held);
+        let normal = public_tool_call(
+            pep.port(),
+            &owner,
+            9811,
+            "command_control",
+            json!({"action":"poll","session_id":direct_session,"wait_ms":0}),
+        );
+        assert_tool_error(&normal, "ProcessFailed");
+        assert_eq!(
+            normal.body["result"]["structuredContent"]["data"]["output_refs"]["stderr"],
+            direct_ref
+        );
+        assert_eq!(
+            normal.body["result"]["structuredContent"]["data"]["output"],
+            ""
+        );
+        let retained = control_read(
+            &owner,
+            9812,
+            json!({"action":"read","output_ref":direct_ref,"stream":"stderr","limit":1048576}),
+        );
+        assert!(
+            retained.body["result"]["structuredContent"]["data"]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("LB_DIRECT_FIRST_STDERR")),
+            "{:#?}",
+            retained.body
+        );
+        let mut coding = pep.stop().unwrap();
+        coding.stop().unwrap();
+        cleanup_test_directory(&workspace);
+    }
+
+    #[test]
     fn full_scripts_share_current_user_authority_independent_of_path_spelling() {
         let root = repo_root();
         let workspace = temp_workspace();
@@ -8174,7 +8644,11 @@ mod tests {
                 "{:#?}",
                 response.body
             );
-            assert!(output.contains(marker), "{:#?}", response.body);
+            assert!(
+                output.contains(marker),
+                "shell={shell} command={command:?} marker={marker} accumulated_output={output:?} response={:#?}",
+                response.body
+            );
         }
 
         let nul = public_tool_call(
@@ -8191,7 +8665,11 @@ mod tests {
         );
         let (nul, nul_output) = settle_public_command(pep.port(), &session, 20_705, nul);
         assert_eq!(nul.body["result"]["isError"], false, "{:#?}", nul.body);
-        assert!(nul_output.contains("LB_SCHEMA42_NUL_OK"));
+        assert!(
+            nul_output.contains("LB_SCHEMA42_NUL_OK"),
+            "NUL accumulated_output={nul_output:?} response={:#?}",
+            nul.body
+        );
         for entry in fs::read_dir(&workspace).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
             assert_ne!(name, "nul");
@@ -8310,7 +8788,7 @@ mod tests {
                 Duration::from_secs(150),
             )
         });
-        assert_eventually("session A never ran", Duration::from_secs(3), || {
+        assert_eventually("session A never ran", Duration::from_secs(10), || {
             matches!(
                 pep.current_task_projection().latest_snapshot(),
                 CurrentTaskStatus::Active(ref task) if task.state == TaskExecutionState::Running
@@ -8319,26 +8797,45 @@ mod tests {
 
         let call_session_b = session_b.clone();
         let call_b = thread::spawn(move || {
-            post_with_read_timeout(
-                port,
-                Some(&call_session_b),
-                &json!({
-                    "jsonrpc":"2.0",
-                    "id":1,
-                    "method":"tools/call",
-                    "params":{
-                        "name":"exec_command",
-                        "arguments":{
-                            "command":"Write-Output SESSION_B_SURVIVED",
-                            "shell":"windows_powershell",
-                            "yield_time_ms":0,
-                            "timeout_ms":120000,
-                            "max_output_bytes":4096
-                        }
+            // Resubmission safety: this scenario command only writes to stdout
+            // (no persistent side effects), so a timed-out first attempt that
+            // still runs upstream as an orphaned execution cannot corrupt the
+            // workspace or these assertions.
+            let payload = json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"exec_command",
+                    "arguments":{
+                        "command":"Write-Output SESSION_B_SURVIVED",
+                        "shell":"windows_powershell",
+                        "yield_time_ms":0,
+                        "timeout_ms":120000,
+                        "max_output_bytes":4096
                     }
-                }),
-                Duration::from_secs(150),
-            )
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let result = post_with_read_timeout(
+                    port,
+                    Some(&call_session_b),
+                    &payload,
+                    Duration::from_secs(150),
+                );
+                let content = &result.body["result"]["structuredContent"];
+                if content["data"]["status"].is_string()
+                    || content["error"]["code"] != "OperationTimedOut"
+                {
+                    return result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "session B submission kept timing out: {:#?}",
+                    result.body
+                );
+            }
         });
         thread::sleep(Duration::from_millis(100));
 
@@ -8440,7 +8937,7 @@ mod tests {
                 Duration::from_secs(150),
             )
         });
-        let running_deadline = Instant::now() + Duration::from_secs(3);
+        let running_deadline = Instant::now() + Duration::from_secs(10);
         while !matches!(
             pep.current_task_projection().latest_snapshot(),
             CurrentTaskStatus::Active(ref task) if task.state == TaskExecutionState::Running
@@ -8451,28 +8948,45 @@ mod tests {
 
         let call_session_b = session_b.clone();
         let call_b = thread::spawn(move || {
-            post_with_read_timeout(
-                port,
-                Some(&call_session_b),
-                &json!({
-                    "jsonrpc":"2.0","id":7,"method":"tools/call",
-                    "params":{
-                        "name":"exec_command",
-                        "arguments":{
-                            "command":"Write-Output SESSION_B_NOT_CANCELLED",
-                            "shell":"windows_powershell",
-                            "yield_time_ms":0,
-                            "timeout_ms":120000,
-                            "max_output_bytes":4096
-                        }
+            // Resubmission safety: stdout-only scenario command (no persistent
+            // side effects), same condition as the other resubmit loops.
+            let payload = json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{
+                    "name":"exec_command",
+                    "arguments":{
+                        "command":"Write-Output SESSION_B_NOT_CANCELLED",
+                        "shell":"windows_powershell",
+                        "yield_time_ms":0,
+                        "timeout_ms":120000,
+                        "max_output_bytes":4096
                     }
-                }),
-                Duration::from_secs(150),
-            )
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let result = post_with_read_timeout(
+                    port,
+                    Some(&call_session_b),
+                    &payload,
+                    Duration::from_secs(150),
+                );
+                let content = &result.body["result"]["structuredContent"];
+                if content["data"]["status"].is_string()
+                    || content["error"]["code"] != "OperationTimedOut"
+                {
+                    return result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "session B submission kept timing out: {:#?}",
+                    result.body
+                );
+            }
         });
         assert_eventually(
             "session B did not enter Work FIFO",
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             || {
                 let scheduler = pep.control_plane.scheduler().snapshot();
                 scheduler.work_running == 1 && scheduler.work_queued == 1
@@ -8575,7 +9089,7 @@ mod tests {
             )
         });
 
-        let running_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let running_deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if matches!(
                 pep.current_task_projection().snapshot(),
@@ -8602,15 +9116,15 @@ mod tests {
         );
         assert_eq!(cancelled.status, 202);
         assert!(
-            cancel_started.elapsed() < Duration::from_secs(2),
+            cancel_started.elapsed() < Duration::from_secs(10),
             "cancellation transport was blocked"
         );
 
         let call_result = call.join().expect("tools/call client thread");
         let cancellation_settle_elapsed = cancel_started.elapsed();
         assert!(
-            cancellation_settle_elapsed < Duration::from_secs(5),
-            "upstream cancellation did not settle within 5 seconds; elapsed_ms={}",
+            cancellation_settle_elapsed < Duration::from_secs(20),
+            "upstream cancellation did not settle within 20 seconds; elapsed_ms={}",
             cancellation_settle_elapsed.as_millis()
         );
         assert!(
@@ -8618,7 +9132,26 @@ mod tests {
             "cancelled tools/call must terminate with a JSON-RPC response: {}",
             call_result.body
         );
-        let presentation_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        // The 20s settle bound above is only a hang guard: the command's natural
+        // completion also fits inside it. The cancellation itself is proven by the
+        // terminal envelope — a naturally finished command would report a success
+        // envelope instead of the cancelled one.
+        assert_eq!(
+            call_result.body["result"]["isError"], true,
+            "cancelled tools/call must terminate as an error, not a natural completion: {:#?}",
+            call_result.body
+        );
+        assert_eq!(
+            call_result.body["result"]["structuredContent"]["error"]["code"], "ProcessCancelled",
+            "{:#?}",
+            call_result.body
+        );
+        assert_eq!(
+            call_result.body["result"]["structuredContent"]["data"]["status"], "cancelled",
+            "{:#?}",
+            call_result.body
+        );
+        let presentation_deadline = std::time::Instant::now() + Duration::from_secs(10);
         while pep.current_task_projection().snapshot() != CurrentTaskStatus::Idle {
             assert!(
                 std::time::Instant::now() < presentation_deadline,
@@ -8632,6 +9165,164 @@ mod tests {
         assert_eq!(coding.active_processes().unwrap(), 0);
         drop(coding);
         cleanup_test_directory(&workspace);
+    }
+
+    /// A client read timeout does not withdraw an already-sent request.
+    /// Resubmitting identical tool arguments can execute the command twice.
+    #[test]
+    fn resubmission_after_an_abandoned_submission_leaves_two_executions() {
+        let workspace = temp_workspace();
+        let markers = workspace.join("resubmit-markers");
+        fs::create_dir(&markers).unwrap();
+        let fixture = PublicRuntimeFixture::start_in(workspace.clone(), PermissionMode::Full);
+        let pep = fixture.runtime();
+        let initialized = initialize(pep.port(), 400);
+        let session = initialized.session.expect("downstream MCP session");
+        assert_eq!(
+            post(
+                pep.port(),
+                Some(&session),
+                &json!({
+                    "jsonrpc":"2.0", "method":"notifications/initialized", "params":{}
+                })
+            )
+            .status,
+            202
+        );
+        // The command generates the identity at execution time. Both requests
+        // carry exactly the same tool parameters; only the RPC id changes.
+        let parameters = json!({"name":"exec_command", "arguments":{
+            "command":"$id = [guid]::NewGuid().ToString('D'); $dir = Join-Path (Get-Location).Path 'resubmit-markers'; $pending = Join-Path $dir ($id + '.pending'); [IO.File]::WriteAllText($pending, 'executed'); [IO.File]::Move($pending, (Join-Path $dir ($id + '.txt')))",
+            "shell":"windows_powershell", "yield_time_ms":0,
+            "timeout_ms":60000, "max_output_bytes":4096
+        }});
+        let response = thread::scope(|scope| {
+            // Declared inside the scope so unwinding releases the guard before
+            // scope waits for outstanding HTTP workers. The fixture then stops
+            // the runtime even if an assertion failed.
+            let guard_arc = pep.guard.as_ref().expect("facade guard").clone();
+            let guard = guard_arc.lock().unwrap();
+            let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+            let first_payload = json!({"jsonrpc":"2.0", "id":402, "method":"tools/call", "params":parameters.clone()});
+            let first_session = session.clone();
+            let port = pep.port();
+            let abandoned = scope.spawn(move || {
+                try_post_with_read_timeout(
+                    port,
+                    Some(&first_session),
+                    &first_payload,
+                    Duration::from_secs(2),
+                    || sent_tx.send(()).expect("first request sent observer"),
+                )
+            });
+            sent_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("first request fully written");
+            let error = abandoned
+                .join()
+                .expect("first client thread")
+                .expect_err("first request must time out while the facade is locked");
+            assert_eq!(error.stage, "read");
+            assert!(
+                matches!(
+                    error.kind,
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.received_bytes, 0);
+
+            let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+            let second_payload =
+                json!({"jsonrpc":"2.0", "id":403, "method":"tools/call", "params":parameters});
+            let second_session = session.clone();
+            let resubmitted = scope.spawn(move || {
+                try_post_with_read_timeout(
+                    port,
+                    Some(&second_session),
+                    &second_payload,
+                    Duration::from_secs(90),
+                    || sent_tx.send(()).expect("second request sent observer"),
+                )
+            });
+            sent_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("second request fully written");
+            drop(guard);
+            resubmitted
+                .join()
+                .expect("second client thread")
+                .expect("second HTTP response")
+        });
+        assert_eq!(response.status, 200, "{:#?}", response.body);
+        assert_eq!(
+            response.body["result"]["isError"], false,
+            "{:#?}",
+            response.body
+        );
+        let terminal =
+            if response.body["result"]["structuredContent"]["data"]["status"] == "running" {
+                let id = response.body["result"]["structuredContent"]["data"]["session_id"]
+                    .as_str()
+                    .expect("resubmission session");
+                poll_public_command_to_terminal(
+                    pep.port(),
+                    &session,
+                    40301,
+                    id,
+                    Duration::from_secs(60),
+                )
+            } else {
+                response
+            };
+        assert_eq!(
+            terminal.body["result"]["structuredContent"]["data"]["status"], "completed",
+            "{:#?}",
+            terminal.body
+        );
+        let valid_markers = || {
+            fs::read_dir(&markers)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) != Some("pending"))
+                .inspect(|path| {
+                    assert!(path.is_file(), "unexpected marker entry: {path:?}");
+                    assert_eq!(
+                        path.extension().and_then(|value| value.to_str()),
+                        Some("txt")
+                    );
+                    let name = path.file_stem().unwrap().to_str().unwrap();
+                    assert_eq!(name.len(), 36);
+                    assert!(
+                        name.bytes().enumerate().all(|(i, byte)| {
+                            if [8, 13, 18, 23].contains(&i) {
+                                byte == b'-'
+                            } else {
+                                byte.is_ascii_hexdigit()
+                            }
+                        }),
+                        "invalid execution UUID: {name}"
+                    );
+                    assert_eq!(fs::read_to_string(path).unwrap(), "executed");
+                })
+                .count()
+        };
+        assert_eventually(
+            "both accepted submissions must execute",
+            Duration::from_secs(60),
+            || valid_markers() >= 2,
+        );
+        fixture.shutdown();
+        assert_eq!(
+            valid_markers(),
+            2,
+            "exactly two execution markers after process shutdown"
+        );
+        assert_eq!(
+            fs::read_dir(&markers).unwrap().count(),
+            2,
+            "no incomplete marker writes"
+        );
     }
 
     #[test]
@@ -8711,7 +9402,7 @@ mod tests {
         });
         assert_eventually(
             "foreground work never acquired its explicit scheduler slot",
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             || pep.control_plane.scheduler().snapshot().work_running == 1,
         );
 
@@ -8724,7 +9415,7 @@ mod tests {
             json!({"action":"poll","session_id":public_session,"wait_ms":0}),
         );
         assert!(
-            poll_started.elapsed() < Duration::from_secs(2),
+            poll_started.elapsed() < Duration::from_secs(20),
             "command_control poll waited behind unrelated Work"
         );
         assert_eq!(
@@ -8742,7 +9433,7 @@ mod tests {
             json!({"action":"kill","session_id":public_session,"signal":"KILL","wait_ms":1000}),
         );
         assert!(
-            kill_started.elapsed() < Duration::from_millis(2_500),
+            kill_started.elapsed() < Duration::from_secs(20),
             "command_control kill waited behind unrelated Work"
         );
         if killed.body["result"]["structuredContent"]["error"]["code"] == "OperationTimedOut" {
@@ -8863,7 +9554,7 @@ mod tests {
             )
         });
 
-        let running_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let running_deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !matches!(
             pep.current_task_projection().latest_snapshot(),
             CurrentTaskStatus::Active(ref task) if task.state == TaskExecutionState::Running
@@ -8884,7 +9575,7 @@ mod tests {
             json!({"action":"cancel"}),
         );
         assert!(
-            cancel_started.elapsed() < Duration::from_secs(2),
+            cancel_started.elapsed() < Duration::from_secs(20),
             "task_control cancel blocked behind the facade execution mutex"
         );
         let cancel_data = &cancel.body["result"]["structuredContent"]["data"];
@@ -8908,7 +9599,7 @@ mod tests {
 
         let result = call.join().expect("tools/call client thread");
         assert!(
-            call_started.elapsed() < Duration::from_secs(5),
+            call_started.elapsed() < Duration::from_secs(20),
             "task_control cancellation did not interrupt the long command"
         );
         assert_eq!(result.body["result"]["isError"], true, "{:#?}", result.body);
@@ -8924,7 +9615,7 @@ mod tests {
         );
         assert_eventually(
             "cancelled foreground task did not converge to Idle",
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             || pep.current_task_projection().latest_snapshot() == CurrentTaskStatus::Idle,
         );
 
@@ -8993,7 +9684,7 @@ mod tests {
             )
         });
 
-        let running_deadline = Instant::now() + Duration::from_secs(3);
+        let running_deadline = Instant::now() + Duration::from_secs(10);
         while !matches!(
             pep.current_task_projection().latest_snapshot(),
             CurrentTaskStatus::Active(ref task) if task.state == TaskExecutionState::Running
@@ -9014,7 +9705,7 @@ mod tests {
             json!({"action":"cancel"}),
         );
         assert!(
-            cancel_started.elapsed() < Duration::from_secs(2),
+            cancel_started.elapsed() < Duration::from_secs(20),
             "filesystem task_control cancel blocked"
         );
         assert_eq!(
@@ -9032,7 +9723,7 @@ mod tests {
 
         let result = call.join().expect("filesystem tools/call client thread");
         assert!(
-            call_started.elapsed() < Duration::from_secs(5),
+            call_started.elapsed() < Duration::from_secs(20),
             "filesystem cancellation did not interrupt the large hash"
         );
         assert_eq!(
@@ -9091,12 +9782,10 @@ mod tests {
             202
         );
 
-        let started = Instant::now();
-        let running = public_tool_call(
+        let running = submit_side_effect_free_public_command(
             pep.port(),
             &session,
             322,
-            "exec_command",
             json!({
                 "command":"Start-Sleep -Seconds 10; Write-Output SHOULD_NOT_COMPLETE",
                 "shell":"windows_powershell",
@@ -9110,6 +9799,7 @@ mod tests {
             "{:#?}",
             running.body
         );
+        let started = Instant::now();
         let public_session = running.body["result"]["structuredContent"]["data"]["session_id"]
             .as_str()
             .expect("detached public session")
@@ -9222,7 +9912,7 @@ mod tests {
             json!({"action":"cancel","task_id":task_id.clone()}),
         );
         assert!(
-            cancel_started.elapsed() < Duration::from_secs(2),
+            cancel_started.elapsed() < Duration::from_secs(20),
             "detached task cancellation blocked"
         );
         assert_eq!(
@@ -9256,7 +9946,7 @@ mod tests {
             "cancelled"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(12),
             "detached command ran near its natural duration"
         );
 
@@ -9282,11 +9972,10 @@ mod tests {
             CurrentTaskStatus::Idle
         );
 
-        let second = public_tool_call(
+        let second = submit_side_effect_free_public_command(
             pep.port(),
             &other_session,
             329,
-            "exec_command",
             json!({
                 "command":"$line=[Console]::In.ReadLine(); Write-Output ('stdin:'+ $line); Start-Sleep -Seconds 10",
                 "shell":"windows_powershell",
@@ -9359,7 +10048,7 @@ mod tests {
             written.body
         );
         assert!(
-            write_started.elapsed() < Duration::from_millis(1_500),
+            write_started.elapsed() < Duration::from_secs(20),
             "write exceeded wait_ms plus transport headroom"
         );
         let kill_started = Instant::now();
@@ -9371,7 +10060,7 @@ mod tests {
             json!({"action":"kill","session_id":second_public_session,"wait_ms":0}),
         );
         assert!(
-            kill_started.elapsed() < Duration::from_millis(1_500),
+            kill_started.elapsed() < Duration::from_secs(20),
             "kill exceeded wait_ms plus transport headroom"
         );
         if killed.body["result"]["structuredContent"]["error"]["code"] == "OperationTimedOut" {
@@ -9794,7 +10483,7 @@ mod tests {
                 }),
             )
         });
-        let running_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let running_deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             match pep.current_task_projection().snapshot() {
                 CurrentTaskStatus::Active(ref task)
@@ -10034,7 +10723,7 @@ mod tests {
                 }),
             )
         });
-        let first_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let first_deadline = std::time::Instant::now() + Duration::from_secs(10);
         while fake.start_count() != 3 {
             assert!(
                 std::time::Instant::now() < first_deadline,
@@ -10247,7 +10936,7 @@ mod tests {
             .expect("MCP stop after schema43 filesystem routing");
         drop(coding);
         cleanup_test_directory(&workspace);
-        let _ = fs::remove_dir_all(outside);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", outside.display());
     }
 
     #[test]

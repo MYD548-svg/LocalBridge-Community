@@ -491,7 +491,7 @@ mod tests {
             plan.windows(2)
                 .all(|pair| pair[0].priority <= pair[1].priority)
         );
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -521,7 +521,7 @@ mod tests {
                 && step.kind == "changed_file_targeted"
                 && step.evidence.contains("a.ts")
         }));
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -540,6 +540,6 @@ mod tests {
         );
         assert!(!plan.iter().any(|step| step.command == "npm test"));
         assert!(!plan.iter().any(|step| step.command == "cargo test"));
-        let _ = fs::remove_dir_all(root);
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 }

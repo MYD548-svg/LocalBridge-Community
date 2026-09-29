@@ -245,6 +245,7 @@ impl RuntimeCommandControl for McpCancellationClient {
             }
         };
         Ok(RuntimeCommandObservation {
+            output_refs: runtime_output_references(structured)?,
             status,
             exit_code,
             signal: structured
@@ -263,8 +264,54 @@ impl RuntimeCommandControl for McpCancellationClient {
                 .unwrap_or_default()
                 .to_string(),
             truncated: structured.get("truncated").and_then(Value::as_bool),
+            output_incomplete: structured
+                .get("warnings")
+                .and_then(Value::as_array)
+                .is_some_and(|warnings| {
+                    warnings.iter().any(|warning| {
+                        warning.as_str()
+                            == Some(crate::control_plane::command_output::INCOMPLETE_COMMAND_OUTPUT)
+                    })
+                }),
         })
     }
+}
+
+pub(crate) fn runtime_output_references(
+    structured: &serde_json::Map<String, Value>,
+) -> Result<crate::execution::output_handles::OutputReferences, RuntimeCommandControlError> {
+    use crate::execution::output_handles::OutputReferences;
+    let token = |value: Option<&Value>| -> Result<Option<String>, RuntimeCommandControlError> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+            _ => Err(RuntimeCommandControlError::CapabilityMismatch),
+        }
+    };
+    let streams = match structured.get("output_refs") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(value)) => Some(value),
+        _ => return Err(RuntimeCommandControlError::CapabilityMismatch),
+    };
+    let mut refs = OutputReferences {
+        primary: token(structured.get("output_ref"))?,
+        stdout: token(streams.and_then(|value| value.get("stdout")))?,
+        stderr: token(streams.and_then(|value| value.get("stderr")))?,
+    };
+    if let Some(primary) = &refs.primary {
+        if refs.stdout.as_ref() != Some(primary) && refs.stderr.as_ref() != Some(primary) {
+            match structured
+                .get("output_stream")
+                .and_then(Value::as_str)
+                .unwrap_or("stdout")
+            {
+                "stdout" if refs.stdout.is_none() => refs.stdout = Some(primary.clone()),
+                "stderr" if refs.stderr.is_none() => refs.stderr = Some(primary.clone()),
+                _ => return Err(RuntimeCommandControlError::CapabilityMismatch),
+            }
+        }
+    }
+    Ok(refs)
 }
 
 fn map_command_transport_error(error: CodingToolsRuntimeError) -> RuntimeCommandControlError {
@@ -852,5 +899,42 @@ mod tests {
             "the upstream call consumed the public response headroom"
         );
         server.join().unwrap();
+    }
+    #[test]
+    fn output_reference_decoder_preserves_primary_stream_and_rejects_malformed_values() {
+        for (stream, raw) in [
+            (
+                "stdout",
+                json!({"output_ref":"out","output_refs":{"stdout":"out"}}),
+            ),
+            (
+                "stderr",
+                json!({"output_ref":"err","output_stream":"stderr"}),
+            ),
+            (
+                "stderr",
+                json!({"output_ref":"err","output_refs":{"stdout":"out","stderr":"err"}}),
+            ),
+        ] {
+            let parsed = runtime_output_references(raw.as_object().unwrap()).unwrap();
+            assert_eq!(
+                parsed.primary,
+                if stream == "stderr" {
+                    parsed.stderr
+                } else {
+                    parsed.stdout
+                }
+            );
+        }
+        for raw in [
+            json!({"output_refs":[]}),
+            json!({"output_refs":{"stderr":3}}),
+            json!({"output_ref":"unknown","output_refs":{"stdout":"out","stderr":"err"}}),
+        ] {
+            assert_eq!(
+                runtime_output_references(raw.as_object().unwrap()),
+                Err(RuntimeCommandControlError::CapabilityMismatch)
+            );
+        }
     }
 }

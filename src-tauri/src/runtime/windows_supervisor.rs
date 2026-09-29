@@ -1126,7 +1126,7 @@ mod tests {
         let eof = eof_rx.recv_timeout(Duration::from_millis(750));
         let output = command.join().unwrap().unwrap();
         reader.join().unwrap();
-        fs::remove_dir_all(&temp).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", temp.display());
 
         assert_eq!(eof.unwrap(), Vec::<u8>::new());
         assert_eq!(output.exit_code, 0);

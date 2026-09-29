@@ -2308,6 +2308,10 @@ class Runtime:
                 pty_master_fd=pty_master_fd,
                 output_encoding=output_encoding,
             )
+            # Publish only after both readers and the watchdog are installed:
+            # pruning a fast-exiting command must not see an empty reader set.
+            start_reader_threads(session)
+            start_session_watchdog(session)
             with self.sessions_lock:
                 self.starting_sessions -= 1
                 slot_released = True
@@ -2341,8 +2345,6 @@ class Runtime:
                     self.request_sessions[request_id] = session.session_id
         if cancel_after_registration:
             self.cancel_session(session.session_id)
-        start_reader_threads(session)
-        start_session_watchdog(session)
         if stdin_text:
             try:
                 session.write_input(stdin_text.encode("utf-8"))
@@ -2651,12 +2653,13 @@ class Runtime:
 
     def _complete_session(self, session: ExecSession) -> RetainedExecOutput | None:
         session.refresh_status()
-        if session.process.poll() is None:
+        if not session.closed:
             return None
         retained = RetainedExecOutput.capture(session, self.sessions_lock)
         with self.sessions_lock:
-            self.sessions.pop(session.session_id, None)
-            self.output_sessions.pop(session.session_id, None)
+            if self.sessions.get(session.session_id) is not session:
+                return retained
+            self.sessions.pop(session.session_id)
             self.output_sessions[session.session_id] = retained
             self._evict_retained_locked()
         return retained
@@ -2666,7 +2669,7 @@ class Runtime:
             active = list(self.sessions.values())
         for session in active:
             session.refresh_status()
-            if session.process.poll() is not None:
+            if session.closed:
                 self._complete_session(session)
         cutoff = time.time() - COMPLETED_SESSION_TTL_SECONDS
         with self.sessions_lock:
@@ -2945,6 +2948,10 @@ class Runtime:
             status = "exited"
         signal_sent = "SIGKILL" if force else signal.Signals(signum).name
         payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
+        if not session.closed:
+            # Keep unread output reachable even after the process has exited.
+            evict = False
+            status = "terminating" if session.process.poll() is None else "running"
         payload.update({"killed": killed, "status": status, "evicted": evict, "signal_sent": signal_sent})
         payload = self._format_session_output(session, payload, args)
         if status == "terminating":

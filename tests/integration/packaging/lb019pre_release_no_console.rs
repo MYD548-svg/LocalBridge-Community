@@ -124,7 +124,7 @@ fn assert_release_launch_no_console(executable: &Path, background: bool, label: 
     assert_no_visible_descendant_windows(label, child.id());
     let _ = child.kill();
     let _ = child.wait();
-    let _ = fs::remove_dir_all(data_root);
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", data_root.display());
 }
 
 fn coding_config(workspace: &Path) -> CodingToolsRuntimeConfig {
@@ -250,7 +250,7 @@ fn schema43_release_no_console_behavior_covers_all_required_scenarios() {
         .expect("kill managed command probe");
     println!("NO_CONSOLE_SCENARIO managed_shell_or_direct_command_child=PASS");
     runtime.stop().unwrap();
-    fs::remove_dir_all(&workspace).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", workspace.display());
 
     // 2. Explicit background launch is exercised on the actual release GUI.
     assert_release_launch_no_console(&release, true, "background_launch");
@@ -271,7 +271,10 @@ fn schema43_release_no_console_behavior_covers_all_required_scenarios() {
         recovered.process_snapshot().pid,
     );
     recovered.stop().unwrap();
-    fs::remove_dir_all(&recovery_workspace).unwrap();
+    eprintln!(
+        "TEST_WORKSPACE_RETAINED path={}",
+        recovery_workspace.display()
+    );
     println!("NO_CONSOLE_SCENARIO runtime_restart_or_recovery=PASS");
 
     // 4. Tunnel reconnect exercises TunnelRestartPrimitive and actually spawns
@@ -300,7 +303,7 @@ fn schema43_release_no_console_behavior_covers_all_required_scenarios() {
     let _ = release_control_plane.send(());
     tunnel.stop().unwrap();
     control_plane_thread.join().unwrap();
-    fs::remove_dir_all(&health_dir).unwrap();
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", health_dir.display());
     println!("NO_CONSOLE_SCENARIO tunnel_reconnect=PASS");
 
     // 5. Login autostart uses the exact production `--background` command-line

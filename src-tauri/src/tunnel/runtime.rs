@@ -79,6 +79,8 @@ pub struct PreparedTunnelStart {
     secret: SecretString,
     mcp_guard_bearer: Option<SecretString>,
     health_url_file: PathBuf,
+    #[cfg(test)]
+    isolate_probe_environment: bool,
 }
 
 impl fmt::Debug for PreparedTunnelStart {
@@ -119,6 +121,8 @@ impl PreparedTunnelStart {
             secret,
             mcp_guard_bearer: None,
             health_url_file,
+            #[cfg(test)]
+            isolate_probe_environment: false,
         })
     }
 
@@ -184,6 +188,22 @@ impl PreparedTunnelStart {
             );
         for key in REMOVED_PARENT_ENV {
             spec = spec.env_remove(key).map_err(classify_supervisor)?;
+        }
+        #[cfg(test)]
+        if self.isolate_probe_environment {
+            for key in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                spec = spec.env_remove(key).map_err(classify_supervisor)?;
+            }
+            spec = spec
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .map_err(classify_supervisor)?;
         }
         spec = spec
             .env(API_KEY_ENV, self.secret.expose_secret())
@@ -622,7 +642,7 @@ mod tests {
         ));
         let health_dir = prepared.config.health_state_dir.clone();
         drop(prepared);
-        fs::remove_dir_all(health_dir).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", health_dir.display());
     }
 
     #[test]
@@ -684,7 +704,10 @@ mod tests {
             Err(TunnelError::RestartDenied)
         ));
         assert_eq!(store.reads(), 2);
-        fs::remove_dir_all(base.health_state_dir).unwrap();
+        eprintln!(
+            "TEST_WORKSPACE_RETAINED path={}",
+            base.health_state_dir.display()
+        );
     }
 
     #[test]
@@ -708,7 +731,187 @@ mod tests {
             "non-recoverable credential/configuration faults must not reread the secret"
         );
         if base.health_state_dir.exists() {
-            fs::remove_dir_all(base.health_state_dir).unwrap();
+            eprintln!(
+                "TEST_WORKSPACE_RETAINED path={}",
+                base.health_state_dir.display()
+            );
+        }
+    }
+
+    // Only redacted facts cross the probe channel, never raw requests or credentials.
+    #[derive(Debug)]
+    struct ProbeObservation {
+        method: String,
+        path: String,
+        has_authorization: bool,
+        matches_authorization: bool,
+        initialized: bool,
+    }
+
+    fn observe_probe_request(request: &str, initialized: bool) -> ProbeObservation {
+        let mut start = request
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace();
+        ProbeObservation {
+            method: start.next().unwrap_or_default().to_owned(),
+            path: start.next().unwrap_or_default().to_owned(),
+            has_authorization: request
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            matches_authorization: request_has_authorization(
+                request,
+                &format!("Bearer {SECRET_TWO}"),
+            ),
+            initialized,
+        }
+    }
+
+    // Startup traffic from the real client is concurrent: the oauth module's
+    // WWW-Authenticate probe (POST then GET on the MCP URL, 1s deadline), the
+    // RFC 9728 discovery GETs and the mcpclient initialize POST (2s deadline)
+    // share one keep-alive HTTP client (tunnel-client pkg/oauth module.go and
+    // pkg/mcpclient fxmodule.go). Serving connections serially stalls past
+    // those deadlines and the client abandons the initialize, so every
+    // connection is handled on its own thread. A real server also never
+    // answers a connection that has not produced a request: the Go transport
+    // can leave a dialed connection idle, and an unsolicited response here
+    // races the client writing its first request on that connection, which
+    // silently swallows the MCP initialize (connectStartupProbe wraps that
+    // transport failure as ErrRejected and the client never retries it).
+    // Connections without a request are therefore waited on or closed
+    // silently, exactly like an idle keep-alive connection. Like the
+    // production Guard, each connection then stays alive and serves further
+    // requests: closing after one response leaves a window where the client
+    // writes its next request onto the closing connection, and that swallowed
+    // initialize is never retried either.
+    fn serve_probe_connection(
+        mut stream: std::net::TcpStream,
+        request_tx: mpsc::Sender<ProbeObservation>,
+    ) {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+        let idle_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut bytes = Vec::new();
+            let mut byte = [0_u8; 1];
+            while bytes.len() < 32_768 && !bytes.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) => return, // peer closed: close silently
+                    Ok(_) => bytes.push(byte[0]),
+                    Err(_) if Instant::now() < idle_deadline => {} // idle: keep waiting
+                    Err(_) => return,                              // idle past deadline: close
+                }
+            }
+            let headers = String::from_utf8_lossy(&bytes);
+            let length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if length > 65_536 {
+                return;
+            }
+            let mut body = vec![0_u8; length];
+            let mut body_read = 0;
+            while body_read < length {
+                match stream.read(&mut body[body_read..]) {
+                    Ok(0) => return,
+                    Ok(count) => body_read += count,
+                    Err(_) if Instant::now() < idle_deadline => {}
+                    Err(_) => return,
+                }
+            }
+            let message: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let initialize = message["method"] == "initialize";
+            let observation = observe_probe_request(&headers, initialize);
+            let session = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("mcp-session-id")
+                    .then(|| value.trim().to_owned())
+            });
+            // Mirror the production Guard contract (mcp/server.rs): a sessionless
+            // GET /mcp is rejected with 400 session_id_required, initialize and
+            // tools/list responses carry Mcp-Session-Id, and the negotiated
+            // protocol version is echoed from the client request.
+            let (status, content_type, response, session_id) = if observation.path != "/mcp" {
+                (
+                    "404 Not Found",
+                    "application/json",
+                    serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"endpoint_not_found","http_status":404}}).to_string(),
+                    None,
+                )
+            } else if !observation.matches_authorization {
+                (
+                    "401 Unauthorized",
+                    "application/json",
+                    serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"client_authentication_required","http_status":401}}).to_string(),
+                    None,
+                )
+            } else if observation.method == "GET" {
+                match session {
+                    Some(_) => ("204 No Content", "", String::new(), None),
+                    None => (
+                        "400 Bad Request",
+                        "application/json",
+                        serde_json::json!({"error":{"error_code":"InvalidRequest","phase":"mcp","cause":"session_id_required","http_status":400}}).to_string(),
+                        None,
+                    ),
+                }
+            } else if initialize {
+                (
+                    "200 OK",
+                    "application/json",
+                    serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":{
+                        "protocolVersion":message["params"]["protocolVersion"].as_str().unwrap_or("2025-11-25"),
+                        "capabilities":{"tools":{}},
+                        "serverInfo":{"name":"localbridge-ci-probe", "version":"1"}
+                    }})
+                    .to_string(),
+                    Some("localbridge-probe-session"),
+                )
+            } else if message["method"] == "tools/list" {
+                (
+                    "200 OK",
+                    "application/json",
+                    serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":{"tools":[]}})
+                        .to_string(),
+                    Some("localbridge-probe-session"),
+                )
+            } else {
+                ("202 Accepted", "", String::new(), None)
+            };
+            let mut head = format!("HTTP/1.1 {status}\r\n");
+            if !content_type.is_empty() {
+                head.push_str(&format!("Content-Type: {content_type}\r\n"));
+            }
+            if let Some(id) = session_id {
+                head.push_str(&format!("Mcp-Session-Id: {id}\r\n"));
+            }
+            head.push_str(&format!("Content-Length: {}\r\n\r\n", response.len()));
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(response.as_bytes());
+            let _ = request_tx.send(observation);
+        }
+    }
+
+    #[test]
+    fn probe_observations_distinguish_routes_and_redact_authorization() {
+        for token in [None, Some("wrong"), Some(SECRET_TWO)] {
+            let header = token
+                .map(|value| format!("Authorization: Bearer {value}\r\n"))
+                .unwrap_or_default();
+            for path in ["/.well-known/oauth-protected-resource", "/mcp"] {
+                let observation =
+                    observe_probe_request(&format!("POST {path} HTTP/1.1\r\n{header}\r\n"), false);
+                assert_eq!(observation.path, path);
+                assert_eq!(observation.matches_authorization, token == Some(SECRET_TWO));
+                assert_eq!(observation.has_authorization, token.is_some());
+                assert!(!format!("{observation:?}").contains(SECRET_TWO));
+            }
         }
     }
 
@@ -718,26 +921,16 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (request_tx, request_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
         let probe = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut bytes = Vec::new();
-                    let mut byte = [0_u8; 1];
-                    while bytes.len() < 32_768 && !bytes.ends_with(b"\r\n\r\n") {
-                        if stream.read(&mut byte).unwrap_or(0) == 0 {
-                            break;
-                        }
-                        bytes.push(byte[0]);
-                    }
-                    let _ = request_tx.send(String::from_utf8_lossy(&bytes).into_owned());
-                    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                    return;
-                }
-                thread::sleep(Duration::from_millis(10));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline && stop_rx.try_recv().is_err() {
+                let Ok((stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let connection_tx = request_tx.clone();
+                thread::spawn(move || serve_probe_connection(stream, connection_tx));
             }
         });
         let config = TunnelRuntimeConfig::new(
@@ -749,27 +942,90 @@ mod tests {
         .unwrap()
         .with_test_control_plane_base_url("http://127.0.0.1:9")
         .unwrap();
-        let health_dir = config.health_state_dir.clone();
-        let prepared = PreparedTunnelStart::prepare(config, &FakeStore::new([Some(SECRET_ONE)]))
-            .unwrap()
-            .with_mcp_guard_bearer(SecretString::new(SECRET_TWO).unwrap());
+        let prepared = PreparedTunnelStart::prepare(config, &FakeStore::new([Some(SECRET_ONE)]));
+        let mut observations = Vec::new();
+        let mut failure = None;
+        let mut initialized = false;
+        match prepared {
+            Ok(mut prepared) => {
+                prepared.mcp_guard_bearer = Some(SecretString::new(SECRET_TWO).unwrap());
+                prepared.isolate_probe_environment = true;
+                match prepared.spawn() {
+                    Ok(mut runtime) => {
+                        // Runner variance (cold cache, real-time scanning) delays
+                        // client startup far more than the assertions below; the
+                        // window only bounds how long the probe collects facts.
+                        let deadline = Instant::now() + Duration::from_secs(30);
+                        while Instant::now() < deadline {
+                            match request_rx.recv_timeout(Duration::from_millis(100)) {
+                                Ok(observation) => {
+                                    let bad = observation.path == "/mcp"
+                                        && !observation.matches_authorization;
+                                    initialized |= observation.path == "/mcp"
+                                        && observation.initialized
+                                        && observation.matches_authorization;
+                                    observations.push(observation);
+                                    if bad {
+                                        failure =
+                                            Some("MCP request authentication mismatch".to_string());
+                                        break;
+                                    }
+                                    if initialized
+                                        && observations
+                                            .iter()
+                                            .any(|item| item.path == "/mcp" && !item.initialized)
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            }
+                            match runtime.supervisor.root_is_running() {
+                                Ok(true) => {}
+                                state => {
+                                    failure = Some(format!(
+                                        "Tunnel exited before probe completed: {state:?}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        let process = runtime.supervisor.snapshot();
+                        eprintln!("Tunnel probe process: {process:?}");
+                        if let Err(error) = runtime.stop() {
+                            failure = Some(format!("Tunnel stop failed: {error:?}"));
+                        }
+                    }
+                    Err(error) => failure = Some(format!("Tunnel spawn failed: {error:?}")),
+                }
+            }
+            Err(error) => failure = Some(format!("Tunnel prepare failed: {error:?}")),
+        }
+        let _ = stop_tx.send(());
+        let joined = probe.join();
+        observations.extend(request_rx.try_iter());
+        assert!(joined.is_ok(), "probe server failed");
         assert!(
-            !prepared
-                .command_line_arguments()
-                .join(" ")
-                .contains(SECRET_TWO)
+            failure.is_none(),
+            "{failure:?}; observations={observations:?}"
         );
-        assert!(!format!("{prepared:?}").contains(SECRET_TWO));
-        let mut runtime = prepared.spawn().unwrap();
-        let received = request_rx.recv_timeout(Duration::from_secs(10));
-        runtime.stop().unwrap();
-        probe.join().unwrap();
-        fs::remove_dir_all(health_dir).unwrap();
-        let request = received.expect("real tunnel binary must probe its local MCP target");
-        let expected_value = format!("Bearer {SECRET_TWO}");
         assert!(
-            request_has_authorization(&request, &expected_value),
-            "real tunnel binary omitted the authenticated MCP header"
+            initialized,
+            "no authenticated MCP initialization before deadline; observations={observations:?}"
+        );
+        assert!(
+            observations
+                .iter()
+                .filter(|item| item.path == "/mcp")
+                .all(|item| item.matches_authorization),
+            "MCP authentication mismatch; observations={observations:?}"
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|item| item.path == "/mcp" && item.method == "POST"),
+            "no MCP POST observed"
         );
     }
 
@@ -805,6 +1061,6 @@ mod tests {
         assert_eq!(runtime.active_processes().unwrap(), 0);
         drop(runtime);
         control_plane_thread.join().unwrap();
-        fs::remove_dir_all(health_dir).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", health_dir.display());
     }
 }

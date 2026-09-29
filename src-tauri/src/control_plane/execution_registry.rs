@@ -1,3 +1,5 @@
+use super::command_output::CommandOutput;
+use crate::execution::output_handles::{OutputHandleRegistry, OutputOwner, OutputReferences};
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -87,6 +89,8 @@ struct ExecutionRegistryInner {
     path: PathBuf,
     state: PersistedExecutionState,
     cancellation_signals: HashMap<ExecutionId, String>,
+    command_outputs: HashMap<ExecutionId, CommandOutput>,
+    output_handles: OutputHandleRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +165,103 @@ pub(crate) struct AdoptedExecution {
 impl std::error::Error for ExecutionRegistryError {}
 
 impl ExecutionRegistry {
+    pub(crate) fn output_handles(&self) -> OutputHandleRegistry {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .output_handles
+            .clone()
+    }
+
+    pub(crate) fn register_command_output_refs(
+        &self,
+        public: &PublicSessionId,
+        refs: &OutputReferences,
+    ) -> Result<(), ExecutionRegistryError> {
+        let inner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = inner
+            .state
+            .executions
+            .iter()
+            .find(|record| &record.public_session_id == public)
+            .ok_or_else(|| ExecutionRegistryError::UnknownPublicSession(public.clone()))?
+            .id
+            .clone();
+        inner.output_handles.register(public.as_str(), refs);
+        drop(inner);
+        self.enrich_terminal_output_refs(&id)
+    }
+
+    pub(crate) fn command_output_refs(&self, public: &PublicSessionId) -> OutputReferences {
+        self.output_handles().for_session(public.as_str())
+    }
+
+    pub(crate) fn enrich_terminal_output_refs(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<(), ExecutionRegistryError> {
+        let execution = self
+            .all()
+            .into_iter()
+            .find(|record| &record.id == id)
+            .ok_or_else(|| ExecutionRegistryError::UnknownExecution(id.clone()))?;
+        let refs = self
+            .command_output_refs(&execution.public_session_id)
+            .values();
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let handles = self.output_handles();
+        let refs: Vec<_> = refs
+            .into_iter()
+            .filter(|value| {
+                handles.owner(value)
+                    == Some(OutputOwner::PublicSession(
+                        execution.public_session_id.to_string(),
+                    ))
+            })
+            .collect();
+        if !matches!(&execution.state, ExecutionState::Terminal(terminal) if refs.iter().any(|value| !terminal.output_refs.contains(value)))
+        {
+            return Ok(());
+        }
+        self.transact("enrich_output_refs", |state| {
+            let record = state
+                .executions
+                .iter_mut()
+                .find(|record| &record.id == id)
+                .ok_or_else(|| ExecutionRegistryError::UnknownExecution(id.clone()))?;
+            if let ExecutionState::Terminal(terminal) = &mut record.state {
+                for value in refs {
+                    if terminal.output_refs.len() < MAX_OUTPUT_REFS
+                        && !terminal.output_refs.contains(&value)
+                    {
+                        terminal.output_refs.push(value);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn command_output(&self, public: &PublicSessionId) -> Option<CommandOutput> {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = inner
+            .state
+            .executions
+            .iter()
+            .find(|record| &record.public_session_id == public)?
+            .id
+            .clone();
+        Some(inner.command_outputs.entry(id).or_default().clone())
+    }
+
     pub(crate) fn for_workspace(workspace: &Path) -> Result<Self, ExecutionRegistryError> {
         Self::open_at(default_execution_state_path(workspace))
     }
@@ -212,6 +313,8 @@ impl ExecutionRegistry {
             path,
             state,
             cancellation_signals: HashMap::new(),
+            command_outputs: HashMap::new(),
+            output_handles: OutputHandleRegistry::default(),
         }))))
     }
 
@@ -721,6 +824,19 @@ impl ExecutionRegistry {
         trim_state(&mut next);
         persist_state(&inner.path, &next)
             .map_err(|_| ExecutionRegistryError::Storage(operation))?;
+        inner
+            .command_outputs
+            .retain(|id, _| next.executions.iter().any(|record| &record.id == id));
+        let expired = inner
+            .state
+            .executions
+            .iter()
+            .filter(|old| !next.executions.iter().any(|record| record.id == old.id))
+            .map(|old| old.public_session_id.to_string())
+            .collect::<Vec<_>>();
+        // The short handle lock is acquired only after persistence completes.
+        // Handle operations never acquire the execution lock in reverse order.
+        inner.output_handles.reap_owned_by(&expired);
         inner.state = next;
         Ok(())
     }
@@ -1259,5 +1375,80 @@ mod tests {
                 .contains("runtime-session")
         );
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn late_reference_registration_is_ordered_after_terminal_and_reaped_with_execution() {
+        let registry = ExecutionRegistry::open_at(temp_path("late-reference-order")).unwrap();
+        let public = PublicSessionId::new("late-reference-session");
+        let id = registry
+            .start(TaskId::new("late-reference-task"), public.clone())
+            .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let other = registry.clone();
+        let worker_public = public.clone();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            other
+                .register_command_output_refs(
+                    &worker_public,
+                    &OutputReferences {
+                        primary: Some("private-late-error".into()),
+                        stderr: Some("private-late-error".into()),
+                        ..OutputReferences::default()
+                    },
+                )
+                .unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let original = terminal(TerminalOutcome::Failed);
+        registry.finish(&id, original.clone()).unwrap();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let refs = registry.command_output_refs(&public);
+        let ExecutionState::Terminal(saved) = registry
+            .execution_for_public_session(&public)
+            .unwrap()
+            .state
+        else {
+            panic!("terminal");
+        };
+        assert_eq!(saved.output_refs, refs.values());
+        assert_eq!(saved.exit_code, original.exit_code);
+        assert_eq!(saved.completed_at_ms, original.completed_at_ms);
+        assert_eq!(saved.outcome, original.outcome);
+        // Remove only test registry records, never filesystem paths.
+        registry
+            .transact("test-expire", |state| {
+                state.executions.retain(|record| record.id != id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            registry.command_output_refs(&public),
+            OutputReferences::default()
+        );
+        assert!(
+            registry
+                .output_handles()
+                .private(refs.stderr.as_ref().unwrap())
+                .is_none()
+        );
+        assert!(
+            registry
+                .register_command_output_refs(
+                    &public,
+                    &OutputReferences {
+                        stderr: Some("private-late-error".into()),
+                        ..OutputReferences::default()
+                    }
+                )
+                .is_err()
+        );
     }
 }

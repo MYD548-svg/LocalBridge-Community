@@ -1,4 +1,5 @@
 pub(crate) mod command_control;
+pub(crate) mod command_output;
 pub mod convergence;
 pub(crate) mod execution_registry;
 pub(crate) mod owner;

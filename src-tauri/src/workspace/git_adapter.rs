@@ -1342,7 +1342,7 @@ mod tests {
                 .contains("outside-repo")
         );
 
-        fs::remove_dir_all(base).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", base.display());
     }
 
     #[test]
@@ -1418,7 +1418,7 @@ mod tests {
             assert_eq!(missing["structuredContent"]["ok"], false);
         }
 
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -1469,7 +1469,7 @@ mod tests {
                 .is_some_and(|content| content.contains("deleted file mode"))
         );
 
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 
     #[test]
@@ -1517,6 +1517,6 @@ mod tests {
         let (_, special) = parse_status_porcelain_v1_z(machine, false).unwrap();
         assert_eq!(special[0]["path"], "to -> literal.txt");
         assert_eq!(special[0]["original_path"], "from -> literal.txt");
-        fs::remove_dir_all(root).unwrap();
+        eprintln!("TEST_WORKSPACE_RETAINED path={}", root.display());
     }
 }

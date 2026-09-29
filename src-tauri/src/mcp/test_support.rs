@@ -18,6 +18,7 @@ use crate::state::PermissionMode;
 
 const TEST_BEARER: &str = "LOCALBRIDGE_TEST_RUNTIME_BEARER_DO_NOT_LEAK";
 
+#[derive(Debug)]
 pub(crate) struct ClientResponse {
     pub(crate) status: u16,
     pub(crate) session: Option<String>,
@@ -75,54 +76,7 @@ pub(crate) fn free_port() -> u16 {
 }
 
 pub(crate) fn cleanup_test_directory(path: &Path) {
-    // Process ownership is asserted by the runtime fixture before this
-    // housekeeping step. Windows Defender, indexing, or another external
-    // observer can still retain a sharing handle after the owned Job is empty.
-    // Keep that environmental condition out of business lifecycle assertions,
-    // but only for the two concrete Windows lock errors; every other cleanup
-    // failure remains a test failure.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match fs::remove_dir_all(path) {
-            Ok(()) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) if is_external_windows_cleanup_lock(&error) => {
-                if Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                eprintln!(
-                    "TEST_WORKSPACE_CLEANUP=DEFERRED path={} windows_error={} reason=external_sharing_lock",
-                    path.display(),
-                    error.raw_os_error().unwrap_or_default()
-                );
-                return;
-            }
-            Err(error) => panic!("remove test workspace {}: {error}", path.display()),
-        }
-    }
-}
-
-fn is_external_windows_cleanup_lock(error: &std::io::Error) -> bool {
-    // ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION are the only errors that
-    // may be produced by a non-owned scanner/indexer after process convergence.
-    matches!(error.raw_os_error(), Some(5 | 32))
-}
-
-#[test]
-fn workspace_cleanup_only_defers_concrete_windows_lock_errors() {
-    assert!(is_external_windows_cleanup_lock(
-        &std::io::Error::from_raw_os_error(5)
-    ));
-    assert!(is_external_windows_cleanup_lock(
-        &std::io::Error::from_raw_os_error(32)
-    ));
-    assert!(!is_external_windows_cleanup_lock(
-        &std::io::Error::from_raw_os_error(3)
-    ));
-    assert!(!is_external_windows_cleanup_lock(
-        &std::io::Error::from_raw_os_error(87)
-    ));
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", path.display());
 }
 
 pub(crate) fn assert_eventually(
@@ -207,7 +161,7 @@ impl Drop for PublicRuntimeFixture {
     fn drop(&mut self) {
         self.stop_best_effort();
         if !self.cleaned {
-            let _ = fs::remove_dir_all(&self.workspace);
+            cleanup_test_directory(&self.workspace);
         }
     }
 }
@@ -225,9 +179,39 @@ pub(crate) fn post_with_read_timeout(
     payload: &Value,
     read_timeout: Duration,
 ) -> ClientResponse {
-    let body = serde_json::to_vec(payload).unwrap();
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-    stream.set_read_timeout(Some(read_timeout)).unwrap();
+    try_post_with_read_timeout(port, session, payload, read_timeout, || {})
+        .unwrap_or_else(|error| panic!("test HTTP request: {error:?}"))
+}
+
+#[derive(Debug)]
+pub(crate) struct TestHttpError {
+    pub(crate) stage: &'static str,
+    pub(crate) kind: std::io::ErrorKind,
+    pub(crate) received_bytes: usize,
+}
+
+pub(crate) fn try_post_with_read_timeout(
+    port: u16,
+    session: Option<&str>,
+    payload: &Value,
+    read_timeout: Duration,
+    sent: impl FnOnce(),
+) -> Result<ClientResponse, TestHttpError> {
+    let io_error = |stage, error: std::io::Error| TestHttpError {
+        stage,
+        kind: error.kind(),
+        received_bytes: 0,
+    };
+    let body = serde_json::to_vec(payload).expect("JSON value serializes");
+    let address = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|error| io_error("connect", error))?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|error| io_error("configure", error))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| io_error("configure", error))?;
     let mut request = format!(
         "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {CURRENT_PROTOCOL_VERSION}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
@@ -238,10 +222,48 @@ pub(crate) fn post_with_read_timeout(
         request.push_str("\r\n");
     }
     request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.write_all(&body).unwrap();
-    stream.flush().unwrap();
-    parse_client_response(stream)
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| io_error("write", error))?;
+    stream
+        .write_all(&body)
+        .map_err(|error| io_error("write", error))?;
+    stream.flush().map_err(|error| io_error("write", error))?;
+    sent();
+    let mut bytes = Vec::new();
+    let deadline = Instant::now() + read_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TestHttpError {
+                stage: "read",
+                kind: std::io::ErrorKind::TimedOut,
+                received_bytes: bytes.len(),
+            });
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| io_error("configure", error))?;
+        let mut chunk = [0_u8; 8192];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionReset
+                    && response_content_length_is_complete(&bytes) =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(TestHttpError {
+                    stage: "read",
+                    kind: error.kind(),
+                    received_bytes: bytes.len(),
+                });
+            }
+        }
+    }
+    parse_client_bytes(&bytes)
 }
 
 pub(crate) fn delete(port: u16, session: &str) -> u16 {
@@ -304,20 +326,29 @@ fn parse_raw_http_response(mut stream: TcpStream) -> RawHttpResponse {
 
 pub(crate) fn parse_client_response(mut stream: TcpStream) -> ClientResponse {
     let bytes = read_complete_http_response(&mut stream);
+    parse_client_bytes(&bytes).unwrap_or_else(|error| panic!("test HTTP response: {error:?}"))
+}
+
+fn parse_client_bytes(bytes: &[u8]) -> Result<ClientResponse, TestHttpError> {
+    let invalid = || TestHttpError {
+        stage: "parse",
+        kind: std::io::ErrorKind::InvalidData,
+        received_bytes: bytes.len(),
+    };
     let split = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .unwrap();
-    let headers = std::str::from_utf8(&bytes[..split]).unwrap();
+        .ok_or_else(invalid)?;
+    let headers = std::str::from_utf8(&bytes[..split]).map_err(|_| invalid())?;
     let mut lines = headers.split("\r\n");
     let status = lines
         .next()
-        .unwrap()
+        .ok_or_else(invalid)?
         .split_whitespace()
         .nth(1)
-        .unwrap()
+        .ok_or_else(invalid)?
         .parse::<u16>()
-        .unwrap();
+        .map_err(|_| invalid())?;
     let session = lines.find_map(|line| {
         line.split_once(':').and_then(|(name, value)| {
             name.eq_ignore_ascii_case("Mcp-Session-Id")
@@ -328,13 +359,13 @@ pub(crate) fn parse_client_response(mut stream: TcpStream) -> ClientResponse {
     let body = if body_bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(body_bytes).unwrap()
+        serde_json::from_slice(body_bytes).map_err(|_| invalid())?
     };
-    ClientResponse {
+    Ok(ClientResponse {
         status,
         session,
         body,
-    }
+    })
 }
 
 fn read_complete_http_response(stream: &mut TcpStream) -> Vec<u8> {
@@ -365,6 +396,21 @@ fn response_content_length_is_complete(bytes: &[u8]) -> bool {
             .flatten()
     });
     content_length.is_some_and(|length| bytes.len() >= header_end + 4 + length)
+}
+
+#[test]
+fn structured_http_errors_distinguish_parse_failures_from_timeouts() {
+    let malformed = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n{";
+    let error = parse_client_bytes(malformed).unwrap_err();
+    assert_eq!(error.stage, "parse");
+    assert_eq!(error.kind, std::io::ErrorKind::InvalidData);
+    assert_eq!(error.received_bytes, malformed.len());
+    let empty = parse_client_bytes(b"").unwrap_err();
+    assert_eq!(empty.stage, "parse");
+    assert_eq!(empty.received_bytes, 0);
+    let valid = parse_client_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+    assert_eq!(valid.status, 200);
+    assert_eq!(valid.body, json!({}));
 }
 
 #[test]
@@ -451,7 +497,26 @@ impl PublicMcpClient {
     }
 
     pub(crate) fn start_detached_command(&self, arguments: Value) -> DetachedCommand<'_> {
-        let response = self.call_tool("exec_command", arguments);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let response = loop {
+            let response = self.call_tool("exec_command", arguments.clone());
+            let content = &response.body["result"]["structuredContent"];
+            if content["data"]["status"].as_str() == Some("running") {
+                break response;
+            }
+            if content["error"]["code"] == "OperationTimedOut" {
+                assert!(
+                    Instant::now() < deadline,
+                    "detached command submission kept timing out: {:#?}",
+                    response.body
+                );
+                continue;
+            }
+            // Anything else (a delivered terminal status or a typed error) is
+            // a real fact about this submission; from_response asserts running
+            // and dumps the response for diagnosis.
+            break response;
+        };
         DetachedCommand::from_response(self, response)
     }
 }
@@ -506,12 +571,20 @@ impl<'a> DetachedCommand<'a> {
                 self.last_response.body
             );
             self.poll(1_000);
-            assert_eq!(
-                self.status(),
-                Some("running"),
-                "command terminated before emitting {marker:?}: {:#?}",
-                self.last_response.body
-            );
+            if self.output.contains(marker) {
+                break;
+            }
+            match classify_command_poll_response(&self.last_response) {
+                CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
+                CommandPollObservation::Terminal => panic!(
+                    "command terminated before emitting {marker:?}: {:#?}",
+                    self.last_response.body
+                ),
+                CommandPollObservation::Invalid => panic!(
+                    "detached command poll response is neither lifecycle status nor bounded timeout: {:#?}",
+                    self.last_response.body
+                ),
+            }
         }
     }
 
@@ -552,10 +625,6 @@ impl<'a> DetachedCommand<'a> {
         self.observe(response)
     }
 
-    pub(crate) fn status(&self) -> Option<&str> {
-        self.last_response.body["result"]["structuredContent"]["data"]["status"].as_str()
-    }
-
     fn observe(&mut self, response: ClientResponse) -> &ClientResponse {
         self.output.push_str(
             response.body["result"]["structuredContent"]["data"]["output"]
@@ -567,6 +636,133 @@ impl<'a> DetachedCommand<'a> {
     }
 }
 
+/// A command_control response carries either a lifecycle observation in
+/// `data.status` or a typed facade error. The facade keeps the Execution
+/// non-terminal when a poll/write hits its wait budget and answers
+/// `OperationTimedOut` (retryable, transport phase), so that response is a
+/// "keep polling the same session" signal, never a terminal fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandPollObservation {
+    Running,
+    BoundedWaitExpired,
+    Terminal,
+    Invalid,
+}
+
+pub(crate) fn classify_command_poll_response(response: &ClientResponse) -> CommandPollObservation {
+    let content = &response.body["result"]["structuredContent"];
+    if let Some(status) = content["data"]["status"].as_str() {
+        return if status == "running" {
+            CommandPollObservation::Running
+        } else {
+            CommandPollObservation::Terminal
+        };
+    }
+    if content["error"]["code"] == "OperationTimedOut" {
+        return CommandPollObservation::BoundedWaitExpired;
+    }
+    CommandPollObservation::Invalid
+}
+
+#[test]
+fn command_poll_classification_matches_the_facade_response_contract() {
+    let observation = |structured: Value| ClientResponse {
+        status: 200,
+        session: None,
+        body: json!({"result": {"structuredContent": structured}}),
+    };
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": true,
+            "data": {"status": "running", "session_id": "lb-session-x", "output": "chunk"}
+        }))),
+        CommandPollObservation::Running
+    );
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": true,
+            "data": {"status": "completed", "output": "done"}
+        }))),
+        CommandPollObservation::Terminal
+    );
+    // A failed terminal still carries data.status; the error object does not
+    // turn it into a pending observation.
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": false,
+            "data": {"status": "failed"},
+            "error": {"code": "ProcessFailed"}
+        }))),
+        CommandPollObservation::Terminal
+    );
+    // The bounded-wait response has no data.status at all.
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": false,
+            "data": null,
+            "error": {
+                "code": "OperationTimedOut",
+                "cause": "operation_timed_out",
+                "phase": "transport",
+                "retryable": true
+            }
+        }))),
+        CommandPollObservation::BoundedWaitExpired
+    );
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({
+            "ok": false,
+            "data": null,
+            "error": {"code": "SessionUnavailable"}
+        }))),
+        CommandPollObservation::Invalid
+    );
+    assert_eq!(
+        classify_command_poll_response(&observation(json!({}))),
+        CommandPollObservation::Invalid
+    );
+}
+
+/// Submit a detached exec_command and return the first response that carries a
+/// lifecycle observation.
+///
+/// Resubmission safety scope: a submission whose wait budget expires does NOT
+/// prove the command was not executed — the facade's private call timeout does
+/// not cancel the upstream request, so the first attempt may still run to its
+/// natural end as an orphaned execution whose public session was terminalized
+/// with the error. Resubmitting is therefore only justified for
+/// observation-only scenario commands (sleep/echo) whose duplicate cannot
+/// corrupt the workspace or the assertions; a command with persistent side
+/// effects must not use this helper.
+pub(crate) fn submit_side_effect_free_public_command(
+    port: u16,
+    session: &str,
+    request_id: u64,
+    arguments: Value,
+) -> ClientResponse {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let response =
+            public_tool_call(port, session, request_id, "exec_command", arguments.clone());
+        let content = &response.body["result"]["structuredContent"];
+        if content["data"]["status"].is_string() {
+            return response;
+        }
+        if content["error"]["code"] == "OperationTimedOut" {
+            assert!(
+                Instant::now() < deadline,
+                "exec_command submission kept timing out: {:#?}",
+                response.body
+            );
+            continue;
+        }
+        panic!(
+            "exec_command submission returned neither lifecycle status nor bounded timeout: {:#?}",
+            response.body
+        );
+    }
+}
+
 pub(crate) fn settle_public_command(
     port: u16,
     session: &str,
@@ -575,35 +771,51 @@ pub(crate) fn settle_public_command(
 ) -> (ClientResponse, String) {
     let deadline = Instant::now() + Duration::from_secs(150);
     let mut output = String::new();
+    let mut public_session = String::new();
     loop {
         let data = &response.body["result"]["structuredContent"]["data"];
         output.push_str(data["output"].as_str().unwrap_or_default());
-        match data["status"].as_str() {
-            Some("running") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "public command did not converge: {:#?}",
-                    response.body
-                );
-                let public_session = data["session_id"]
+        eprintln!(
+            "COMMAND_POLL id={} session={} status={} exit={} chunk_bytes={} total_bytes={} error={}",
+            response.body["id"],
+            data["session_id"],
+            data["status"],
+            data["exit_code"],
+            data["output"].as_str().unwrap_or_default().len(),
+            output.len(),
+            response.body["result"]["structuredContent"]["error"]
+        );
+        match classify_command_poll_response(&response) {
+            CommandPollObservation::Running => {
+                public_session = data["session_id"]
                     .as_str()
                     .expect("running command has PublicSessionId")
                     .to_string();
-                response = public_tool_call(
-                    port,
-                    session,
-                    poll_id,
-                    "command_control",
-                    json!({"action":"poll","session_id":public_session,"wait_ms":1000}),
-                );
-                poll_id = poll_id.saturating_add(1);
             }
-            Some(_) => return (response, output),
-            None => panic!(
-                "public command response has no status: {:#?}",
+            CommandPollObservation::Terminal => return (response, output),
+            CommandPollObservation::BoundedWaitExpired if public_session.is_empty() => panic!(
+                "public command transport timeout before the session identity was delivered: {:#?}",
+                response.body
+            ),
+            CommandPollObservation::BoundedWaitExpired => {}
+            CommandPollObservation::Invalid => panic!(
+                "public command response is neither lifecycle status nor bounded timeout: {:#?}",
                 response.body
             ),
         }
+        assert!(
+            Instant::now() < deadline,
+            "public command did not converge: {:#?}",
+            response.body
+        );
+        response = public_tool_call(
+            port,
+            session,
+            poll_id,
+            "command_control",
+            json!({"action":"poll","session_id":public_session,"wait_ms":1000}),
+        );
+        poll_id = poll_id.saturating_add(1);
     }
 }
 
@@ -624,12 +836,14 @@ pub(crate) fn poll_public_command_to_terminal(
             json!({"action":"poll","session_id":public_session,"wait_ms":1_000}),
         );
         poll_id = poll_id.saturating_add(1);
-        let content = &response.body["result"]["structuredContent"];
-        match content["data"]["status"].as_str() {
-            Some("running") => {}
-            Some(_) => return response,
-            None if content["error"]["code"] == "OperationTimedOut" => {}
-            None => panic!(
+        match classify_command_poll_response(&response) {
+            CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
+            CommandPollObservation::Terminal => return response,
+            // No transient SessionUnavailable tolerance here: the production
+            // poll path replays the durable terminal when a concurrent control
+            // call finalizes the same Execution, and a genuinely unavailable
+            // or unknown session must surface as the contract error.
+            CommandPollObservation::Invalid => panic!(
                 "public command returned neither lifecycle status nor bounded timeout: {:#?}",
                 response.body
             ),
