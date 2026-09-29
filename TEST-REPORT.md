@@ -1,3 +1,73 @@
+# Clippy test-module placement repair - 2026-09-29
+
+## Audited cloud result for 9c43453
+
+Audit performed on 2026-09-28 for branch codex/fix-ci-validation at
+9c4345351bf527222401752198d26884002fe4e0. Both PR runs checked out merge
+843d8178f7a998bfdf91c93f7f4cb31c264b1260 against
+012adf917b06b8a3866b0d77a564ae481c289b4f.
+
+| Run | Verified result |
+| --- | --- |
+| [CI push 36424064624](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36424064624) | FAIL: Windows runtime-resources compile preflight, test-clippy |
+| [CI PR 36424072597](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36424072597) | FAIL: same Clippy error |
+| [Community PR 36424072539](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36424072539) | Linux PASS; Windows FAIL with the same Clippy error |
+
+All three Windows jobs passed the first 11 stages and test-compile within
+stage 12. test-clippy rejected items after the test module at
+src-tauri/src/control_plane/command_output.rs:132. The existing -D warnings
+gate promoted clippy::items_after_test_module to an error (exit 101).
+Broker-specific compile preflight and later stages, including authentication
+repetitions, Rust behavior tests, standalone Clippy, packaging and final
+artifact verification, were NOT_RUN. No verified installer was uploaded.
+The shared-output behavior introduced in 9c43453 remains unverified by these
+cloud runs; successful test compilation is not test execution.
+
+## Repair
+
+Move the existing test module to the end of command_output.rs without changing
+production functions or test bodies. Inspection of the other Rust files touched
+in 9c43453 found no corresponding trailing production items after their test
+modules. No lint suppression, API change, runtime payload/hash change, workflow
+change or test weakening is included.
+
+## Local evidence for this repair
+
+- PASS: installed Rust 1.85 Clippy, standalone command_output.rs including tests,
+  --edition=2021 --test --emit=metadata -A dead_code -D warnings. The exact
+  items_after_test_module error was reproduced before repair during the prior
+  audit; the repaired module passes. The dead_code exception is command-local
+  for isolated-module unused items; complete-crate CI still uses -D warnings.
+  This is metadata analysis, not a linked executable or full-crate Clippy.
+- PASS: existing gate from bundled-integrity through frontend-build (8 stages).
+  The generated gate report correctly remains PARTIAL, not full acceptance.
+- PASS: 32 Node base/build-contract tests; bundled Python 11/11, including
+  .cmd, .bat, PowerShell and NUL each exactly ten times (40/40). Marker, exit
+  code, replay and NUL leakage assertions are unchanged. No retry-until-pass.
+- PASS: handle regression 262 -> 262, maximum growth 8; fixtures retained.
+- PASS: formatting, public release policy, licenses (166 npm / 484 cargo),
+  schema44, frontend tests (18 tests / 6 files), TypeScript and Vite build.
+- PASS: bundled integrity. Runtime source, manifest, metadata and pinned Rust
+  hashes are unchanged; historical installer evidence is not new evidence.
+- NOT_RUN locally: full Rust compile/Clippy, Rust behavior/public-interface
+  tests, authenticated Tunnel probes, NSIS packaging and clean installation.
+  MSVC/Windows SDK remain unavailable and were not installed.
+
+The sandbox initially blocked Node spawning git (EPERM) before validation
+started. The same authorized gate then ran outside that restriction and passed.
+This environment retry is not a retry of a failed behavior assertion.
+
+## Delivery boundary
+
+Stage only command_output.rs and this report after diff review. Push once to
+codex/fix-ci-validation, then compare the remote branch SHA with the local commit.
+Do not query new Actions, poll, rerun, monitor, merge or publish. New-commit cloud
+acceptance remains UNVERIFIED. Preserve all 19 gates, ten authentication probes,
+existing triggers and toolchain versions. Keep unrelated untracked material and
+all test fixtures. If push is rejected, retain the local commit without force.
+
+## Historical reports
+
 # Shared public command output delivery - 2026-09-28
 
 ## Delivery boundary and verified cloud baseline

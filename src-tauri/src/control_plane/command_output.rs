@@ -128,86 +128,6 @@ impl CommandOutput {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    #[test]
-    fn paused_collector_prevents_delivery_until_its_bytes_are_staged() {
-        let output = CommandOutput::default();
-        let other = output.clone();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _collection = other.begin();
-            ready_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            other.append("DELAYED");
-        });
-        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        output.append("EARLIER");
-        let held = output.take();
-        assert!(held.collecting);
-        assert!(held.output.is_empty());
-        release_tx.send(()).unwrap();
-        worker.join().unwrap();
-        let settled = output.take();
-        assert!(!settled.collecting);
-        assert_eq!(settled.output, "EARLIERDELAYED");
-        assert!(output.take().output.is_empty());
-    }
-
-    #[test]
-    fn concurrent_deliveries_consume_one_shared_cursor() {
-        let output = CommandOutput::default();
-        output.append("ONCE");
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let workers: Vec<_> = (0..2)
-            .map(|_| {
-                let output = output.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    output.take().output
-                })
-            })
-            .collect();
-        barrier.wait();
-        let delivered: String = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .collect();
-        assert_eq!(delivered, "ONCE");
-    }
-
-    #[test]
-    fn shared_stderr_fragments_and_sticky_truncation_survive_replay() {
-        let output = CommandOutput::default();
-        let other = output.clone();
-        assert!(
-            output
-                .filter_stderr("#< CLIXML\r\n<Objs><S S=\"Error\">hel")
-                .is_empty()
-        );
-        let visible = other.filter_stderr("lo</S></Objs>");
-        assert!(visible.contains("hello"), "{visible:?}");
-        output.append(&"x".repeat(MAX_PENDING_OUTPUT_BYTES + 16));
-        output.annotate(false, true);
-        let first = other.take();
-        assert!(
-            first
-                .output
-                .starts_with("[earlier command output truncated]")
-        );
-        assert!(first.truncated && first.incomplete);
-        let replay = output.take();
-        assert!(replay.output.is_empty());
-        assert!(replay.truncated && replay.incomplete);
-    }
-}
-
 pub(crate) fn public_command_stderr(stderr: &str) -> String {
     if !looks_like_clixml_protocol(stderr) {
         return stderr.to_string();
@@ -421,4 +341,84 @@ fn decode_clixml_utf16_escapes(value: &str) -> String {
         index += ch.len_utf8();
     }
     decoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn paused_collector_prevents_delivery_until_its_bytes_are_staged() {
+        let output = CommandOutput::default();
+        let other = output.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _collection = other.begin();
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            other.append("DELAYED");
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        output.append("EARLIER");
+        let held = output.take();
+        assert!(held.collecting);
+        assert!(held.output.is_empty());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let settled = output.take();
+        assert!(!settled.collecting);
+        assert_eq!(settled.output, "EARLIERDELAYED");
+        assert!(output.take().output.is_empty());
+    }
+
+    #[test]
+    fn concurrent_deliveries_consume_one_shared_cursor() {
+        let output = CommandOutput::default();
+        output.append("ONCE");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let output = output.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    output.take().output
+                })
+            })
+            .collect();
+        barrier.wait();
+        let delivered: String = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(delivered, "ONCE");
+    }
+
+    #[test]
+    fn shared_stderr_fragments_and_sticky_truncation_survive_replay() {
+        let output = CommandOutput::default();
+        let other = output.clone();
+        assert!(
+            output
+                .filter_stderr("#< CLIXML\r\n<Objs><S S=\"Error\">hel")
+                .is_empty()
+        );
+        let visible = other.filter_stderr("lo</S></Objs>");
+        assert!(visible.contains("hello"), "{visible:?}");
+        output.append(&"x".repeat(MAX_PENDING_OUTPUT_BYTES + 16));
+        output.annotate(false, true);
+        let first = other.take();
+        assert!(
+            first
+                .output
+                .starts_with("[earlier command output truncated]")
+        );
+        assert!(first.truncated && first.incomplete);
+        let replay = output.take();
+        assert!(replay.output.is_empty());
+        assert!(replay.truncated && replay.incomplete);
+    }
 }
