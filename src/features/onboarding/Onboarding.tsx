@@ -6,6 +6,7 @@ import { bridge, type AccessCode, type MainProjection, uiErrorMessage } from "..
 import { accessText } from "../../presentation";
 import { onboardingApi, type OnboardingState } from "./api";
 import "./onboarding.css";
+import { LocalOnboarding } from "./LocalOnboarding";
 
 const KEY_HINT = "Runtime API Key 仅保存在 Windows 安全凭据中。";
 
@@ -13,7 +14,7 @@ type Screen4CopyKey = "name" | "tunnel";
 
 const messageFrom = (value: unknown, fallback: string) => uiErrorMessage(value, fallback);
 
-export function Onboarding({ initial, onComplete, previewMode = false }: { initial: OnboardingState; onComplete: () => void; previewMode?: boolean }) {
+function TunnelOnboarding({ initial, onComplete, previewMode = false }: { initial: OnboardingState; onComplete: () => void; previewMode?: boolean }) {
   const viteDev = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true;
   const permissionGeometryE2e = viteDev
     && typeof window !== "undefined"
@@ -293,4 +294,9 @@ export function Onboarding({ initial, onComplete, previewMode = false }: { initi
   );
 
   return null;
+}
+
+export function Onboarding(props: { initial: OnboardingState; onComplete: () => void; previewMode?: boolean }) {
+  const [mode, setMode] = useState(props.initial.connectionMode ?? "openai_tunnel");
+  return mode === "local" ? <LocalOnboarding onComplete={props.onComplete} previewMode={props.previewMode} onTunnel={() => setMode("openai_tunnel")} /> : <TunnelOnboarding {...props} />;
 }

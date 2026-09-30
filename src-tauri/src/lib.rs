@@ -7,6 +7,7 @@ pub(crate) mod document;
 pub mod domain;
 pub mod execution;
 pub mod filesystem;
+pub mod local_connection;
 pub mod mcp;
 pub mod privilege;
 pub mod runtime;
@@ -43,6 +44,10 @@ macro_rules! localbridge_invoke_handler {
             commands::ui::retry_update_check,
             commands::ui::open_github_releases,
             commands::onboarding::get_onboarding_state,
+            commands::local_connection::get_connection_state,
+            commands::local_connection::set_connection_mode,
+            commands::local_connection::connect_codex,
+            commands::local_connection::disconnect_codex,
             commands::onboarding::save_onboarding_connection,
             commands::onboarding::open_openai_tunnel_settings,
             commands::onboarding::open_openai_api_keys,

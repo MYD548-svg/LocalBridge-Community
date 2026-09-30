@@ -320,7 +320,7 @@ impl ControlPlaneSnapshot {
         let connection_ready = self.connection.availability() == ProjectionAvailability::Ready
             && !self.connection.is_stale()
             && self.connection.value().is_some_and(|connection| {
-                connection.desired_tunnel_id.is_none()
+                connection.desired_credential_epoch.is_none()
                     || connection.effective == EffectiveAvailability::Available
             });
         runtime_ready && workspace_ready && connection_ready
@@ -735,6 +735,18 @@ mod tests {
         let consumed = reader.read();
         assert_eq!(consumed.revision, published.revision);
         assert!(consumed.work_is_authorized());
+
+        // Local registration has no Tunnel ID, but is still a configured
+        // connection and must fail closed until the endpoint is observed.
+        let mut local = consumed.clone();
+        let mut connection = local.connection.ready_value().unwrap().clone();
+        connection.desired_credential_epoch = Some(0);
+        connection.effective = EffectiveAvailability::Unavailable;
+        local.connection = ProjectionSection::ready(connection.clone());
+        assert!(!local.work_is_authorized());
+        connection.effective = EffectiveAvailability::Available;
+        local.connection = ProjectionSection::ready(connection);
+        assert!(local.work_is_authorized());
 
         let mut stale = draft(consumed.settings.clone());
         stale.runtime = consumed.runtime;

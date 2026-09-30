@@ -192,6 +192,17 @@ impl TaskRegistry {
         None
     }
 
+    pub(crate) fn active(&self) -> Vec<TaskRecord> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tasks
+            .values()
+            .filter(|task| !task.lifecycle.is_terminal())
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn latest_terminal(&self) -> Option<TaskRecord> {
         self.latest_terminal_excluding(&HashSet::new())
     }

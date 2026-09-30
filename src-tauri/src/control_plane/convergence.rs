@@ -37,15 +37,25 @@ impl DesiredWorkspace {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionProfile {
-    pub tunnel_id: TunnelId,
+    pub mode: crate::local_connection::profile::ConnectionMode,
+    pub tunnel_id: Option<TunnelId>,
     pub credential_epoch: u64,
 }
 
 impl ConnectionProfile {
     pub const fn new(tunnel_id: TunnelId, credential_epoch: u64) -> Self {
         Self {
-            tunnel_id,
+            mode: crate::local_connection::profile::ConnectionMode::OpenaiTunnel,
+            tunnel_id: Some(tunnel_id),
             credential_epoch,
+        }
+    }
+
+    pub const fn local() -> Self {
+        Self {
+            mode: crate::local_connection::profile::ConnectionMode::Local,
+            tunnel_id: None,
+            credential_epoch: 0,
         }
     }
 }

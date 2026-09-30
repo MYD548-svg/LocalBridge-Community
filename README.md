@@ -1,10 +1,14 @@
 # LocalBridge
 
+当前源码包含 **尚未发布的 Codex 本地连接候选改造**：已安装并登录 Codex 的 Windows 用户可通过随包适配器接入 LocalBridge，连接与工具执行在本机完成，模型仍由 Codex 联网调用。保留 OpenAI Tunnel 高级兼容模式。
+
+本轮未生成新版安装包，完整 Windows 编译与实机验收仍受构建环境阻断，不能据此认定正式发布。参见 [本地连接使用说明](docs/LOCAL-CODEX-USAGE.md)、[来源与适配说明](docs/LOCAL-CODEX-ADAPTATION.md) 和 [本地验证报告](docs/LOCAL-CODEX-TEST-REPORT.md)。下文下载流程对应已发布的 Tunnel 版本。
+
 ## 让 ChatGPT 直接参与本地开发与 Windows 维护
 
 LocalBridge 将 ChatGPT 插件与 Windows 本地环境连接起来。无需反复上传文件或复制命令，就能让 ChatGPT 阅读和修改项目、运行开发任务，并协助完成常见的系统检查与维护工作。
 
-安装包约 **21 MB**，内置 Python、Coding Runtime、Tunnel 和常用工具，无需另外配置系统 Python、Node.js、Rust 或 Docker。
+已发布的 Tunnel 安装包约 **21 MB**，内置 Python、Coding Runtime、Tunnel 和常用工具，无需另外配置系统 Python、Node.js、Rust 或 Docker。候选本地连接版的安装包大小尚未验证。
 
 ---
 
@@ -44,7 +48,7 @@ LocalBridge 将运行所需的工具统一放入安装包，不依赖系统 PATH
 
 ## 权限与安全
 
-LocalBridge 提供编辑、完整和管理员三种权限模式。管理员操作通过明确确认和 Windows UAC 启用；Runtime API Key 保存在 Windows 安全凭据中，不写入普通配置文件。
+LocalBridge 提供编辑、完整和管理员三种权限模式。管理员操作通过明确确认和 Windows UAC 启用；Tunnel 模式的 Runtime API Key 保存在 Windows 安全凭据中，不写入普通配置文件。本地模式不需要 Tunnel ID 或 Runtime API Key。
 
 完整的权限边界和安全设计见 [SECURITY.md](SECURITY.md)。
 

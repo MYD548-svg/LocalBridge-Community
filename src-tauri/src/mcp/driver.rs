@@ -29,7 +29,8 @@ pub struct ProductionRuntimeConfig {
     pub workspace: PathBuf,
     workspace_identity: Option<String>,
     pub health_state_dir: PathBuf,
-    pub tunnel_id: TunnelId,
+    pub mode: crate::local_connection::profile::ConnectionMode,
+    pub tunnel_id: Option<TunnelId>,
     pub mcp_readiness_timeout: Duration,
     pub tunnel_readiness_timeout: Duration,
 }
@@ -51,7 +52,8 @@ impl ProductionRuntimeConfig {
             workspace,
             workspace_identity,
             health_state_dir: health_state_dir.into(),
-            tunnel_id,
+            mode: crate::local_connection::profile::ConnectionMode::OpenaiTunnel,
+            tunnel_id: Some(tunnel_id),
             mcp_readiness_timeout: Duration::from_secs(10),
             tunnel_readiness_timeout: Duration::from_secs(15),
         }
@@ -60,6 +62,33 @@ impl ProductionRuntimeConfig {
     pub(crate) fn workspace_identity(&self) -> Option<&str> {
         self.workspace_identity.as_deref()
     }
+
+    pub fn local(
+        install_root: impl Into<PathBuf>,
+        workspace: impl Into<PathBuf>,
+        health_state_dir: impl Into<PathBuf>,
+    ) -> Self {
+        let workspace = workspace.into();
+        let workspace_identity = WorkspaceValidator
+            .validate(&workspace)
+            .ok()
+            .map(|validated| validated.identity().as_str().to_owned());
+        Self {
+            install_root: install_root.into(),
+            workspace,
+            workspace_identity,
+            health_state_dir: health_state_dir.into(),
+            mode: crate::local_connection::profile::ConnectionMode::Local,
+            tunnel_id: None,
+            mcp_readiness_timeout: Duration::from_secs(10),
+            tunnel_readiness_timeout: Duration::from_secs(15),
+        }
+    }
+}
+
+pub enum RuntimeConnectionHandle {
+    Local(crate::local_connection::runtime::LocalRuntime),
+    Tunnel(TunnelRuntime),
 }
 
 enum CredentialStoreHandle<'a, C> {
@@ -182,7 +211,14 @@ where
 {
     type Mcp = CodingToolsRuntime;
     type Pep = PolicyEnforcementRuntime;
-    type Tunnel = TunnelRuntime;
+    type Tunnel = RuntimeConnectionHandle;
+
+    fn uses_tunnel(&self) -> bool {
+        self.config.mode == crate::local_connection::profile::ConnectionMode::OpenaiTunnel
+    }
+    fn active_task_summaries(&self, pep: &Self::Pep) -> Vec<String> {
+        pep.active_task_summaries()
+    }
 
     fn start_mcp(&mut self) -> Result<Self::Mcp, RuntimeFault> {
         let port = available_loopback_port()?;
@@ -289,10 +325,24 @@ where
     }
 
     fn start_tunnel(&mut self, pep: &Self::Pep) -> Result<Self::Tunnel, RuntimeFault> {
+        if !self.uses_tunnel() {
+            let adapter = crate::local_connection::profile::adapter_path(&self.config.install_root);
+            return crate::local_connection::runtime::LocalRuntime::start(
+                &adapter,
+                pep.port(),
+                pep.local_connector_bearer()
+                    .ok_or(RuntimeFault::PolicyInvalid)?,
+            )
+            .map(RuntimeConnectionHandle::Local)
+            .map_err(|_| RuntimeFault::PolicyBindFailed);
+        }
         let config = TunnelRuntimeConfig::new(
             &self.config.install_root,
             &self.config.health_state_dir,
-            self.config.tunnel_id.clone(),
+            self.config
+                .tunnel_id
+                .clone()
+                .ok_or(RuntimeFault::TunnelIdMissing)?,
             pep.port(),
         )
         .map_err(|error| error.runtime_fault())?;
@@ -302,13 +352,23 @@ where
         PreparedTunnelStart::prepare(config, self.credential_store.as_ref())
             .map(|prepared| prepared.with_mcp_guard_bearer(bearer))
             .and_then(PreparedTunnelStart::spawn)
+            .map(RuntimeConnectionHandle::Tunnel)
             .map_err(|error| error.runtime_fault())
     }
 
     fn confirm_tunnel_ready(&mut self, tunnel: &mut Self::Tunnel) -> Result<(), RuntimeFault> {
-        tunnel
-            .wait_ready(self.config.tunnel_readiness_timeout)
-            .map_err(|error| error.runtime_fault())
+        match tunnel {
+            RuntimeConnectionHandle::Local(local) => {
+                if local.is_running() {
+                    Ok(())
+                } else {
+                    Err(RuntimeFault::PolicyBindFailed)
+                }
+            }
+            RuntimeConnectionHandle::Tunnel(tunnel) => tunnel
+                .wait_ready(self.config.tunnel_readiness_timeout)
+                .map_err(|error| error.runtime_fault()),
+        }
     }
 
     fn start_tunnel_for_recovery(
@@ -319,10 +379,16 @@ where
         if permit.is_cancelled() {
             return Err(RuntimeFault::UserStopped);
         }
+        if !self.uses_tunnel() {
+            return self.start_tunnel(pep);
+        }
         let config = TunnelRuntimeConfig::new(
             &self.config.install_root,
             &self.config.health_state_dir,
-            self.config.tunnel_id.clone(),
+            self.config
+                .tunnel_id
+                .clone()
+                .ok_or(RuntimeFault::TunnelIdMissing)?,
             pep.port(),
         )
         .map_err(|error| error.runtime_fault())?;
@@ -338,7 +404,7 @@ where
             let _ = tunnel.stop();
             return Err(RuntimeFault::UserStopped);
         }
-        Ok(tunnel)
+        Ok(RuntimeConnectionHandle::Tunnel(tunnel))
     }
 
     fn confirm_tunnel_ready_for_recovery(
@@ -346,6 +412,9 @@ where
         tunnel: &mut Self::Tunnel,
         permit: &RecoveryPermit,
     ) -> Result<(), RuntimeFault> {
+        let RuntimeConnectionHandle::Tunnel(tunnel) = tunnel else {
+            return self.confirm_tunnel_ready(tunnel);
+        };
         let result = tunnel.wait_ready_for_recovery(
             self.config.tunnel_readiness_timeout,
             Duration::from_millis(250),
@@ -359,10 +428,16 @@ where
     }
 
     fn stop_tunnel(&mut self, tunnel: &mut Self::Tunnel) -> Result<(), RuntimeFault> {
-        tunnel
-            .stop()
-            .map(|_| ())
-            .map_err(|error| error.runtime_fault())
+        match tunnel {
+            RuntimeConnectionHandle::Local(local) => {
+                local.stop();
+                Ok(())
+            }
+            RuntimeConnectionHandle::Tunnel(tunnel) => tunnel
+                .stop()
+                .map(|_| ())
+                .map_err(|error| error.runtime_fault()),
+        }
     }
 
     fn stop_pep(&mut self, pep: Self::Pep) -> Result<Self::Mcp, RuntimeFault> {
@@ -388,7 +463,10 @@ where
     }
 
     fn connector_endpoint(&self, tunnel: &Self::Tunnel) -> Option<ConnectorEndpoint> {
-        tunnel.connector_endpoint()
+        match tunnel {
+            RuntimeConnectionHandle::Tunnel(tunnel) => tunnel.connector_endpoint(),
+            RuntimeConnectionHandle::Local(_) => None,
+        }
     }
 
     fn connection_profile(&self) -> Option<ConnectionProfile> {
@@ -420,9 +498,12 @@ where
     }
 
     fn probe_tunnel_health(&mut self, tunnel: &mut Self::Tunnel) -> Result<(), RuntimeFault> {
-        tunnel
-            .wait_ready_for_recovery(Duration::ZERO, Duration::from_millis(250), || false)
-            .map_err(|error| error.runtime_fault())
+        match tunnel {
+            RuntimeConnectionHandle::Local(_) => self.confirm_tunnel_ready(tunnel),
+            RuntimeConnectionHandle::Tunnel(tunnel) => tunnel
+                .wait_ready_for_recovery(Duration::ZERO, Duration::from_millis(250), || false)
+                .map_err(|error| error.runtime_fault()),
+        }
     }
 
     fn current_workspace(&self) -> Option<&Path> {

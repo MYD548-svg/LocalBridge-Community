@@ -686,6 +686,22 @@ impl PolicyEnforcementRuntime {
         self.port
     }
 
+    pub(crate) fn active_task_summaries(&self) -> Vec<String> {
+        let mut tasks: Vec<String> = self
+            .control_plane
+            .tasks()
+            .active()
+            .iter()
+            .map(|task| format!("{}: {:?}", task.id.as_str(), task.kind))
+            .collect();
+        for execution in self.control_plane.executions().running() {
+            tasks.push(format!("执行 {}", execution.public_session_id.as_str()));
+        }
+        tasks.sort();
+        tasks.dedup();
+        tasks
+    }
+
     pub fn endpoint(&self) -> String {
         format!("http://127.0.0.1:{}/mcp", self.port)
     }

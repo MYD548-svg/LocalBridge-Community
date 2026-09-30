@@ -186,9 +186,13 @@ export async function auditPackageRoot(packageRoot) {
 }
 
 async function verifyLicenseInventory() {
-  for (const path of ["LICENSE", "THIRD_PARTY_NOTICES.md", "runtime/coding-tools-mcp/LICENSE", "runtime/python/LICENSE.txt", "runtime/tunnel-client/LICENSE"]) {
+  for (const path of ["LICENSE", "THIRD_PARTY_NOTICES.md", "runtime/coding-tools-mcp/LICENSE", "runtime/python/LICENSE.txt", "runtime/tunnel-client/LICENSE", "docs/licenses/mcp-proxy-MIT.txt", "provenance/local-mcp-references.json"]) {
     if (!existsSync(resolve(root, path))) throw new Error(`required license file missing: ${path}`);
   }
+  const references = JSON.parse(await readFile(resolve(root, "provenance/local-mcp-references.json"), "utf8"));
+  if (references.schemaVersion !== 1 || references.primaryCommit !== "153a96a61fde2bf5a23961c64a3dd96b5e385108") throw new Error("unverified local adapter primary reference");
+  const licenseBlob = references.reviewed.find((item) => item.project === "sparfenyuk/mcp-proxy" && item.file === "LICENSE")?.blobSha;
+  if (licenseBlob !== "f690a20a5fcd4f28188fb0f83b109211c47ebbc7" || git(["hash-object", "--no-filters", "docs/licenses/mcp-proxy-MIT.txt"]).trim() !== licenseBlob) throw new Error("adapted source license differs from reviewed upstream blob");
   const lock = JSON.parse(await readFile(resolve(root, "package-lock.json"), "utf8"));
   const missingNpm = Object.entries(lock.packages ?? {}).filter(([key, value]) => key && !value.link && !value.license).map(([key]) => key);
   if (missingNpm.length) throw new Error(`npm lock packages missing license metadata: ${missingNpm.slice(0, 10).join(", ")}`);
@@ -196,7 +200,7 @@ async function verifyLicenseInventory() {
   const missingCargo = metadata.packages.filter((pkg) => pkg.name !== "localbridge" && !pkg.license && !pkg.license_file).map((pkg) => `${pkg.name}@${pkg.version}`);
   if (missingCargo.length) throw new Error(`Cargo packages missing license metadata: ${missingCargo.slice(0, 10).join(", ")}`);
   const notices = await readFile(resolve(root, "THIRD_PARTY_NOTICES.md"), "utf8");
-  for (const marker of ["coding-tools-mcp", "tunnel-client", "Python", "Tauri", "WebView2", "aria2", "7-Zip", "jq", "curl.exe"]) {
+  for (const marker of ["coding-tools-mcp", "tunnel-client", "Python", "Tauri", "WebView2", "aria2", "7-Zip", "jq", "curl.exe", "mcp-proxy"]) {
     if (!notices.includes(marker)) throw new Error(`THIRD_PARTY_NOTICES missing ${marker}`);
   }
   const report = { schema: 1, npm_packages: Object.keys(lock.packages ?? {}).length - 1, cargo_packages: metadata.packages.length - 1, missing_npm_license_metadata: 0, missing_cargo_license_metadata: 0 };

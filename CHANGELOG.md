@@ -4,7 +4,10 @@ All notable user-visible changes to LocalBridge are recorded here.
 
 ## [Unreleased]
 
-No user-visible changes yet.
+- 增加 Codex 本地连接候选模式：随包 STDIO 适配器通过当前用户命名管道进入现有权限层与执行引擎；保留 OpenAI Tunnel 兼容模式。
+- 新用户默认本地模式；连接设置独立版本化保存，已有 Tunnel 用户保持原模式。接入使用桌面 Codex 自带官方 MCP 命令，备份并核验配置归属，保留其他 MCP、模型和登录信息。
+- 引导区分服务就绪、配置完成和客户端已连接，完成引导需要真实工具成功调用；目录、模式和断开操作明确确认受影响任务取消。
+- 增加协议、权限、配置、输出与打包断言及参考来源说明。当前完整 Windows 编译受缺失 MSVC/SDK 阻断，未生成新版安装包，完整实机验收尚未完成；详见本地验证报告。
 
 ## [0.1.5] - 2026-09-03
 

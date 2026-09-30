@@ -134,6 +134,9 @@ pub enum DesktopRuntimeReconcileError<E> {
 }
 
 pub trait ExitRuntime {
+    fn active_task_summaries(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn stop_tunnel_for_exit(&mut self) -> Result<(), DesktopExitError>;
     fn finish_exit_after_tunnel(&mut self) -> Result<(), DesktopExitError>;
 
@@ -294,6 +297,9 @@ where
     D: RuntimeDriver,
     RuntimeOrchestrator<D>: Send,
 {
+    fn active_task_summaries(&self) -> Vec<String> {
+        RuntimeOrchestrator::active_task_summaries(self)
+    }
     fn stop_tunnel_for_exit(&mut self) -> Result<(), DesktopExitError> {
         RuntimeOrchestrator::stop_tunnel_for_exit(self).map_err(|_| DesktopExitError::Runtime)
     }
@@ -354,6 +360,9 @@ where
     C: RecoveryClock + Send,
     AutoRecoveryRuntime<D, C>: Send,
 {
+    fn active_task_summaries(&self) -> Vec<String> {
+        self.runtime().active_task_summaries()
+    }
     fn stop_tunnel_for_exit(&mut self) -> Result<(), DesktopExitError> {
         self.orchestrator_mut()
             .stop_tunnel_for_exit()
@@ -564,7 +573,7 @@ fn publish_control_plane_observation(
                 .desired
                 .connection
                 .as_ref()
-                .map(|profile| profile.tunnel_id.expose().to_owned()),
+                .and_then(|profile| profile.tunnel_id.as_ref().map(|id| id.expose().to_owned())),
             desired_credential_epoch: convergence
                 .desired
                 .connection
@@ -574,7 +583,7 @@ fn publish_control_plane_observation(
                 .observed
                 .connection
                 .as_ref()
-                .map(|profile| profile.tunnel_id.expose().to_owned()),
+                .and_then(|profile| profile.tunnel_id.as_ref().map(|id| id.expose().to_owned())),
             observed_credential_epoch: convergence
                 .observed
                 .connection
@@ -1159,6 +1168,16 @@ impl DesktopLifecycle {
             }
             Err(TryLockError::WouldBlock) => None,
         }
+    }
+
+    pub fn active_task_summaries(&self) -> Vec<String> {
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .as_ref()
+            .map(|runtime| runtime.active_task_summaries())
+            .unwrap_or_default()
     }
 
     pub fn runtime_snapshot(&self) -> DesktopRuntimeSnapshot {

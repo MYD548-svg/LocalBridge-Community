@@ -31,6 +31,7 @@ pub const CHATGPT_CUSTOM_CONNECTOR_URL: &str = "https://chatgpt.com/plugins#sett
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OnboardingState {
+    connection_mode: crate::local_connection::profile::ConnectionMode,
     complete: bool,
     projection_revision: u64,
     connection_configured: bool,
@@ -50,7 +51,14 @@ pub struct ConnectorEndpointProjection {
 pub async fn get_onboarding_state(app: AppHandle) -> UiResult<OnboardingState> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<OnboardingState> {
         let lifecycle = app.state::<DesktopLifecycle>();
-        project_state(&lifecycle)
+        let mut result = project_state(&lifecycle)?;
+        result.connection_mode = crate::local_connection::profile::ConnectionSettings::load(
+            &app_data_dir(&app)?,
+            result.complete || result.tunnel_id.is_some(),
+        )
+        .map_err(|_| "无法读取连接模式".to_string())?
+        .mode;
+        Ok(result)
     })
     .await
     .map_err(|_| UiError::internal("Ui.OnboardingReadJoinFailed", "首次设置状态后台任务异常"))?
@@ -189,9 +197,12 @@ pub async fn choose_onboarding_workspace_folder() -> UiResult<Option<String>> {
 pub async fn prepare_onboarding_project(
     project_id: Option<String>,
     selected_folder: Option<String>,
+    confirmed_cancel: Option<bool>,
     app: AppHandle,
 ) -> UiResult<OnboardingState> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<OnboardingState> {
+        let lifecycle = app.state::<DesktopLifecycle>();
+        super::local_connection::ensure_idle(&lifecycle, confirmed_cancel.unwrap_or(false))?;
         if let Some(folder) = selected_folder.filter(|value| !value.trim().is_empty()) {
             let lifecycle = app.state::<DesktopLifecycle>();
             ui::add_project_blocking(folder, Some(false), &app, &lifecycle)?;
@@ -230,6 +241,19 @@ pub async fn complete_onboarding(app: AppHandle) -> UiResult<()> {
         }
         let store = SettingsStore::new(app_data_dir(&app)?.join("settings.json"));
         let mut data = store.load().map_err(|_| "无法读取设置".to_string())?;
+        let connection = crate::local_connection::profile::ConnectionSettings::load(
+            &app_data_dir(&app)?,
+            data.settings.onboarding_complete,
+        )
+        .map_err(|_| "无法读取连接模式".to_string())?;
+        if connection.mode == crate::local_connection::profile::ConnectionMode::Local
+            && (!crate::local_connection::registration::configured(&connection)
+                .map_err(|_| "无法核验配置".to_string())?
+                || crate::local_connection::runtime::connected_clients() == 0
+                || crate::local_connection::runtime::successful_calls() == 0)
+        {
+            return Err(UiError::from("请先连接 Codex，并在新会话中完成真实调用"));
+        }
         data.settings.onboarding_complete = true;
         store
             .save(&data)
@@ -257,6 +281,7 @@ fn onboarding_state_from_snapshot(snapshot: &ControlPlaneSnapshot) -> Onboarding
     let settings = snapshot.settings.ready_value();
     let connection = snapshot.connection.ready_value();
     OnboardingState {
+        connection_mode: crate::local_connection::profile::ConnectionMode::OpenaiTunnel,
         complete: settings.is_some_and(|settings| settings.onboarding_complete),
         projection_revision: snapshot.revision,
         connection_configured: connection

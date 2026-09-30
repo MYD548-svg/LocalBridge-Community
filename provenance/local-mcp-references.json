@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "primaryCommit": "153a96a61fde2bf5a23961c64a3dd96b5e385108",
+  "projects": [
+    {
+      "repository": "sparfenyuk/mcp-proxy",
+      "commit": "153a96a61fde2bf5a23961c64a3dd96b5e385108",
+      "license": "MIT"
+    },
+    {
+      "repository": "supercorp-ai/supergateway",
+      "commit": "1a2445620428e5217ee987d8585fb6db308f2ef9",
+      "license": "MIT"
+    },
+    {
+      "repository": "punkpeye/mcp-proxy",
+      "commit": "7fbe09d7aa697a3b314af3016eb13ff10dc50b48",
+      "license": "MIT"
+    },
+    {
+      "repository": "modelcontextprotocol/rust-sdk",
+      "commit": "ae2f9c9b45a2c98d24ee345406e79f507c9f9282",
+      "usage": "protocol and behavior reference only; no code copied or linked",
+      "license": "Apache-2.0 with original MIT contributions; documentation CC-BY-4.0"
+    }
+  ],
+  "reviewed": [
+    {
+      "project": "sparfenyuk/mcp-proxy",
+      "commit": "153a96a61fde2bf5a23961c64a3dd96b5e385108",
+      "blobSha": "f690a20a5fcd4f28188fb0f83b109211c47ebbc7",
+      "url": "https://github.com/sparfenyuk/mcp-proxy/blob/153a96a61fde2bf5a23961c64a3dd96b5e385108/LICENSE",
+      "file": "LICENSE",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "sparfenyuk/mcp-proxy",
+      "commit": "153a96a61fde2bf5a23961c64a3dd96b5e385108",
+      "blobSha": "ae1c1b5ef6d1413310f9a53418232000be1e9f10",
+      "url": "https://github.com/sparfenyuk/mcp-proxy/blob/153a96a61fde2bf5a23961c64a3dd96b5e385108/src/mcp_proxy/mcp_server.py",
+      "file": "mcp_server.py",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "sparfenyuk/mcp-proxy",
+      "commit": "153a96a61fde2bf5a23961c64a3dd96b5e385108",
+      "blobSha": "1317836c69947f8f3878344ddf0d38872e9cfcba",
+      "url": "https://github.com/sparfenyuk/mcp-proxy/blob/153a96a61fde2bf5a23961c64a3dd96b5e385108/src/mcp_proxy/streamablehttp_client.py",
+      "file": "streamablehttp_client.py",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "sparfenyuk/mcp-proxy",
+      "commit": "153a96a61fde2bf5a23961c64a3dd96b5e385108",
+      "blobSha": "d21011b2480b5c76fd6abcff0201b3a0788ed7ab",
+      "url": "https://github.com/sparfenyuk/mcp-proxy/blob/153a96a61fde2bf5a23961c64a3dd96b5e385108/tests/test_progress_forwarding.py",
+      "file": "test_progress_forwarding.py",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "sparfenyuk/mcp-proxy",
+      "commit": "153a96a61fde2bf5a23961c64a3dd96b5e385108",
+      "blobSha": "0cced2e997a1635429c8fb8f8143c4c1bb598c9d",
+      "url": "https://github.com/sparfenyuk/mcp-proxy/blob/153a96a61fde2bf5a23961c64a3dd96b5e385108/src/mcp_proxy/proxy_server.py",
+      "file": "proxy_server.py",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "sparfenyuk/mcp-proxy",
+      "commit": "153a96a61fde2bf5a23961c64a3dd96b5e385108",
+      "blobSha": "cf1e0a54ab3ecc05f743fbdfebc63f96d44f3dd7",
+      "url": "https://github.com/sparfenyuk/mcp-proxy/blob/153a96a61fde2bf5a23961c64a3dd96b5e385108/tests/test_proxy_server.py",
+      "file": "test_proxy_server.py",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "supercorp-ai/supergateway",
+      "commit": "1a2445620428e5217ee987d8585fb6db308f2ef9",
+      "blobSha": "83e853d0f186bb307097867db21163df452389c3",
+      "url": "https://github.com/supercorp-ai/supergateway/blob/1a2445620428e5217ee987d8585fb6db308f2ef9/LICENSE",
+      "file": "LICENSE",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "punkpeye/mcp-proxy",
+      "commit": "7fbe09d7aa697a3b314af3016eb13ff10dc50b48",
+      "blobSha": "44d536b84eb750727c5f2d9949a0b554bf6db86f",
+      "url": "https://github.com/punkpeye/mcp-proxy/blob/7fbe09d7aa697a3b314af3016eb13ff10dc50b48/LICENSE",
+      "file": "LICENSE",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "punkpeye/mcp-proxy",
+      "commit": "7fbe09d7aa697a3b314af3016eb13ff10dc50b48",
+      "blobSha": "b3e1ae42f55f54b4941f5f8310f8efe28448fb4e",
+      "url": "https://github.com/punkpeye/mcp-proxy/blob/7fbe09d7aa697a3b314af3016eb13ff10dc50b48/src/proxyServer.ts",
+      "file": "proxyServer.ts",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "supercorp-ai/supergateway",
+      "commit": "1a2445620428e5217ee987d8585fb6db308f2ef9",
+      "blobSha": "1526441a6bc08c8bcc6c166b55789c732a95fcbb",
+      "url": "https://github.com/supercorp-ai/supergateway/blob/1a2445620428e5217ee987d8585fb6db308f2ef9/src/gateways/streamableHttpToStdio.ts",
+      "file": "streamableHttpToStdio.ts",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "supercorp-ai/supergateway",
+      "commit": "1a2445620428e5217ee987d8585fb6db308f2ef9",
+      "blobSha": "90bd66659e6a0fe6b128d70efc3235a36498710a",
+      "url": "https://github.com/supercorp-ai/supergateway/blob/1a2445620428e5217ee987d8585fb6db308f2ef9/tests/bridgeCancellation.test.ts",
+      "file": "bridgeCancellation.test.ts",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "modelcontextprotocol/rust-sdk",
+      "commit": "ae2f9c9b45a2c98d24ee345406e79f507c9f9282",
+      "blobSha": "4a93985763241755401a10678395303de4e720ba",
+      "url": "https://github.com/modelcontextprotocol/rust-sdk/blob/ae2f9c9b45a2c98d24ee345406e79f507c9f9282/LICENSE",
+      "file": "LICENSE",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "modelcontextprotocol/rust-sdk",
+      "commit": "ae2f9c9b45a2c98d24ee345406e79f507c9f9282",
+      "blobSha": "adc2dba0ef63d3421f6fd8bd0590f25c77bd9fe3",
+      "url": "https://github.com/modelcontextprotocol/rust-sdk/blob/ae2f9c9b45a2c98d24ee345406e79f507c9f9282/crates/rmcp/src/transport/io.rs",
+      "file": "crates/rmcp/src/transport/io.rs",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "modelcontextprotocol/rust-sdk",
+      "commit": "ae2f9c9b45a2c98d24ee345406e79f507c9f9282",
+      "blobSha": "64be3fc7342f4236489eaa9c6f24e21b6068c5d9",
+      "url": "https://github.com/modelcontextprotocol/rust-sdk/blob/ae2f9c9b45a2c98d24ee345406e79f507c9f9282/crates/rmcp/tests/test_stdio_response_concurrency.rs",
+      "file": "crates/rmcp/tests/test_stdio_response_concurrency.rs",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "modelcontextprotocol/rust-sdk",
+      "commit": "ae2f9c9b45a2c98d24ee345406e79f507c9f9282",
+      "blobSha": "50479a2376996f7db4a36f0cee212e93a1403dd4",
+      "url": "https://github.com/modelcontextprotocol/rust-sdk/blob/ae2f9c9b45a2c98d24ee345406e79f507c9f9282/crates/rmcp/tests/test_close_connection.rs",
+      "file": "crates/rmcp/tests/test_close_connection.rs",
+      "upstreamTestsRun": false
+    },
+    {
+      "project": "modelcontextprotocol/rust-sdk",
+      "commit": "ae2f9c9b45a2c98d24ee345406e79f507c9f9282",
+      "blobSha": "0ca0182f941d4e4963a8a55ed715dd4c8f293cae",
+      "url": "https://github.com/modelcontextprotocol/rust-sdk/blob/ae2f9c9b45a2c98d24ee345406e79f507c9f9282/crates/rmcp/tests/test_client_initialization.rs",
+      "file": "crates/rmcp/tests/test_client_initialization.rs",
+      "upstreamTestsRun": false
+    }
+  ]
+}

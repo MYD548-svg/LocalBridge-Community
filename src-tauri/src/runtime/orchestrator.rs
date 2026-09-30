@@ -12,6 +12,12 @@ use crate::tunnel::ConnectorEndpoint;
 use super::RecoveryPermit;
 
 pub trait RuntimeDriver {
+    fn uses_tunnel(&self) -> bool {
+        true
+    }
+    fn active_task_summaries(&self, _pep: &Self::Pep) -> Vec<String> {
+        Vec::new()
+    }
     type Mcp;
     type Pep;
     type Tunnel;
@@ -227,6 +233,18 @@ impl<D: RuntimeDriver> RuntimeOrchestrator<D> {
         &self.state
     }
 
+    pub fn active_task_summaries(&self) -> Vec<String> {
+        self.ready
+            .as_ref()
+            .map(|ready| self.driver.active_task_summaries(&ready.pep))
+            .or_else(|| {
+                self.recovering_pep
+                    .as_ref()
+                    .map(|pep| self.driver.active_task_summaries(pep))
+            })
+            .unwrap_or_default()
+    }
+
     pub fn current_task(&self) -> CurrentTaskStatus {
         self.current_task_timing().status
     }
@@ -346,7 +364,9 @@ impl<D: RuntimeDriver> RuntimeOrchestrator<D> {
             return Err(self.fail(fault, cleanup_fault, &mut project));
         }
 
-        self.transition(RuntimeState::StartingTunnel, &mut project);
+        if self.driver.uses_tunnel() {
+            self.transition(RuntimeState::StartingTunnel, &mut project);
+        }
         let mut tunnel = match self.driver.start_tunnel(&pep) {
             Ok(tunnel) => tunnel,
             Err(fault) => {
@@ -355,7 +375,9 @@ impl<D: RuntimeDriver> RuntimeOrchestrator<D> {
             }
         };
 
-        self.transition(RuntimeState::WaitingTunnelReady, &mut project);
+        if self.driver.uses_tunnel() {
+            self.transition(RuntimeState::WaitingTunnelReady, &mut project);
+        }
         if let Err(fault) = self.driver.confirm_tunnel_ready(&mut tunnel) {
             let mut cleanup_fault = self.driver.stop_tunnel(&mut tunnel).err();
             merge_cleanup_fault(&mut cleanup_fault, self.cleanup_pep(pep));

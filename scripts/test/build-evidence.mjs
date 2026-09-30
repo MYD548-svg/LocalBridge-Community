@@ -37,6 +37,7 @@ export function artifacts() {
     `src-tauri/target/release/bundle/nsis/${installers[0]}`,
     "src-tauri/target/release/localbridge.exe",
     "src-tauri/target/release-stage/localbridge-privileged-broker.exe",
+    "src-tauri/target/local-mcp-stage/localbridge-mcp.exe", "src-tauri/target/local-mcp-stage/adapter-build.json", "provenance/local-mcp-references.json", "docs/licenses/mcp-proxy-MIT.txt",
     "runtime-manifest.toml", "runtime-policy.toml", "provenance/runtime-lock.json",
     "provenance/tunnel-client.json", "src-tauri/target/release-stage/broker-build.json",
     ...filesBelow(join(root, "runtime")).map((name) => `runtime/${name}`),

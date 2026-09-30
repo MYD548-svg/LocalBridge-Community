@@ -22,3 +22,7 @@ Application/source dependencies:
 Windows `curl.exe` is a system runtime dependency and is not redistributed by LocalBridge; LocalBridge resolves only `%SystemRoot%/System32/curl.exe` after its runtime capability probe.
 
 Exact versions, source commits, binary checksums, transitive dependencies and notices are frozen by the release runtime manifest and SBOM. Where an upstream payload includes its own LICENSE/NOTICE material, that material remains with the redistributed payload.
+
+## Local MCP transport adaptation
+
+The Rust local adapter adapts transport/proxy separation from sparfenyuk/mcp-proxy, commit 153a96a61fde2bf5a23961c64a3dd96b5e385108. Copyright (c) 2024 Sergey Parfenyuk. Licensed under MIT; the complete license is bundled at licenses/mcp-proxy-MIT.txt and recorded in docs/licenses/mcp-proxy-MIT.txt. See docs/LOCAL-CODEX-ADAPTATION.md for scope and other inspected references. No third-party proxy executable is distributed.

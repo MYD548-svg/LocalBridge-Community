@@ -26,3 +26,6 @@
 runtime/python/** -text -eol
 runtime/coding-tools-mcp/** -text -eol
 runtime/tunnel-client/** -text -eol
+
+# Preserve the exact reviewed upstream MIT license blob.
+docs/licenses/mcp-proxy-MIT.txt -text -eol

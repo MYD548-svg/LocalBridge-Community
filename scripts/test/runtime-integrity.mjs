@@ -72,7 +72,7 @@ function resolveInstallerSevenZip(root) {
   }
   throw new Error("no 7-Zip installation available for installer payload verification");
 }
-function verifyInstallerPayload(root, evidence) {
+function verifyInstallerPayload(root, evidence, adapterEvidence) {
   const bundleDir = join(root, "src-tauri/target/release/bundle/nsis");
   if (!existsSync(bundleDir)) return;
   const installers = filesBelow(bundleDir).filter((name) => name.endsWith("-setup.exe"));
@@ -84,13 +84,19 @@ function verifyInstallerPayload(root, evidence) {
   if (listing.status !== 0 || !listing.stdout) throw new Error(`installer listing failed (${listing.status ?? listing.error})`);
   const paths = installerEntryPaths(listing.stdout);
   rejectDuplicateInstallerEntries(paths);
+  const adapterEntry = paths.find((path) => path.toLowerCase() === "localbridge-mcp.exe");
+  if (!adapterEntry) throw new Error("installer payload does not carry the attested local MCP adapter");
+  const licenseEntry = paths.find((path) => path.replaceAll("\\", "/").toLowerCase() === "licenses/mcp-proxy-mit.txt");
+  if (!licenseEntry) throw new Error("installer adapter attribution missing");
   const brokerEntry = paths.find((path) => path.toLowerCase() === "localbridge-privileged-broker.exe");
   if (!brokerEntry) throw new Error("installer payload does not carry the attested privileged broker");
   // Extraction is retained: this repository forbids automatic bulk deletion.
   const extraction = mkdtempSync(join(tmpdir(), "localbridge-installer-verify-"));
-  const unpacked = spawnSync(sevenZip, ["x", "-y", `-o${extraction}`, installer, brokerEntry], { windowsHide: true });
+  const unpacked = spawnSync(sevenZip, ["x", "-y", `-o${extraction}`, installer, brokerEntry, adapterEntry, licenseEntry], { windowsHide: true });
   if (unpacked.status !== 0) throw new Error(`installer broker extraction failed (${unpacked.status ?? unpacked.error})`);
   verifyHash(join(extraction, brokerEntry), evidence.sha256);
+  verifyHash(join(extraction, adapterEntry), adapterEvidence.sha256);
+  verifyHash(join(extraction, licenseEntry), sha256(requiredFile(join(root, "docs/licenses/mcp-proxy-MIT.txt"))));
   console.log(`installer payload verified; broker extraction retained at ${extraction}`);
 }
 export function verifyRuntime(root, { bundledOnly = false, lockFile = "provenance/runtime-lock.json" } = {}) {
@@ -165,7 +171,14 @@ export function verifyRuntime(root, { bundledOnly = false, lockFile = "provenanc
   // NSIS installer already exists in this checkout, open it and verify the
   // actually carried broker against the same evidence, and that no later
   // duplicate entry overwrites it.
-  verifyInstallerPayload(root, evidence);
+  const adapter = join(root, "src-tauri/target/local-mcp-stage/localbridge-mcp.exe");
+  const adapterEvidence = JSON.parse(requiredFile(join(root, "src-tauri/target/local-mcp-stage/adapter-build.json")));
+  if (adapterEvidence.status !== "PASS") throw new Error("adapter build incomplete");
+  verifyHash(adapter, adapterEvidence.sha256);
+  requiredFile(join(root, "docs/licenses/mcp-proxy-MIT.txt"));
+  if (config?.bundle?.resources?.["target/local-mcp-stage/localbridge-mcp.exe"] !== "localbridge-mcp.exe" || config?.bundle?.resources?.["../docs/licenses/mcp-proxy-MIT.txt"] !== "licenses/mcp-proxy-MIT.txt") throw new Error("installer must embed the attested staged adapter and license");
+  rejectExtras(dirname(adapter), ["localbridge-mcp.exe", "adapter-build.json"]);
+  verifyInstallerPayload(root, evidence, adapterEvidence);
   rejectExtras(dirname(broker), ["localbridge-privileged-broker.exe", "broker-build.json"]);
   }
   return { status: "PASS", coverage: bundledOnly ? "bundled-only" : "bundled-and-staged" };

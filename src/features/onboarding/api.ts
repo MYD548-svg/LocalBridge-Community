@@ -7,6 +7,7 @@ export interface OnboardingReadiness {
 }
 
 export interface OnboardingState {
+  connectionMode?: "local" | "openai_tunnel";
   complete: boolean;
   projectionRevision: number;
   connectionConfigured: boolean;
@@ -33,6 +34,7 @@ export function parseOnboardingState(value: unknown): OnboardingState {
     || typeof value.readiness.openaiTunnel !== "boolean") {
     throw new Error("后端首次设置状态合同不兼容");
   }
+  if (value.connectionMode !== undefined && value.connectionMode !== "local" && value.connectionMode !== "openai_tunnel") throw new Error("连接模式合同不兼容");
   return value as unknown as OnboardingState;
 }
 
@@ -44,7 +46,7 @@ export function parseConnectorEndpoint(value: unknown): ConnectorEndpointProject
 export const onboardingApi = {
   read: async () => parseOnboardingState(await invoke<unknown>("get_onboarding_state")),
   saveConnection: (tunnelId: string, runtimeKey: string) => invoke<void>("save_onboarding_connection", { tunnelId, runtimeKey }),
-  prepareProject: async (projectId: string | null, selectedFolder: string | null) => parseOnboardingState(await invoke<unknown>("prepare_onboarding_project", { projectId, selectedFolder })),
+  prepareProject: async (projectId: string | null, selectedFolder: string | null, confirmedCancel = false) => parseOnboardingState(await invoke<unknown>("prepare_onboarding_project", { projectId, selectedFolder, confirmedCancel })),
   chooseWorkspaceFolder: () => invoke<string | null>("choose_onboarding_workspace_folder"),
   openTunnelSettings: () => invoke<void>("open_openai_tunnel_settings"),
   openApiKeys: () => invoke<void>("open_openai_api_keys"),

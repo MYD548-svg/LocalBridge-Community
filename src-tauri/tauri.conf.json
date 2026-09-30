@@ -17,8 +17,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["../assets/icons/localbridge.ico"],
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "../assets/icons/localbridge.ico"
+    ],
     "externalBin": [],
     "resources": {
       "../runtime/python/": "runtime/python/",
@@ -29,7 +33,9 @@
       "../runtime-manifest.toml": "runtime-manifest.toml",
       "../runtime-policy.toml": "runtime-policy.toml",
       "../LICENSE": "LICENSE",
-      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "target/local-mcp-stage/localbridge-mcp.exe": "localbridge-mcp.exe",
+      "../docs/licenses/mcp-proxy-MIT.txt": "licenses/mcp-proxy-MIT.txt"
     },
     "windows": {
       "nsis": {

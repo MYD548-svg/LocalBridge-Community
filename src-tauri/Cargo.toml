@@ -23,6 +23,12 @@ path = "src/main.rs"
 # template installs the app-feature-set copy from target/release over the
 # resources-mapped attested staged broker.
 privileged-broker = []
+mcp-adapter = []
+
+[[bin]]
+name = "localbridge-mcp"
+path = "bin/mcp-adapter/main.rs"
+required-features = ["mcp-adapter"]
 
 [[bin]]
 name = "localbridge-privileged-broker"

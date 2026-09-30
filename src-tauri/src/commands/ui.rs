@@ -815,9 +815,14 @@ pub(crate) fn add_project_blocking(
 }
 
 #[tauri::command]
-pub async fn select_project(id: String, app: AppHandle) -> UiResult<()> {
+pub async fn select_project(
+    id: String,
+    confirmed_cancel: Option<bool>,
+    app: AppHandle,
+) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
         let lifecycle = app.state::<DesktopLifecycle>();
+        super::local_connection::ensure_idle(&lifecycle, confirmed_cancel.unwrap_or(false))?;
         select_project_blocking(id, &app, &lifecycle)
     })
     .await
@@ -856,10 +861,14 @@ pub(crate) fn select_project_blocking(
 }
 
 #[tauri::command]
-pub async fn remove_project(id: String, app: AppHandle) -> UiResult<()> {
+pub async fn remove_project(
+    id: String,
+    confirmed_cancel: Option<bool>,
+    app: AppHandle,
+) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
         let lifecycle = app.state::<DesktopLifecycle>();
-        remove_project_blocking(id, &app, &lifecycle)
+        remove_project_blocking(id, &app, &lifecycle, confirmed_cancel.unwrap_or(false))
     })
     .await
     .map_err(|_| UiError::internal("Ui.ProjectRemoveJoinFailed", "项目移除后台任务异常"))?
@@ -870,6 +879,7 @@ fn remove_project_blocking(
     id: String,
     app: &AppHandle,
     lifecycle: &DesktopLifecycle,
+    confirmed_cancel: bool,
 ) -> UiResult<()> {
     let id = WorkspaceId::from_validated(id).map_err(|_| "项目不存在".to_string())?;
     let (store, mut data) = load_app_data(app)?;
@@ -878,6 +888,7 @@ fn remove_project_blocking(
     }
     let was_active = data.workspace.active_workspace_id.as_ref() == Some(&id);
     if was_active {
+        super::local_connection::ensure_idle(lifecycle, confirmed_cancel)?;
         data.workspace.clear_active();
     }
     let _ = data.workspace.registry.remove(&id);
@@ -903,6 +914,7 @@ fn activate_project(
     id: WorkspaceId,
     candidate: &Path,
 ) -> UiResult<()> {
+    super::local_connection::ensure_idle(lifecycle, false)?;
     clear_manual_stop_for_explicit_action(app)?;
     data.workspace
         .set_active_reference(id.clone())
@@ -917,11 +929,20 @@ fn activate_project(
         .map_err(|error| runtime_reconciliation_message(error, "项目目标已保存"))
 }
 
-fn production_runtime_config_for_path(
+pub(crate) fn production_runtime_config_for_path(
     app: &AppHandle,
     path: &Path,
 ) -> UiResult<ProductionRuntimeConfig> {
     let app_data = app_data_dir(app)?;
+    let connection = crate::local_connection::profile::ConnectionSettings::load(&app_data, false)
+        .map_err(|_| "无法读取连接模式".to_string())?;
+    if connection.mode == crate::local_connection::profile::ConnectionMode::Local {
+        return Ok(ProductionRuntimeConfig::local(
+            production_install_root()?,
+            path,
+            app_data.join("health"),
+        ));
+    }
     let profile = StartupProfileStore::new(app_data.join(STARTUP_PROFILE_FILE_NAME))
         .load()
         .map_err(|_| "无法读取连接设置".to_string())?;
@@ -937,7 +958,7 @@ fn production_runtime_config_for_path(
     ))
 }
 
-fn production_runtime_config_for_active_workspace(
+pub(crate) fn production_runtime_config_for_active_workspace(
     app: &AppHandle,
     data: &AppData,
 ) -> UiResult<ProductionRuntimeConfig> {
@@ -1104,6 +1125,22 @@ pub(crate) fn refresh_settings_snapshot(
     lifecycle: &DesktopLifecycle,
 ) -> UiResult<()> {
     let (_, data) = load_app_data(app)?;
+    if lifecycle
+        .desired_state()
+        .snapshot()
+        .state
+        .connection
+        .as_ref()
+        .is_some_and(|connection| {
+            connection.mode == crate::local_connection::profile::ConnectionMode::Local
+        })
+    {
+        lifecycle.publish_settings_snapshot(
+            crate::control_plane::snapshot::SettingsProjection::from_app_data(&data, false, None),
+            None,
+        );
+        return Ok(());
+    }
     let (runtime_key_saved, runtime_key_length, error) =
         match WindowsCredentialStore::default().read_runtime_api_key() {
             Ok(secret) => (
@@ -1142,7 +1179,7 @@ fn app_data_dir(app: &AppHandle) -> UiResult<PathBuf> {
         .map_err(|_| "无法定位应用数据目录".to_string())?)
 }
 
-fn production_install_root() -> UiResult<PathBuf> {
+pub(crate) fn production_install_root() -> UiResult<PathBuf> {
     #[cfg(debug_assertions)]
     {
         Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))

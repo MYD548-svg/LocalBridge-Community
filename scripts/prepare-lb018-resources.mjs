@@ -20,6 +20,8 @@ export function compilePreflight(repository, execute = (program, args) => spawnS
     ["test-clippy", ["clippy", ...common, "--all-targets", "--", "-D", "warnings"]],
     ["broker-compile", ["test", ...common, "--features", "privileged-broker", "--bin", "localbridge-privileged-broker", "--no-run"]],
     ["broker-clippy", ["clippy", ...common, "--features", "privileged-broker", "--bin", "localbridge-privileged-broker", "--", "-D", "warnings"]],
+    ["adapter-compile", ["test", ...common, "--features", "mcp-adapter", "--bin", "localbridge-mcp", "--no-run"]],
+    ["adapter-clippy", ["clippy", ...common, "--features", "mcp-adapter", "--bin", "localbridge-mcp", "--", "-D", "warnings"]],
   ].map(([id, args]) => ({ id, program: "cargo", args: ["+1.85.0", ...args], status: "NOT_RUN", exitCode: null }));
   const directory = resolve(repository, "tests/artifacts/ci");
   mkdirSync(directory, { recursive: true });
@@ -67,6 +69,22 @@ export function stageBroker(repository, build, preflight = () => {}) {
   if (sha256(requiredFile(staged)) !== hash) throw new Error("broker staging mismatch");
   writeFileSync(evidence, JSON.stringify({ status: "PASS", sha256: hash, builtAt: new Date().toISOString() }, null, 2) + "\n");
 }
+export function stageAdapter(repository, build, preflight = () => {}) {
+  const stage = resolve(repository, "src-tauri/target/local-mcp-stage");
+  rejectExtras(stage, ["localbridge-mcp.exe", "adapter-build.json"]);
+  mkdirSync(stage, { recursive: true });
+  const staged = resolve(stage, "localbridge-mcp.exe");
+  const evidence = resolve(stage, "adapter-build.json");
+  writeFileSync(evidence, JSON.stringify({ status: "BUILDING" }));
+  if (!existsSync(staged)) writeFileSync(staged, Buffer.alloc(0));
+  preflight();
+  build();
+  const binary = resolve(repository, "src-tauri/target/release/localbridge-mcp.exe");
+  const hash = sha256(requiredFile(binary));
+  copyFileSync(binary, staged);
+  if (sha256(requiredFile(staged)) !== hash) throw new Error("adapter staging mismatch");
+  writeFileSync(evidence, JSON.stringify({ status: "PASS", sha256: hash, builtAt: new Date().toISOString() }, null, 2) + "\n");
+}
 export function prepareResources({ compile = false } = {}) {
   for (const forbidden of ["runtime/tunnel-client/cloudflared.exe", "runtime/tunnel-client/cloudflared-manifest.json"]) {
     if (existsSync(resolve(root, forbidden))) throw new Error(`forbidden payload: ${forbidden}`);
@@ -74,7 +92,11 @@ export function prepareResources({ compile = false } = {}) {
   for (const path of ["runtime/python/python.exe", "runtime/coding-tools-mcp/coding_tools_mcp/__init__.py", "runtime/tunnel-client/tunnel-client.exe", "runtime-manifest.toml", "runtime-policy.toml", "LICENSE", "THIRD_PARTY_NOTICES.md"]) requiredFile(resolve(root, path));
   if (/cloudflared|cloudflare managed/i.test(readFileSync(resolve(root, "runtime-manifest.toml"), "utf8"))) throw new Error("obsolete runtime manifest");
   run(process.execPath, ["scripts/prepare-toolbox.mjs"]);
+  const adapterStage = resolve(root, "src-tauri/target/local-mcp-stage");
+  mkdirSync(adapterStage, { recursive: true });
+  if (!existsSync(resolve(adapterStage, "localbridge-mcp.exe"))) writeFileSync(resolve(adapterStage, "localbridge-mcp.exe"), Buffer.alloc(0));
   stageBroker(root, () => run("cargo", ["+1.85.0", "build", "--manifest-path", "src-tauri/Cargo.toml", "--target-dir", "src-tauri/target", "--locked", "--release", "--features", "privileged-broker", "--bin", "localbridge-privileged-broker"]), () => { if (compile) compilePreflight(root); });
+  stageAdapter(root, () => run("cargo", ["+1.85.0", "build", "--manifest-path", "src-tauri/Cargo.toml", "--target-dir", "src-tauri/target", "--locked", "--release", "--features", "mcp-adapter", "--bin", "localbridge-mcp"]));
   console.log("LB018_RELEASE_RESOURCES=PASS broker=release toolbox=pinned");
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

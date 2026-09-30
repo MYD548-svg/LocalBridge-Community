@@ -90,26 +90,44 @@ pub fn configure_desktop_startup(
         .load()
         .map_err(DesktopStartupError::Settings)?;
     lifecycle.set_close_window_continue_running(data.settings.close_window_continue_running);
+    let profile_store = StartupProfileStore::new(app_data_dir.join(STARTUP_PROFILE_FILE_NAME));
+    let profile = profile_store.load().map_err(DesktopStartupError::Profile)?;
+    let connection_settings = crate::local_connection::profile::ConnectionSettings::load(
+        app_data_dir,
+        data.settings.onboarding_complete
+            || profile
+                .validated_tunnel_id()
+                .map_err(DesktopStartupError::Profile)?
+                .is_some(),
+    )
+    .map_err(DesktopStartupError::AppDataIo)?;
+    connection_settings
+        .save(app_data_dir)
+        .map_err(DesktopStartupError::AppDataIo)?;
     #[cfg(windows)]
     let (runtime_key_saved, runtime_key_length, settings_error) =
-        match WindowsCredentialStore::default().read_runtime_api_key() {
-            Ok(secret) => (
-                secret.is_some(),
-                secret
-                    .as_ref()
-                    .map(|secret| secret.expose_secret().chars().count()),
-                None,
-            ),
-            Err(_) => (
-                false,
-                None,
-                Some(OperationError::new(
-                    "Settings.CredentialMetadataUnavailable",
-                    ErrorCategory::Unavailable,
-                    "Runtime credential metadata is unavailable",
-                    true,
-                )),
-            ),
+        if connection_settings.mode == crate::local_connection::profile::ConnectionMode::Local {
+            (false, None, None)
+        } else {
+            match WindowsCredentialStore::default().read_runtime_api_key() {
+                Ok(secret) => (
+                    secret.is_some(),
+                    secret
+                        .as_ref()
+                        .map(|secret| secret.expose_secret().chars().count()),
+                    None,
+                ),
+                Err(_) => (
+                    false,
+                    None,
+                    Some(OperationError::new(
+                        "Settings.CredentialMetadataUnavailable",
+                        ErrorCategory::Unavailable,
+                        "Runtime credential metadata is unavailable",
+                        true,
+                    )),
+                ),
+            }
         };
     #[cfg(not(windows))]
     let (runtime_key_saved, runtime_key_length, settings_error) = (false, None, None);
@@ -117,9 +135,6 @@ pub fn configure_desktop_startup(
         SettingsProjection::from_app_data(&data, runtime_key_saved, runtime_key_length),
         settings_error,
     );
-    let profile_store = StartupProfileStore::new(app_data_dir.join(STARTUP_PROFILE_FILE_NAME));
-    let profile = profile_store.load().map_err(DesktopStartupError::Profile)?;
-
     let desired_workspace = data
         .workspace
         .resolve_active(&WorkspaceValidator)
@@ -127,10 +142,15 @@ pub fn configure_desktop_startup(
         .map(|workspace| {
             DesiredWorkspace::new(workspace.workspace_id, workspace.validated.execution_path())
         });
-    let desired_connection = profile
-        .validated_tunnel_id()
-        .map_err(DesktopStartupError::Profile)?
-        .map(|tunnel_id| ConnectionProfile::new(tunnel_id, 0));
+    let desired_connection =
+        if connection_settings.mode == crate::local_connection::profile::ConnectionMode::Local {
+            Some(ConnectionProfile::local())
+        } else {
+            profile
+                .validated_tunnel_id()
+                .map_err(DesktopStartupError::Profile)?
+                .map(|tunnel_id| ConnectionProfile::new(tunnel_id, 0))
+        };
     let process_elevated =
         current_process_is_elevated().map_err(DesktopStartupError::AuthorityProbe)?;
     let stored_permission: PermissionMode = data.settings.permission_mode.into();
@@ -212,6 +232,32 @@ fn build_background_resume_config(
     }
     if startup_mode == StartupMode::Background && profile.manual_stop_latched() {
         return Ok(Err(StartupSuppression::ManualStopLatched));
+    }
+    let connection = crate::local_connection::profile::ConnectionSettings::load(
+        app_data_dir,
+        data.settings.onboarding_complete
+            || profile
+                .validated_tunnel_id()
+                .map_err(DesktopStartupError::Profile)?
+                .is_some(),
+    )
+    .map_err(DesktopStartupError::AppDataIo)?;
+    if connection.mode == crate::local_connection::profile::ConnectionMode::Local {
+        if profile.manual_stop_latched() {
+            return Ok(Err(StartupSuppression::ManualStopLatched));
+        }
+        let Some(workspace) = data
+            .workspace
+            .resolve_active(&WorkspaceValidator)
+            .map_err(DesktopStartupError::Workspace)?
+        else {
+            return Ok(Err(StartupSuppression::NoActiveWorkspace));
+        };
+        return Ok(Ok(ProductionRuntimeConfig::local(
+            install_root,
+            workspace.validated.execution_path(),
+            app_data_dir.join("health"),
+        )));
     }
     let Some(tunnel_id) = profile
         .validated_tunnel_id()
