@@ -12,6 +12,8 @@ mod server;
 #[cfg(all(test, windows))]
 pub(crate) mod test_support;
 
+#[cfg(all(test, windows))]
+pub(crate) use driver::RuntimeConnectionHandle;
 pub use driver::{ProductionRuntimeConfig, ProductionRuntimeDriver};
 pub use facade::{
     AGENT_API_VERSION, AgentFacade, CodingRuntimeHealth, CodingRuntimeHealthState,

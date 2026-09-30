@@ -2,6 +2,16 @@
 
 实际验证测试-非正式发布。基线 `de756be2b57f48a908108922ea869b84a70fab87`，工作分支 `codex/local-codex`。本轮在本地收敛后执行一次普通推送；推送结果与最终 SHA 由交付消息记录。推送后不查询 Actions，不创建 PR、不合并、不发布、不重装。
 
+## 2026-09-30 测试连接类型修复
+
+已检查提交 `9512007c5213a4f8c6e3c4097f51e7b55d48fe84` 的 [CI push 36696285180](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36696285180)。运行于香港时间 2026-09-30 17:32 结束，结果为 **11 PASS、1 FAIL、7 NOT_RUN**。基础测试 37 项、bundled Python 11 项、前端测试 23 项通过；第 12 项 `runtime-resources` 在 `test-compile` 因 `background.rs:874` 的 E0308 类型不匹配失败。后续暂存完整性、认证、Rust 测试、Clippy、NSIS、安装包完整性和最终产物阶段未执行，仅上传诊断文件，没有新安装包。
+
+本次将该测试传入的 `TunnelRuntime` 包装为 `RuntimeConnectionHandle::Tunnel`，匹配生产驱动的新连接类型。`mcp::driver` 是私有模块，因此从 `mcp` 增加仅在 Windows 测试构建中启用、仅 crate 内可见的类型重导出，避免非测试构建出现未使用导入；对外接口和测试断言保持不变。已检索 `src-tauri` 与 `tests`，确认此测试构造函数只有这一处调用。
+
+本次验证：Rust 1.85 rustfmt 改动文件检查及 `git diff --check` 为 PASS。原完整编译命令 `cargo +1.85.0 test --manifest-path src-tauri/Cargo.toml --locked --all-targets --no-run` 在独立本地构建缓存中尝试，退出码 101；依赖构建脚本因 `link.exe` 缺失而阻断，记为 **BLOCKED**，未到达项目完整类型检查。日志保留于 `.local-tmp/local-codex-type-fix-20260930/test-compile-final.log`。此结果不证明修复后完整 Rust 编译或行为测试通过。
+
+本次保留原 19 项门禁与认证断言。提交并普通推送到 `codex/local-codex` 后只核对远端 SHA，随后停止，不创建 PR、不查询新 Actions、不合并或发布。**本次新提交的云端结果为 UNVERIFIED**；下文为原候选版本的本地验证记录。
+
 ## 环境与证据
 
 Rust/Cargo 1.85.0、Node 24.16.0、Git 2.46.0、Codex 桌面自带 CLI 0.159.0。已确认缺少 MSVC `link.exe`，未发现 Visual Studio Build Tools 或 Windows SDK 的标准安装目录；没有主动安装。完整 Cargo 检查在依赖构建脚本链接阶段终止，尚未到达项目完整类型检查。
