@@ -67,12 +67,15 @@ fn tool(pipe: &mut Pipe, id: &str, name: &str, arguments: Value) -> Value {
 
 #[test]
 fn local_route_retains_failed_stderr_and_enforces_session_ownership_ten_times() {
-    let fixture = PublicRuntimeFixture::start(PermissionMode::Full);
+    let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Full);
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let mut runtime = LocalRuntime::start(
         &executable,
         fixture.runtime().port(),
-        fixture.runtime().local_connector_bearer().unwrap(),
+        fixture
+            .runtime()
+            .local_connector_bearer()
+            .expect("authenticated local transport fixture provides a connector bearer"),
     )
     .unwrap();
     let mut owner = client(&executable);
@@ -151,12 +154,15 @@ fn local_route_retains_failed_stderr_and_enforces_session_ownership_ten_times() 
 
 #[test]
 fn initialization_concurrency_errors_and_manual_stop_use_real_local_transport() {
-    let fixture = PublicRuntimeFixture::start(PermissionMode::Edit);
+    let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Edit);
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let mut runtime = LocalRuntime::start(
         &executable,
         fixture.runtime().port(),
-        fixture.runtime().local_connector_bearer().unwrap(),
+        fixture
+            .runtime()
+            .local_connector_bearer()
+            .expect("authenticated local transport fixture provides a connector bearer"),
     )
     .unwrap();
     let mut premature = client(&executable);
@@ -236,12 +242,16 @@ fn initialization_concurrency_errors_and_manual_stop_use_real_local_transport() 
 #[test]
 fn cancellation_timeout_and_disconnect_never_replay_a_side_effect() {
     let workspace = crate::mcp::test_support::temp_workspace();
-    let fixture = PublicRuntimeFixture::start_in(workspace.clone(), PermissionMode::Full);
+    let fixture =
+        PublicRuntimeFixture::start_authenticated_in(workspace.clone(), PermissionMode::Full);
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let mut runtime = LocalRuntime::start(
         &executable,
         fixture.runtime().port(),
-        fixture.runtime().local_connector_bearer().unwrap(),
+        fixture
+            .runtime()
+            .local_connector_bearer()
+            .expect("authenticated local transport fixture provides a connector bearer"),
     )
     .unwrap();
     let mut owner = client(&executable);
@@ -306,14 +316,17 @@ fn cancellation_timeout_and_disconnect_never_replay_a_side_effect() {
 
 #[test]
 fn both_sides_reject_a_process_from_another_installation() {
-    let fixture = PublicRuntimeFixture::start(PermissionMode::Edit);
+    let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Edit);
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
     let workspace = crate::mcp::test_support::temp_workspace();
     let wrong_installation = workspace.join("probe.txt");
     let mut runtime = LocalRuntime::start(
         &wrong_installation,
         fixture.runtime().port(),
-        fixture.runtime().local_connector_bearer().unwrap(),
+        fixture
+            .runtime()
+            .local_connector_bearer()
+            .expect("authenticated local transport fixture provides a connector bearer"),
     )
     .unwrap();
     let name = pipe_name(&installation_id(&workspace).unwrap()).unwrap();
@@ -329,7 +342,10 @@ fn both_sides_reject_a_process_from_another_installation() {
     let mut runtime = LocalRuntime::start(
         &executable,
         fixture.runtime().port(),
-        fixture.runtime().local_connector_bearer().unwrap(),
+        fixture
+            .runtime()
+            .local_connector_bearer()
+            .expect("authenticated local transport fixture provides a connector bearer"),
     )
     .unwrap();
     let name = pipe_name(&installation_id(executable.parent().unwrap()).unwrap()).unwrap();

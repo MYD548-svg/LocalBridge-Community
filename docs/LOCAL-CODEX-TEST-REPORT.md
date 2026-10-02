@@ -2,7 +2,23 @@
 
 实际验证测试-非正式发布。基线 `de756be2b57f48a908108922ea869b84a70fab87`，工作分支 `codex/local-codex`。本轮在本地收敛后执行一次普通推送；推送结果与最终 SHA 由交付消息记录。推送后不查询 Actions，不创建 PR、不合并、不发布、不重装。
 
-## 2026-10-02 连接枚举大小修复
+## 2026-10-02 本地管道认证夹具修复
+
+已核验提交 `b471d7ed06e9590ff5448fae5b332880e5d1d4b7` 的 [CI push 36957941525](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36957941525)，运行于香港时间 2026-10-02 11:23 结束，原 19 项门禁结果为 **13 PASS、1 FAIL、5 NOT_RUN**。六项编译/Clippy 预检、Broker 与 Adapter 发布构建、暂存完整性均通过，枚举大小修复已得到该提交云端验证。`auth-repeat` 内原 Tunnel 认证探测 10 次、retained stderr 回归 10 次通过，随后四项 `local_connection::tests` 全部在获取连接 bearer 时因 `Option::unwrap()` 遇到 `None` 失败，尚未进入实际管道行为断言。后续完整 Rust 测试、独立 Clippy、NSIS、安装包完整性和最终产物五项未执行；仅有诊断产物，没有安装包。上轮提交的云端结果由此更新为 FAIL。
+
+共同原因已从源码确认：`PublicRuntimeFixture::start/start_in` 调用原隔离单元测试启动路径，该路径明确使用 `disabled_for_isolated_unit_test()`，因此 `local_connector_bearer()` 返回 `None`。本次增加仅 Windows 测试构建、crate 内可见的认证启动入口，使用原有 `ClientAuthenticator::generated()`，认证生成失败仍返回 `AuthenticationUnavailable`；与原测试入口共享权限、工作目录和生命周期设置。夹具新增 `start_authenticated/start_authenticated_in`，四个本地管道测试切换到新入口，五处 bearer 获取使用明确的 `expect`；原默认夹具、生产启动路径和外部接口不变。
+
+现有 Guard 认证测试改用新夹具，保留缺失 bearer 返回 401、错误 bearer 返回 401、正确 bearer 返回 200 的全部断言。原管道测试的初始化、并发、权限、跨会话归属、取消、超时、不重放、十次输出回归、停止和错误安装身份断言全部保留，认证及 stderr 重复次数未改变，没有伪造 bearer、关闭认证、添加认证豁免或调整门禁/Actions。
+
+本次本地证据保留于 `.local-tmp/auth-fixture-fix-20261002/`，`local-checks.json` 和 `rust-checks.json` 记录实际命令、退出码及逐项日志；该目录的前端输出与全新锁定依赖安装目录均保留。Rust 1.85 改动文件格式检查、`git diff --check` 和共享前 11 项检查为 PASS：基础集合 37 项（含 bundled Python 子套件 11 项）、前端测试 8 个文件 23 项、前端生产构建、公开内容预检、许可证及架构扫描全部通过；额外敏感扫描为 PASS。依赖检查使用全新目录中的离线 `npm ci`，未清理现有 `node_modules`。
+
+默认、Broker、Adapter 的六项完整编译/Clippy 检查按共享预检参数矩阵分别实际尝试，保留 Rust 1.85、`--locked` 和对应的 `--all-targets`、`-D warnings`，使用独立构建缓存；均退出 101，在依赖构建脚本阶段因缺少 `link.exe` 记为 **BLOCKED**，未到达项目完整编译/Clippy 检查。对应的 `runtime-resources` 与完整 `rust-clippy` 检查为 BLOCKED；暂存完整性、认证回归/管道测试、完整 Rust 行为测试、NSIS、安装包完整性及最终产物为 NOT_RUN。本次 19 项本地映射为 **11 PASS、2 BLOCKED、6 NOT_RUN**，不代表共享门禁完整通过；未安装工具链，未以格式、静态审查、独立类型检查或历史成功结果替代当前完整验证。
+
+已静态复核本地路由的初始化协议、请求 ID 原样转发、每连接独立 HTTP 会话、按会话取消、断连关闭/DELETE 及不重放路径、半帧/大小上限、双向用户与可执行文件身份校验；并复核后续打包的 Adapter/Broker/许可证映射、暂存构建证据、安装包载荷哈希和重复条目检查。未发现额外确定的源码阻断点，但这些审查不证明未执行的行为测试或实际安装包验证通过。
+
+本次仅提交认证夹具、现有测试与报告修改，普通推送一次并核对远端 SHA 后停止，不创建 PR、不查询或监控新 Actions、不合并或发布，不删除文件，保留全部未跟踪内容。**本次新提交云端结果为 UNVERIFIED**；下文均为历史记录，不能作为本次新提交的完整验收结果。
+
+## 2026-10-02 连接枚举大小修复（历史记录）
 
 已检查提交 `61ff790a71cd2d6fbc288adaa72851a88b3b234d` 的 [CI push 36712102154](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36712102154)。运行于香港时间 2026-09-30 20:09 结束，结果为 **11 PASS、1 FAIL、7 NOT_RUN**。`runtime-resources` 内的完整测试编译预检 `test-compile` 已通过，随后 `test-clippy` 因 `driver.rs:89` 的 `clippy::large_enum_variant` 失败：`Tunnel` 载荷至少 264 字节，`Local` 载荷至少 48 字节。后续暂存完整性、认证重复测试、Rust 行为测试、独立 Clippy 门禁、NSIS、安装包完整性和最终产物阶段均未执行；仅有诊断产物，没有安装包。上次类型修复的新提交云端结果由此更新为 FAIL。
 

@@ -543,6 +543,42 @@ impl PolicyEnforcementRuntime {
         privileged: Option<Arc<dyn PrivilegedExecution>>,
         wake: Option<CurrentTaskWake>,
     ) -> Result<Self, PolicyEnforcementError> {
+        Self::start_test_with_auth(
+            coding_runtime,
+            policy,
+            permission_mode,
+            privileged,
+            wake,
+            ClientAuthenticator::disabled_for_isolated_unit_test(),
+        )
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn start_authenticated_for_test(
+        coding_runtime: CodingToolsRuntime,
+        policy: CapabilityPolicy,
+        permission_mode: PermissionMode,
+    ) -> Result<Self, PolicyEnforcementError> {
+        Self::start_test_with_auth(
+            coding_runtime,
+            policy,
+            permission_mode,
+            None,
+            None,
+            ClientAuthenticator::generated()
+                .map_err(|_| PolicyEnforcementError::AuthenticationUnavailable)?,
+        )
+    }
+
+    #[cfg(test)]
+    fn start_test_with_auth(
+        coding_runtime: CodingToolsRuntime,
+        policy: CapabilityPolicy,
+        permission_mode: PermissionMode,
+        privileged: Option<Arc<dyn PrivilegedExecution>>,
+        wake: Option<CurrentTaskWake>,
+        authenticator: ClientAuthenticator,
+    ) -> Result<Self, PolicyEnforcementError> {
         let workspace = coding_runtime.workspace().to_path_buf();
         let desired_state = DesiredStateOwner::default();
         desired_state.replace(DesiredState {
@@ -563,7 +599,7 @@ impl PolicyEnforcementRuntime {
             policy_state,
             privileged,
             wake,
-            ClientAuthenticator::disabled_for_isolated_unit_test(),
+            authenticator,
         )
     }
 
@@ -7804,42 +7840,11 @@ mod tests {
 
     #[test]
     fn guard_rejects_missing_and_wrong_bearer_before_mcp_initialization() {
-        let root = repo_root();
-        let workspace = temp_workspace();
-        let coding = CodingToolsRuntime::start(
-            CodingToolsRuntimeConfig::new(
-                &root,
-                &workspace,
-                free_port(),
-                CodingToolsPermissionMode::Trusted,
-            ),
-            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
-            Duration::from_secs(10),
-        )
-        .expect("bundled MCP ready");
-        let desired = DesiredStateOwner::default();
-        desired.replace(DesiredState {
-            permission: PermissionMode::Full,
-            workspace: Some(DesiredWorkspace::for_runtime_path(&workspace)),
-            services: ServiceIntent::Enabled,
-            connection: None,
-        });
-        let auth = ClientAuthenticator::generated().unwrap();
-        let correct = auth.test_authorization_header().unwrap();
-        let pep = PolicyEnforcementRuntime::start_inner(
-            coding,
-            policy(&root),
-            PolicyStateSource::Simulated {
-                desired,
-                workspace,
-                connection: None,
-                privileged: None,
-            },
-            None,
-            None,
-            auth,
-        )
-        .expect("authenticated Guard ready");
+        let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Full);
+        let pep = fixture.runtime();
+        let correct = pep
+            .test_client_authorization_header()
+            .expect("authenticated fixture provides an authorization header");
         let statuses: Vec<_> = [None, Some("Bearer synthetic-wrong"), Some(correct.as_str())].into_iter().map(|authorization| {
             let body = json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
                 "protocolVersion":CURRENT_PROTOCOL_VERSION, "capabilities":{}, "clientInfo":{"name":"auth-regression", "version":"1"}
@@ -7851,8 +7856,7 @@ mod tests {
             std::io::Write::write_all(&mut stream, request.as_bytes()).unwrap();
             super::super::test_support::parse_client_response(stream).status
         }).collect();
-        let mut coding = pep.stop().expect("Guard stops");
-        coding.stop().expect("coding runtime stops");
+        fixture.shutdown();
         assert_eq!(statuses, [401, 401, 200]);
     }
 

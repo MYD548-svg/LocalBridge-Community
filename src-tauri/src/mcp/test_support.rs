@@ -110,6 +110,22 @@ impl PublicRuntimeFixture {
     }
 
     pub(crate) fn start_in(workspace: PathBuf, permission: PermissionMode) -> Self {
+        Self::start_in_with_auth(workspace, permission, false)
+    }
+
+    pub(crate) fn start_authenticated(permission: PermissionMode) -> Self {
+        Self::start_authenticated_in(temp_workspace(), permission)
+    }
+
+    pub(crate) fn start_authenticated_in(workspace: PathBuf, permission: PermissionMode) -> Self {
+        Self::start_in_with_auth(workspace, permission, true)
+    }
+
+    fn start_in_with_auth(
+        workspace: PathBuf,
+        permission: PermissionMode,
+        authenticated: bool,
+    ) -> Self {
         let root = repo_root();
         let coding = CodingToolsRuntime::start(
             CodingToolsRuntimeConfig::new(
@@ -122,8 +138,16 @@ impl PublicRuntimeFixture {
             Duration::from_secs(10),
         )
         .expect("bundled MCP test runtime ready");
-        let runtime = PolicyEnforcementRuntime::start(coding, policy(&root), permission)
-            .expect("public MCP test runtime ready");
+        let runtime = if authenticated {
+            PolicyEnforcementRuntime::start_authenticated_for_test(
+                coding,
+                policy(&root),
+                permission,
+            )
+        } else {
+            PolicyEnforcementRuntime::start(coding, policy(&root), permission)
+        }
+        .expect("public MCP test runtime ready");
         Self {
             workspace,
             runtime: Some(runtime),
