@@ -166,6 +166,83 @@ fn backup(home: &Path, bytes: &[u8]) -> io::Result<()> {
     output.sync_all()
 }
 
+#[derive(Clone, Copy)]
+enum ConfigChange<'a> {
+    Add(&'a Registration),
+    Remove(&'a Registration),
+}
+
+// The CLI may normalize unrelated/unknown MCP fields. Adopt only the verified
+// owned entry into the original document, never its rewritten configuration.
+fn configuration_candidate(
+    original: &str,
+    cli_result: &str,
+    change: ConfigChange<'_>,
+) -> io::Result<String> {
+    let invalid = || io::Error::other("配置核验失败；保留原配置和备份");
+    let before: toml::Value = toml::from_str(original).map_err(|_| invalid())?;
+    let generated: toml::Value = toml::from_str(cli_result).map_err(|_| invalid())?;
+    let mut document: toml_edit::Document = original.parse().map_err(|_| invalid())?;
+    match change {
+        ConfigChange::Add(registration) => {
+            if server(&before).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "同名配置拒绝覆盖",
+                ));
+            }
+            if !server(&generated).is_some_and(|entry| {
+                owns_entry(entry, registration)
+                    && entry.get("enabled").and_then(toml::Value::as_bool) != Some(false)
+            }) {
+                return Err(invalid());
+            }
+            let generated_document: toml_edit::Document =
+                cli_result.parse().map_err(|_| invalid())?;
+            let mut entry = generated_document
+                .get("mcp_servers")
+                .and_then(|servers| servers.get(SERVER_NAME))
+                .ok_or_else(invalid)?
+                .clone();
+            if !document.contains_key("mcp_servers") {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(true);
+                document["mcp_servers"] = toml_edit::Item::Table(table);
+            }
+            let servers_item = document.get_mut("mcp_servers").ok_or_else(invalid)?;
+            // Inline tables require a value; ordinary tables accept a table item.
+            if servers_item.is_inline_table() {
+                entry = toml_edit::Item::Value(entry.into_value().map_err(|_| invalid())?);
+            }
+            servers_item
+                .as_table_like_mut()
+                .ok_or_else(invalid)?
+                .insert(SERVER_NAME, entry);
+        }
+        ConfigChange::Remove(registration) => {
+            if !server(&before).is_some_and(|entry| owns_entry(entry, registration))
+                || server(&generated).is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "配置归属或移除结果核验失败",
+                ));
+            }
+            document
+                .get_mut("mcp_servers")
+                .and_then(toml_edit::Item::as_table_like_mut)
+                .ok_or_else(invalid)?
+                .remove(SERVER_NAME);
+        }
+    }
+    let candidate = document.to_string();
+    let after: toml::Value = toml::from_str(&candidate).map_err(|_| invalid())?;
+    if unrelated(before) != unrelated(after) {
+        return Err(invalid());
+    }
+    Ok(candidate)
+}
+
 // The official CLI operates on a retained staging copy while the destination
 // denies concurrent writes/deletes. Only a verified result reaches config.toml.
 fn update_config<F>(
@@ -173,10 +250,27 @@ fn update_config<F>(
     codex: &Path,
     home: &Path,
     args: &[OsString],
+    change: ConfigChange<'_>,
     verify: F,
 ) -> io::Result<()>
 where
     F: FnOnce(&toml::Value, &toml::Value) -> io::Result<()>,
+{
+    update_config_using(directory, codex, home, args, change, verify, execute)
+}
+
+fn update_config_using<F, E>(
+    directory: &Path,
+    codex: &Path,
+    home: &Path,
+    args: &[OsString],
+    change: ConfigChange<'_>,
+    verify: F,
+    run_cli: E,
+) -> io::Result<()>
+where
+    F: FnOnce(&toml::Value, &toml::Value) -> io::Result<()>,
+    E: FnOnce(&Path, &Path, &[OsString]) -> io::Result<()>,
 {
     let mut destination = OpenOptions::new()
         .read(true)
@@ -205,16 +299,19 @@ where
     source.write_all(&original)?;
     source.sync_all()?;
     drop(source);
-    execute(codex, &staging, args)?;
-    let result = fs::read(staging.join("config.toml"))?;
-    let after: toml::Value = toml::from_str(
-        std::str::from_utf8(&result)
+    run_cli(codex, &staging, args)?;
+    let generated = fs::read_to_string(staging.join("config.toml"))?;
+    let result = configuration_candidate(
+        std::str::from_utf8(&original)
             .map_err(|_| io::Error::other("invalid configuration encoding"))?,
-    )
-    .map_err(|_| io::Error::other("invalid Codex configuration"))?;
+        &generated,
+        change,
+    )?;
+    let after: toml::Value =
+        toml::from_str(&result).map_err(|_| io::Error::other("invalid Codex configuration"))?;
     verify(&before, &after)?;
     destination.seek(SeekFrom::Start(0))?;
-    destination.write_all(&result)?;
+    destination.write_all(result.as_bytes())?;
     destination.set_len(result.len() as u64)?;
     destination.sync_all()?;
     if config(home)? != after {
@@ -290,6 +387,7 @@ pub fn connect(
             "--install-id".into(),
             registration.install_id.clone().into(),
         ],
+        ConfigChange::Add(&registration),
         |before, after| {
             if server(before).is_some() {
                 return Err(io::Error::new(
@@ -345,6 +443,7 @@ pub fn disconnect(
             &detect_codex()?,
             &registration.codex_home,
             &["mcp".into(), "remove".into(), SERVER_NAME.into()],
+            ConfigChange::Remove(&registration),
             |before, after| {
                 if !server(before).is_some_and(|entry| owns_entry(entry, &registration)) {
                     return Err(io::Error::new(
@@ -367,6 +466,215 @@ pub fn disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registration() -> Registration {
+        Registration {
+            adapter: PathBuf::from("D:/中文 space/localbridge-mcp.exe"),
+            codex_home: PathBuf::from("D:/synthetic-codex"),
+            install_id: "synthetic-install".into(),
+        }
+    }
+
+    const ORIGINAL: &str = "# keep this comment\nmodel = 'existing' # model comment\nfuture_setting = { value = 'preserve' }\n[mcp_servers.fetch]\ntype = 'stdio' # keep type\ncommand = 'synthetic-fetch'\n[mcp_servers.time]\ntype = 'stdio'\ncommand = 'synthetic-time'\n[mcp_servers.'synthetic/paper-search']\ntype = 'stdio'\ncommand = 'synthetic-paper'\n[mcp_servers.node_repl]\ncommand = 'synthetic-node'\nargs = [] # keep explicit empty args\nunknown = 'preserve'\n";
+    const CLI_ADDED: &str = "model = 'changed-by-cli'\n[mcp_servers.localbridge]\ncommand = 'D:/中文 space/localbridge-mcp.exe'\nargs = ['--install-id','synthetic-install']\n";
+
+    #[test]
+    fn transaction_preserves_bytes_on_cli_failure_invalid_output_and_conflict() {
+        let registration = registration();
+        for case in [
+            "cli-failed",
+            "invalid-output",
+            "changed-identity",
+            "conflict",
+        ] {
+            let root = std::env::temp_dir().join(crate::security::random_prefixed_id(
+                "registration-中文 space-",
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let original = if case == "conflict" {
+                CLI_ADDED
+            } else {
+                ORIGINAL
+            };
+            let path = root.join("config.toml");
+            fs::write(&path, original).unwrap();
+            let result = update_config_using(
+                &root,
+                &root.join("synthetic-cli.exe"),
+                &root,
+                &[],
+                ConfigChange::Add(&registration),
+                |_, _| panic!("invalid CLI result must not reach final verification"),
+                |_, staging, _| {
+                    // The destination denies concurrent writes while the CLI
+                    // runs; this never touches the real user configuration.
+                    assert!(OpenOptions::new().write(true).open(&path).is_err());
+                    if case == "cli-failed" {
+                        return Err(io::Error::other("synthetic CLI failed"));
+                    }
+                    let generated = if case == "invalid-output" {
+                        "invalid = [".to_owned()
+                    } else if case == "changed-identity" {
+                        CLI_ADDED.replace("synthetic-install", "other-install")
+                    } else {
+                        CLI_ADDED.to_owned()
+                    };
+                    fs::write(staging.join("config.toml"), generated)
+                },
+            );
+            assert!(result.is_err(), "{case}");
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes(), "{case}");
+            let backups: Vec<_> = fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(fs::read(backups[0].path()).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn transaction_commits_only_the_owned_delta_and_reads_it_back() {
+        let registration = registration();
+        let root = std::env::temp_dir().join(crate::security::random_prefixed_id(
+            "registration-中文 space-",
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, ORIGINAL).unwrap();
+        update_config_using(
+            &root,
+            &root.join("synthetic-cli.exe"),
+            &root,
+            &[],
+            ConfigChange::Add(&registration),
+            |before, after| {
+                assert_eq!(unrelated(before.clone()), unrelated(after.clone()));
+                assert!(owns_entry(server(after).unwrap(), &registration));
+                Ok(())
+            },
+            |_, staging, _| fs::write(staging.join("config.toml"), CLI_ADDED),
+        )
+        .unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("args = [] # keep explicit empty args")
+        );
+        update_config_using(
+            &root,
+            &root.join("synthetic-cli.exe"),
+            &root,
+            &[],
+            ConfigChange::Remove(&registration),
+            |before, after| {
+                assert!(owns_entry(server(before).unwrap(), &registration));
+                assert!(server(after).is_none());
+                Ok(())
+            },
+            |_, staging, _| fs::write(staging.join("config.toml"), "model='cli-rewritten'\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            unrelated(toml::from_str(ORIGINAL).unwrap()),
+            unrelated(config(&root).unwrap())
+        );
+    }
+
+    #[test]
+    fn cli_rewrites_are_not_adopted_for_add_or_remove() {
+        let registration = registration();
+        let candidate =
+            configuration_candidate(ORIGINAL, CLI_ADDED, ConfigChange::Add(&registration)).unwrap();
+        let before: toml::Value = toml::from_str(ORIGINAL).unwrap();
+        let after: toml::Value = toml::from_str(&candidate).unwrap();
+        assert_eq!(unrelated(before), unrelated(after.clone()));
+        assert!(owns_entry(server(&after).unwrap(), &registration));
+        for preserved in [
+            "# keep this comment",
+            "# model comment",
+            "type = 'stdio' # keep type",
+            "args = [] # keep explicit empty args",
+            "unknown = 'preserve'",
+            "future_setting = { value = 'preserve' }",
+        ] {
+            assert!(
+                candidate.contains(preserved),
+                "lost source text: {preserved}"
+            );
+        }
+        let removed = configuration_candidate(
+            &candidate,
+            "model='changed-by-cli'",
+            ConfigChange::Remove(&registration),
+        )
+        .unwrap();
+        let removed_value: toml::Value = toml::from_str(&removed).unwrap();
+        assert!(server(&removed_value).is_none());
+        assert_eq!(
+            unrelated(toml::from_str(ORIGINAL).unwrap()),
+            unrelated(removed_value)
+        );
+        assert!(removed.contains("args = [] # keep explicit empty args"));
+    }
+
+    #[test]
+    fn inline_servers_and_missing_servers_preserve_original_fields() {
+        let registration = registration();
+        for original in [
+            "model='existing'\n",
+            "mcp_servers = { other = { command = 'keep', args = [], unknown = 42 } } # inline comment\n",
+        ] {
+            let candidate =
+                configuration_candidate(original, CLI_ADDED, ConfigChange::Add(&registration))
+                    .unwrap();
+            let after: toml::Value = toml::from_str(&candidate).unwrap();
+            assert!(owns_entry(server(&after).unwrap(), &registration));
+            assert_eq!(
+                unrelated(toml::from_str(original).unwrap()),
+                unrelated(after)
+            );
+            let removed =
+                configuration_candidate(&candidate, "", ConfigChange::Remove(&registration))
+                    .unwrap();
+            assert_eq!(
+                unrelated(toml::from_str(original).unwrap()),
+                unrelated(toml::from_str(&removed).unwrap())
+            );
+            if original.contains("# inline comment") {
+                assert!(removed.contains("# inline comment"));
+            }
+        }
+    }
+
+    #[test]
+    fn conflicts_identity_changes_and_invalid_cli_results_are_rejected() {
+        let registration = registration();
+        assert!(
+            configuration_candidate(CLI_ADDED, CLI_ADDED, ConfigChange::Add(&registration))
+                .is_err()
+        );
+        for invalid in [
+            CLI_ADDED.replace("synthetic-install", "other-install"),
+            format!("{CLI_ADDED}enabled=false\n"),
+            "invalid TOML = [".into(),
+            "model='missing-owned-entry'".into(),
+        ] {
+            assert!(
+                configuration_candidate(ORIGINAL, &invalid, ConfigChange::Add(&registration))
+                    .is_err()
+            );
+        }
+        let wrong_owner = CLI_ADDED.replace("synthetic-install", "other-install");
+        assert!(
+            configuration_candidate(&wrong_owner, "", ConfigChange::Remove(&registration)).is_err()
+        );
+        assert!(
+            configuration_candidate(CLI_ADDED, CLI_ADDED, ConfigChange::Remove(&registration))
+                .is_err()
+        );
+    }
     #[test]
     fn ownership_requires_exact_install_and_preserves_unrelated_configuration() {
         let registration = Registration {
@@ -398,6 +706,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("config.toml");
+        let registration = registration();
         let bytes = b"model='existing'\n[mcp_servers.other]\ncommand='keep'\n";
         fs::write(&path, bytes).unwrap();
         let result = update_config(
@@ -405,6 +714,7 @@ mod tests {
             &root.join("missing-client.exe"),
             &root,
             &[],
+            ConfigChange::Add(&registration),
             |_, _| panic!("missing client cannot reach verification"),
         );
         assert!(result.is_err());
@@ -417,6 +727,7 @@ mod tests {
             &root.join("missing-client.exe"),
             &root,
             &[],
+            ConfigChange::Add(&registration),
             |_, _| panic!("readonly config cannot reach verification"),
         );
         let mut permissions = fs::metadata(&path).unwrap().permissions();

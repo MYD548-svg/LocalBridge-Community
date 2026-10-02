@@ -11,7 +11,7 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -249,21 +249,53 @@ impl Pipe {
     }
 
     pub fn connect(name: &str, expected: &Path) -> io::Result<Self> {
+        Self::connect_with_wait(name, expected, Duration::from_secs(5), || {})
+    }
+
+    fn connect_with_wait(
+        name: &str,
+        expected: &Path,
+        timeout: Duration,
+        mut busy: impl FnMut(),
+    ) -> io::Result<Self> {
         let name = wide(std::ffi::OsStr::new(name));
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                null(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            )
+        let deadline = Instant::now() + timeout;
+        let handle = loop {
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    null(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                break handle;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+                return Err(error);
+            }
+            busy();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Retain the observed busy code for redacted Adapter diagnostics.
+                return Err(io::Error::new(io::ErrorKind::TimedOut, error));
+            }
+            let wait_ms = remaining.as_millis().clamp(1, 200) as u32;
+            if unsafe { WaitNamedPipeW(name.as_ptr(), wait_ms) } == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_SEM_TIMEOUT as i32) {
+                    return Err(error);
+                }
+            }
+            // Another client may acquire an available instance first. Only a
+            // subsequent ERROR_PIPE_BUSY opens another bounded wait; no message
+            // has been sent and identity failures below are never retried.
         };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
         let pipe = Self::from_handle(handle, false);
         pipe.verify_peer(expected)?;
         let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
@@ -447,5 +479,109 @@ impl Write for Pipe {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn occupied_instance() -> (String, PathBuf, Pipe, Pipe) {
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let name = pipe_name(&crate::security::random_hex(32).unwrap()).unwrap();
+        let listener = Pipe::listen(&name, true).unwrap();
+        let client = Pipe::connect(&name, &executable).unwrap();
+        listener
+            .accept(&executable, &AtomicBool::new(false))
+            .unwrap();
+        (name, executable, listener, client)
+    }
+
+    #[test]
+    fn busy_connection_waits_for_a_new_real_instance() {
+        let (name, executable, listener, first) = occupied_instance();
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let expected = executable.clone();
+        let waiting_name = name.clone();
+        let waiting = thread::spawn(move || {
+            let mut first_busy = Some(busy_tx);
+            Pipe::connect_with_wait(&waiting_name, &expected, Duration::from_secs(5), || {
+                if let Some(sender) = first_busy.take() {
+                    sender.send(()).unwrap();
+                }
+            })
+        });
+        // The second instance is withheld until the actual CreateFileW busy
+        // branch has been reached; timing guesses cannot make this pass.
+        busy_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let next = Pipe::listen(&name, false).unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let server_stop = stopping.clone();
+        let server_pipe = next.clone();
+        let accepting = thread::spawn(move || {
+            server_pipe.accept(&executable, &server_stop)?;
+            server_pipe.send(b"retained-response")
+        });
+        let connected = waiting.join().unwrap();
+        if connected.is_err() {
+            stopping.store(true, Ordering::Release);
+            next.close();
+        }
+        let accepted = accepting.join().unwrap();
+        let mut second = connected.unwrap();
+        accepted.unwrap();
+        assert_eq!(
+            second.receive_frame(Duration::from_secs(5)).unwrap(),
+            b"retained-response"
+        );
+        second.close();
+        first.close();
+        next.close();
+        listener.close();
+    }
+
+    #[test]
+    fn persistent_busy_is_bounded_and_retains_the_observed_os_code() {
+        let (name, executable, listener, first) = occupied_instance();
+        let started = Instant::now();
+        let error = match Pipe::connect(&name, &executable) {
+            Ok(_) => panic!("occupied instance unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<io::Error>())
+                .and_then(io::Error::raw_os_error),
+            Some(ERROR_PIPE_BUSY as i32)
+        );
+        first.close();
+        listener.close();
+    }
+
+    #[test]
+    fn missing_service_and_identity_rejection_never_enter_busy_retry() {
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let missing = pipe_name(&crate::security::random_hex(32).unwrap()).unwrap();
+        let mut busy_calls = 0;
+        assert!(
+            Pipe::connect_with_wait(&missing, &executable, Duration::from_secs(5), || {
+                busy_calls += 1
+            })
+            .is_err()
+        );
+        assert_eq!(busy_calls, 0);
+        let name = pipe_name(&crate::security::random_hex(32).unwrap()).unwrap();
+        let listener = Pipe::listen(&name, true).unwrap();
+        let rejected = executable.with_file_name("synthetic-wrong-installation.exe");
+        assert!(
+            Pipe::connect_with_wait(&name, &rejected, Duration::from_secs(5), || busy_calls += 1)
+                .is_err()
+        );
+        assert_eq!(busy_calls, 0);
+        listener.close();
     }
 }

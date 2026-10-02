@@ -135,6 +135,50 @@ fn read_stderr(pipe: &mut Pipe, iteration: usize, reference: &str) -> Value {
 }
 
 #[test]
+fn simultaneous_clients_initialize_and_call_without_retrying_requests() {
+    let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Edit);
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let mut runtime = LocalRuntime::start(
+        &executable,
+        fixture.runtime().port(),
+        fixture
+            .runtime()
+            .local_connector_bearer()
+            .expect("authenticated fixture provides a connector bearer"),
+    )
+    .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let barrier = barrier.clone();
+        let expected = executable.clone();
+        workers.push(thread::spawn(move || {
+            let name = pipe_name(&installation_id(expected.parent().unwrap()).unwrap()).unwrap();
+            barrier.wait();
+            // Unlike client(), no test wrapper retries connection failures.
+            let mut pipe = Pipe::connect(&name, &expected).unwrap();
+            initialize(&mut pipe);
+            send(
+                &pipe,
+                &json!({"jsonrpc":"2.0","id":0,"method":"tools/list"}),
+            );
+            let reply = response(&mut pipe, json!(0));
+            assert!(reply["result"]["tools"].is_array(), "{reply}");
+            pipe.close();
+            reply
+        }));
+    }
+    barrier.wait();
+    let replies: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(replies[0], replies[1]);
+    runtime.stop();
+    fixture.shutdown();
+}
+
+#[test]
 fn local_route_retains_failed_stderr_and_enforces_session_ownership_ten_times() {
     let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Full);
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
