@@ -2,6 +2,26 @@
 
 实际验证测试-非正式发布。基线 `de756be2b57f48a908108922ea869b84a70fab87`，工作分支 `codex/local-codex`。本轮在本地收敛后执行一次普通推送；推送结果与最终 SHA 由交付消息记录。推送后不查询 Actions，不创建 PR、不合并、不发布、不重装。
 
+## 2026-10-02 权限服务退出与所有权交接修复
+
+本轮起点 `9748d5c074f24ee1e7b0481193ef2f933dc11726`。已核验 [CI push 36998343172](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36998343172)，云端实际检出同一 SHA，于香港时间 **2026-10-02 19:19** 结束：原 19 项门禁为 **13 PASS、1 FAIL、5 NOT_RUN**。默认、Broker、Adapter 六项完整编译/Clippy 预检、发布资源构建及暂存完整性通过。`auth-repeat` 内原 Tunnel 认证 **10/10 PASS**，retained stderr 前五次通过，第六次在所有内容、稳定引用、终态重放及归属断言完成之后，停止权限服务时触发 `server.rs:1106` 的 `policy enforcement guard still shared after worker shutdown` panic，随后测试的 `pep.stop()` 返回 `ThreadTerminated`。剩余四次 stderr、新配置及管道行为测试、完整 Rust 测试、独立 Clippy、NSIS、安装包完整性及最终产物均未执行；只有诊断产物，没有新安装包。前一提交 `f8395de` 的成功不作为本轮通过证据。
+
+源码确认一个竞争窗口：原 `stop`/`Drop` 先发送停止通知，再释放调用方 guard，服务线程可能先执行唯一所有权回收；服务因监听/观察错误自行退出时，也不能假定调用方已释放引用。云端日志确认回收时仍有共享引用，但没有记录具体线程交错，因此不宣称该次调度顺序已被直接观测。相关日志摘录保留于本轮证据目录。
+
+### 修改与回归
+
+- 服务线程完成原取消流程及全部工作线程回收后返回共享 guard，不在服务线程中执行 `Arc::try_unwrap`。调用方统一通过 `finish_shutdown` 通知停止、join、释放自身引用，然后取得唯一所有权；join 失败也释放自身引用。所有权异常沿用 `ThreadTerminated`，不添加生产重试、等待或 panic。`stop()` 继续返回原 `CodingToolsRuntime`；`Drop` 使用同一回收流程。循环所有出口统一设置停止标志，覆盖监听错误出口。启动失败的既有局部资源释放路径保持，公开 API、认证、权限、会话隔离、输出引用、取消及不重放契约不变。
+- 新增五项生命周期 Rust 回归，覆盖服务已完成但调用方仍持有引用、请求线程保持引用时停止、服务先自行退出再 stop、直接 Drop 和断言失败展开清理，以及异常共享引用返回结构化错误。同步通道控制工作线程释放顺序；仅测试构建包含退出注入与同步观察，等待有界，发送方被释放后不会无限阻塞。检查服务/工作线程回收、共享引用释放、运行时取回、显式停止后受管进程为零；保留真实进程同步句柄验证 Drop/展开后进程实际退出，不持有会延长 Job 生命周期的句柄。测试目录全部保留。
+- `auth-repeat` 在原重复测试前执行新增生命周期、已有配置事务及真实管道连接测试。原认证十次、retained stderr 十次、完整本地管道协议测试、全部原断言和完整 Rust 套件保留；原 19 项门禁、Actions 工作流、依赖锁定及编译参数矩阵均未修改。配置/管道上一轮生产实现只做关联审查，本轮未扩大修改。
+
+### 本轮实际本地验证及上传边界
+
+证据保留于 `.local-tmp/policy-shutdown-fix-20261002/`，逐项命令、退出码与日志记录在 `local-checks.json`、`rust-checks.json` 和最终检查文件中。前 11 项共享检查 **PASS**：基础集合 **45 PASS**（含原 bundled Python 子套件 **11 PASS**）、前端 8 文件 **23 PASS**及生产构建通过，格式、公开内容、许可证、架构、bundled 完整性通过，额外敏感扫描 **PASS**。锁定前端依赖在全新独立目录离线 npm ci，保留现有依赖、原测试数据、安装及失败证据。Rust 1.85 改动文件格式与 `git diff --check` 完成最终复核后记录；受保护输入哈希核对包括原工作流、共享门禁、Cargo 清单/锁及上一轮配置/管道实现。
+
+默认、Broker、Adapter 六项完整编译/Clippy 预检均实际尝试，保持 Rust 1.85、`--locked`、默认 `--all-targets`、对应 feature/二进制范围及 `-D warnings`，使用本轮独立缓存。六项均退出 101，因缺少 MSVC `link.exe` 在依赖构建脚本阶段 **BLOCKED**，未到达项目完整编译或 lint。新增生命周期、配置及 Win32 管道行为回归、Guard `[401,401,200]`、认证/stderr 重复及完整 Rust 行为套件均 **NOT_RUN**；当前资源发布构建、暂存完整性、NSIS、安装包及产物验证 **NOT_RUN**。原 19 项本地映射为 **11 PASS、2 BLOCKED、6 NOT_RUN**。未安装 MSVC/Windows SDK，未使用独立类型检查、metadata、历史云端结果或旧二进制替代本轮完整验证。
+
+仅提交权限服务、测试调度与本报告。完成最终差异/证据复核后普通推送一次到 `origin/codex/local-codex`，核对远端 SHA 即停止；不创建 PR、不触发或重跑 Actions、不查询上传后的云端状态、不合并/发布/安装新版本，不删除文件。最终 SHA 和上传核验由交付消息记录。**新提交云端结果与新版本实机验收均为 UNVERIFIED**。以下保留历史记录。
+
 ## 2026-10-02 配置保留与 Adapter 初次连接等待修复
 
 本轮起点 `f8395de83805dc561bdd0d76aa86b820ad980cb1`。其历史已核验 [CI push 36980502938](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36980502938) 于香港时间 **16:55** 结束，原 19 项门禁 **19 PASS、0 FAIL、0 NOT_RUN**。这只属于该提交的云端验收，不是本轮新提交或完整实机可用性验收。

@@ -148,9 +148,25 @@ struct TaskControlContext<'a> {
     privileged: Option<&'a Arc<dyn PrivilegedExecution>>,
 }
 
+type PolicyGuard = Arc<Mutex<AgentFacade<CodingToolsRuntimeAdapter>>>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct ShutdownTestControl {
+    exit_requested: AtomicBool,
+    worker_exit: Mutex<Option<ShutdownTestCheckpoint>>,
+    joining: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+#[cfg(test)]
+struct ShutdownTestCheckpoint {
+    arrived: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
 struct ServeContext {
     authenticator: ClientAuthenticator,
-    guard: Arc<Mutex<AgentFacade<CodingToolsRuntimeAdapter>>>,
+    guard: PolicyGuard,
     public_policy: Arc<RwLock<CapabilityPolicy>>,
     cancellation: McpCancellationClient,
     control_plane: ControlPlane,
@@ -160,6 +176,8 @@ struct ServeContext {
     current_task: CurrentTaskProjection,
     privileged: Option<Arc<dyn PrivilegedExecution>>,
     shutdown: mpsc::Receiver<()>,
+    #[cfg(test)]
+    shutdown_test: Arc<ShutdownTestControl>,
 }
 
 #[derive(Clone)]
@@ -444,14 +462,16 @@ pub struct PolicyEnforcementRuntime {
     authenticator: ClientAuthenticator,
     control_plane: ControlPlane,
     current_task: CurrentTaskProjection,
-    guard: Option<Arc<Mutex<AgentFacade<CodingToolsRuntimeAdapter>>>>,
+    guard: Option<PolicyGuard>,
     public_policy: Arc<RwLock<CapabilityPolicy>>,
     #[cfg(test)]
     test_desired_state: Option<DesiredStateOwner>,
     health_client: McpHealthClient,
     health_workspace: PathBuf,
     shutdown: Option<mpsc::Sender<()>>,
-    thread: Option<JoinHandle<AgentFacade<CodingToolsRuntimeAdapter>>>,
+    thread: Option<JoinHandle<PolicyGuard>>,
+    #[cfg(test)]
+    shutdown_test: Arc<ShutdownTestControl>,
 }
 
 impl fmt::Debug for PolicyEnforcementRuntime {
@@ -681,6 +701,10 @@ impl PolicyEnforcementRuntime {
         let thread_guard = Arc::clone(&guard);
         let thread_policy = Arc::clone(&public_policy);
         let thread_authenticator = authenticator.clone();
+        #[cfg(test)]
+        let shutdown_test = Arc::new(ShutdownTestControl::default());
+        #[cfg(test)]
+        let thread_shutdown_test = shutdown_test.clone();
         let thread = thread::Builder::new()
             .name("localbridge-mcp-policy".into())
             .spawn(move || {
@@ -698,6 +722,8 @@ impl PolicyEnforcementRuntime {
                         current_task: thread_task,
                         privileged,
                         shutdown: shutdown_rx,
+                        #[cfg(test)]
+                        shutdown_test: thread_shutdown_test,
                     },
                 )
             })
@@ -715,6 +741,8 @@ impl PolicyEnforcementRuntime {
             health_workspace,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            #[cfg(test)]
+            shutdown_test,
         })
     }
 
@@ -894,16 +922,35 @@ impl PolicyEnforcementRuntime {
     }
 
     pub fn stop(mut self) -> Result<CodingToolsRuntime, PolicyEnforcementError> {
+        self.finish_shutdown().map(AgentFacade::into_runtime)
+    }
+
+    fn finish_shutdown(
+        &mut self,
+    ) -> Result<AgentFacade<CodingToolsRuntimeAdapter>, PolicyEnforcementError> {
         self.signal_shutdown();
-        drop(self.guard.take());
-        let thread = self
+        #[cfg(test)]
+        if let Some(joining) = self.shutdown_test.joining.lock().unwrap().take() {
+            let _ = joining.send(());
+        }
+        let joined = self
             .thread
             .take()
-            .ok_or(PolicyEnforcementError::ThreadTerminated)?;
-        let guard = thread
-            .join()
-            .map_err(|_| PolicyEnforcementError::ThreadTerminated)?;
-        Ok(guard.into_runtime())
+            .ok_or(PolicyEnforcementError::ThreadTerminated)
+            .and_then(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| PolicyEnforcementError::ThreadTerminated)
+            });
+        // The service may finish before shutdown is requested. It returns its
+        // shared reference without trying to take ownership on the worker side.
+        // Always release our reference, including when joining failed.
+        drop(self.guard.take());
+        let guard =
+            Arc::try_unwrap(joined?).map_err(|_| PolicyEnforcementError::ThreadTerminated)?;
+        Ok(guard
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     fn signal_shutdown(&mut self) {
@@ -915,15 +962,11 @@ impl PolicyEnforcementRuntime {
 
 impl Drop for PolicyEnforcementRuntime {
     fn drop(&mut self) {
-        self.signal_shutdown();
-        drop(self.guard.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let _ = self.finish_shutdown();
     }
 }
 
-fn serve(listener: TcpListener, context: ServeContext) -> AgentFacade<CodingToolsRuntimeAdapter> {
+fn serve(listener: TcpListener, context: ServeContext) -> PolicyGuard {
     let ServeContext {
         authenticator,
         guard,
@@ -936,6 +979,8 @@ fn serve(listener: TcpListener, context: ServeContext) -> AgentFacade<CodingTool
         current_task,
         privileged,
         shutdown,
+        #[cfg(test)]
+        shutdown_test,
     } = context;
     let requests = control_plane.requests();
     let executions = control_plane.executions();
@@ -948,6 +993,10 @@ fn serve(listener: TcpListener, context: ServeContext) -> AgentFacade<CodingTool
     let mut next_session_reap = Instant::now();
     let mut next_execution_observation = Instant::now();
     loop {
+        #[cfg(test)]
+        if shutdown_test.exit_requested.load(Ordering::Acquire) {
+            break;
+        }
         if shutdown.try_recv().is_ok() {
             stopping.store(true, Ordering::Release);
             break;
@@ -1032,6 +1081,8 @@ fn serve(listener: TcpListener, context: ServeContext) -> AgentFacade<CodingTool
                 let worker_privileged = privileged.as_ref().map(Arc::clone);
                 let worker_stopping = Arc::clone(&stopping);
                 let worker_cancellation = cancellation.clone();
+                #[cfg(test)]
+                let worker_shutdown_test = shutdown_test.clone();
                 let mut spawn_failure_stream = stream.try_clone().ok();
                 match thread::Builder::new()
                     .name("localbridge-mcp-policy-request".into())
@@ -1058,6 +1109,17 @@ fn serve(listener: TcpListener, context: ServeContext) -> AgentFacade<CodingTool
                                 "[localbridge-mcp] connection closed before response completed"
                             );
                         }
+                        #[cfg(test)]
+                        {
+                            let checkpoint =
+                                worker_shutdown_test.worker_exit.lock().unwrap().take();
+                            if let Some(checkpoint) = checkpoint {
+                                let _ = checkpoint.arrived.send(());
+                                // Bounded and test-only: failed assertions or a
+                                // dropped test sender cannot strand teardown.
+                                let _ = checkpoint.release.recv_timeout(Duration::from_secs(30));
+                            }
+                        }
                     }) {
                     Ok(worker) => workers.push(worker),
                     Err(_) => {
@@ -1078,6 +1140,9 @@ fn serve(listener: TcpListener, context: ServeContext) -> AgentFacade<CodingTool
             Err(_) => break,
         }
     }
+    // Every exit path, including listener/observer errors, stops workers before
+    // joining them. No caller-side ownership timing is assumed here.
+    stopping.store(true, Ordering::Release);
     for task_id in scheduler.close() {
         let _ = tasks.finish(&task_id, TerminalOutcome::Cancelled);
     }
@@ -1102,11 +1167,7 @@ fn serve(listener: TcpListener, context: ServeContext) -> AgentFacade<CodingTool
     for worker in workers {
         let _ = worker.join();
     }
-    let guard = Arc::try_unwrap(guard)
-        .unwrap_or_else(|_| panic!("policy enforcement guard still shared after worker shutdown"));
     guard
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn settle_closed_session(
@@ -5049,6 +5110,176 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::mcp::V1_CORE_TOOL_NAMES;
+
+    struct ShutdownProcess(windows_sys::Win32::Foundation::HANDLE);
+
+    impl ShutdownProcess {
+        fn assert_exited(&self) {
+            assert_eq!(
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, 10_000)
+                },
+                windows_sys::Win32::Foundation::WAIT_OBJECT_0,
+                "managed runtime process survived policy service cleanup"
+            );
+        }
+    }
+
+    impl Drop for ShutdownProcess {
+        fn drop(&mut self) {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+
+    fn shutdown_runtime() -> (PolicyEnforcementRuntime, PathBuf, ShutdownProcess) {
+        let root = repo_root();
+        let workspace = temp_workspace();
+        let coding = CodingToolsRuntime::start(
+            CodingToolsRuntimeConfig::new(
+                &root,
+                &workspace,
+                free_port(),
+                CodingToolsPermissionMode::Trusted,
+            ),
+            InternalBearer::new(SYNTHETIC_BEARER).unwrap(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        // Retain only a process synchronization handle, never a Job handle;
+        // observing termination must not keep the kill-on-close Job alive.
+        let process = unsafe {
+            windows_sys::Win32::System::Threading::OpenProcess(
+                0x0010_0000, // SYNCHRONIZE
+                0,
+                coding.process_snapshot().pid,
+            )
+        };
+        assert!(!process.is_null());
+        let process = ShutdownProcess(process);
+        let pep =
+            PolicyEnforcementRuntime::start(coding, policy(&root), PermissionMode::Full).unwrap();
+        (pep, workspace, process)
+    }
+
+    fn stop_shutdown_coding(mut coding: CodingToolsRuntime) {
+        coding.stop().unwrap();
+        assert_eq!(coding.active_processes().unwrap(), 0);
+    }
+
+    fn hold_shutdown_worker(
+        pep: &PolicyEnforcementRuntime,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *pep.shutdown_test.worker_exit.lock().unwrap() = Some(ShutdownTestCheckpoint {
+            arrived: arrived_tx,
+            release: release_rx,
+        });
+        assert!(initialize(pep.port(), 70_000).session.is_some());
+        arrived_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (joining_tx, joining_rx) = mpsc::channel();
+        *pep.shutdown_test.joining.lock().unwrap() = Some(joining_tx);
+        (joining_rx, release_tx)
+    }
+
+    #[test]
+    fn policy_shutdown_server_returns_while_owner_retains_guard() {
+        let (mut pep, workspace, process) = shutdown_runtime();
+        pep.signal_shutdown();
+        assert_eventually(
+            "service completed with its owner still present",
+            Duration::from_secs(10),
+            || pep.thread.as_ref().unwrap().is_finished(),
+        );
+        let returned = pep
+            .thread
+            .take()
+            .unwrap()
+            .join()
+            .expect("service did not panic");
+        assert!(Arc::ptr_eq(pep.guard.as_ref().unwrap(), &returned));
+        assert_eq!(Arc::strong_count(&returned), 2);
+        let weak = Arc::downgrade(&returned);
+        drop(pep.guard.take());
+        let facade = Arc::try_unwrap(returned).unwrap_or_else(|_| panic!("workers retained guard"));
+        stop_shutdown_coding(facade.into_inner().unwrap().into_runtime());
+        assert!(weak.upgrade().is_none());
+        process.assert_exited();
+        cleanup_test_directory(&workspace);
+    }
+
+    #[test]
+    fn policy_shutdown_waits_for_request_worker_before_ownership_transfer() {
+        let (pep, workspace, process) = shutdown_runtime();
+        let weak = Arc::downgrade(pep.guard.as_ref().unwrap());
+        let (joining, release) = hold_shutdown_worker(&pep);
+        let (done_tx, done_rx) = mpsc::channel();
+        let stopping = thread::spawn(move || done_tx.send(pep.stop()).unwrap());
+        joining.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        let coding = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        stopping.join().unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "joined workers must release their guard"
+        );
+        stop_shutdown_coding(coding);
+        process.assert_exited();
+        cleanup_test_directory(&workspace);
+    }
+
+    #[test]
+    fn policy_shutdown_recovers_runtime_after_service_exits_independently() {
+        let (pep, workspace, process) = shutdown_runtime();
+        let (_joining, release) = hold_shutdown_worker(&pep);
+        // Enter the same common exit path as a listener/observer failure, with
+        // no caller shutdown notification and a worker reference still held.
+        pep.shutdown_test
+            .exit_requested
+            .store(true, Ordering::Release);
+        release.send(()).unwrap();
+        assert_eventually("independent service exit", Duration::from_secs(10), || {
+            pep.thread.as_ref().unwrap().is_finished()
+        });
+        assert!(pep.guard.is_some());
+        stop_shutdown_coding(pep.stop().unwrap());
+        process.assert_exited();
+        cleanup_test_directory(&workspace);
+    }
+
+    #[test]
+    fn policy_shutdown_drop_and_assertion_unwind_release_runtime() {
+        for unwind in [false, true] {
+            let (pep, workspace, process) = shutdown_runtime();
+            let weak = Arc::downgrade(pep.guard.as_ref().unwrap());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _runtime = pep;
+                assert!(!unwind, "synthetic test assertion failure");
+            }));
+            assert_eq!(result.is_err(), unwind);
+            assert!(weak.upgrade().is_none());
+            process.assert_exited();
+            cleanup_test_directory(&workspace);
+        }
+    }
+
+    #[test]
+    fn policy_shutdown_unexpected_shared_reference_returns_typed_error() {
+        let (pep, workspace, process) = shutdown_runtime();
+        let retained = pep.guard.as_ref().unwrap().clone();
+        assert!(matches!(
+            pep.stop(),
+            Err(PolicyEnforcementError::ThreadTerminated)
+        ));
+        let facade = Arc::try_unwrap(retained).unwrap_or_else(|_| panic!("workers retained guard"));
+        stop_shutdown_coding(facade.into_inner().unwrap().into_runtime());
+        process.assert_exited();
+        cleanup_test_directory(&workspace);
+    }
 
     #[test]
     fn task_cancel_selection_is_explicit_and_session_local() {

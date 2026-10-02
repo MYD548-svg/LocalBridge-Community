@@ -1,5 +1,16 @@
 import { cargoCommand } from "./ci-gate.mjs";
 import { runStage } from "./process.mjs";
+
+// Run the new exit regressions and previously compiled configuration/pipe
+// behavior first, without removing any original repetition or full-suite gate.
+for (const [id, filter] of [
+  ["policy-shutdown", "mcp::server::tests::policy_shutdown_"],
+  ["local-registration", "local_connection::registration::tests::"],
+  ["local-pipe-connect", "local_connection::pipe::tests::"],
+]) {
+  runStage({ id, label: "local lifecycle and connection behavior", ...cargoCommand(["test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "--lib", filter, "--", "--test-threads=1", "--nocapture"]) });
+}
+
 for (let attempt = 1; attempt <= 10; attempt++) {
   runStage({ id: `auth-${attempt}`, label: "strict authenticated MCP probe", ...cargoCommand(["test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "--lib", "tunnel::runtime::tests::actual_tunnel_discovery_sends_the_authenticated_pep_header", "--", "--exact", "--test-threads=1", "--nocapture"]) });
 }
