@@ -874,7 +874,7 @@ fn production_tray_exit_owns_actual_adapter_and_stops_tunnel_gate_pep_mcp() {
     let runtime = RuntimeOrchestrator::from_ready_for_test(
         driver,
         pep,
-        crate::mcp::RuntimeConnectionHandle::Tunnel(tunnel),
+        crate::mcp::RuntimeConnectionHandle::Tunnel(Box::new(tunnel)),
     );
     let lifecycle = DesktopLifecycle::new(controller.clone());
     lifecycle

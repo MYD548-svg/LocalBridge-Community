@@ -2,7 +2,17 @@
 
 实际验证测试-非正式发布。基线 `de756be2b57f48a908108922ea869b84a70fab87`，工作分支 `codex/local-codex`。本轮在本地收敛后执行一次普通推送；推送结果与最终 SHA 由交付消息记录。推送后不查询 Actions，不创建 PR、不合并、不发布、不重装。
 
-## 2026-09-30 测试连接类型修复
+## 2026-10-02 连接枚举大小修复
+
+已检查提交 `61ff790a71cd2d6fbc288adaa72851a88b3b234d` 的 [CI push 36712102154](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36712102154)。运行于香港时间 2026-09-30 20:09 结束，结果为 **11 PASS、1 FAIL、7 NOT_RUN**。`runtime-resources` 内的完整测试编译预检 `test-compile` 已通过，随后 `test-clippy` 因 `driver.rs:89` 的 `clippy::large_enum_variant` 失败：`Tunnel` 载荷至少 264 字节，`Local` 载荷至少 48 字节。后续暂存完整性、认证重复测试、Rust 行为测试、独立 Clippy 门禁、NSIS、安装包完整性和最终产物阶段均未执行；仅有诊断产物，没有安装包。上次类型修复的新提交云端结果由此更新为 FAIL。
+
+本次将 `RuntimeConnectionHandle::Tunnel` 的载荷改为 `Box<TunnelRuntime>`，同步更新正常启动、恢复启动和现有后台测试的三处构造。匹配分支通过自动解引用沿用原方法调用；取消、停止、资源释放逻辑、测试专用重导出和全部断言保留。未添加 lint 豁免，未修改外部接口、协议、配置格式或原 19 项门禁。
+
+本次本地验证：Rust 1.85 rustfmt 改动文件检查及 `git diff --check` 为 PASS。使用独立本地构建缓存分别尝试 `cargo +1.85.0 test --manifest-path src-tauri/Cargo.toml --locked --all-targets --no-run` 和 `cargo +1.85.0 clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings`；两者均退出 101，在依赖构建脚本阶段因缺少 `link.exe` 阻断，分别记为 **BLOCKED**，未到达项目完整编译或 Clippy 检查。日志保留于 `.local-tmp/local-codex-enum-fix-20261002/test-compile.log` 和同目录 `test-clippy.log`。未安装工具链，未以独立类型检查或历史云端成功结果代替本次完整验证。
+
+本次仅提交上述修复和报告，普通推送一次并核对远端 SHA 后停止，不创建 PR、不查询新 Actions、不合并或发布，不删除文件，保留未跟踪内容。**本次新提交的云端结果为 UNVERIFIED**；下文保留此前各轮证据，不能作为本次新提交的验收结果。
+
+## 2026-09-30 测试连接类型修复（历史记录）
 
 已检查提交 `9512007c5213a4f8c6e3c4097f51e7b55d48fe84` 的 [CI push 36696285180](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36696285180)。运行于香港时间 2026-09-30 17:32 结束，结果为 **11 PASS、1 FAIL、7 NOT_RUN**。基础测试 37 项、bundled Python 11 项、前端测试 23 项通过；第 12 项 `runtime-resources` 在 `test-compile` 因 `background.rs:874` 的 E0308 类型不匹配失败。后续暂存完整性、认证、Rust 测试、Clippy、NSIS、安装包完整性和最终产物阶段未执行，仅上传诊断文件，没有新安装包。
 

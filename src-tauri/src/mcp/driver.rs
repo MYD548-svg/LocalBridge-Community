@@ -88,7 +88,7 @@ impl ProductionRuntimeConfig {
 
 pub enum RuntimeConnectionHandle {
     Local(crate::local_connection::runtime::LocalRuntime),
-    Tunnel(TunnelRuntime),
+    Tunnel(Box<TunnelRuntime>),
 }
 
 enum CredentialStoreHandle<'a, C> {
@@ -352,7 +352,7 @@ where
         PreparedTunnelStart::prepare(config, self.credential_store.as_ref())
             .map(|prepared| prepared.with_mcp_guard_bearer(bearer))
             .and_then(PreparedTunnelStart::spawn)
-            .map(RuntimeConnectionHandle::Tunnel)
+            .map(|tunnel| RuntimeConnectionHandle::Tunnel(Box::new(tunnel)))
             .map_err(|error| error.runtime_fault())
     }
 
@@ -404,7 +404,7 @@ where
             let _ = tunnel.stop();
             return Err(RuntimeFault::UserStopped);
         }
-        Ok(RuntimeConnectionHandle::Tunnel(tunnel))
+        Ok(RuntimeConnectionHandle::Tunnel(Box::new(tunnel)))
     }
 
     fn confirm_tunnel_ready_for_recovery(
