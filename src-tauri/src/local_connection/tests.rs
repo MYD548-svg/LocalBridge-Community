@@ -6,7 +6,9 @@ use super::{
     profile::installation_id,
     runtime::LocalRuntime,
 };
-use crate::mcp::test_support::PublicRuntimeFixture;
+use crate::mcp::test_support::{
+    CommandPollObservation, PublicRuntimeFixture, classify_command_poll_body,
+};
 use crate::state::PermissionMode;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -34,7 +36,10 @@ fn response(pipe: &mut Pipe, id: Value) -> Value {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(Instant::now() < deadline, "request {id} did not settle");
-        if let Some(bytes) = pipe.receive_with_tick(Duration::from_millis(100)).unwrap() {
+        if let Some(bytes) = pipe
+            .receive_with_tick(Duration::from_millis(100))
+            .unwrap_or_else(|error| panic!("response stage=request {id}: {error}"))
+        {
             let value = codec::validate_message(&bytes).unwrap();
             if value.get("id") == Some(&id) {
                 return value;
@@ -65,6 +70,70 @@ fn tool(pipe: &mut Pipe, id: &str, name: &str, arguments: Value) -> Value {
     response(pipe, json!(id))
 }
 
+fn settle_command(pipe: &mut Pipe, iteration: usize, mut current: Value) -> Value {
+    let session = current["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("stage=start iteration={iteration}: {current}"))
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let observed_session = &current["result"]["structuredContent"]["data"]["session_id"];
+        if !observed_session.is_null() {
+            assert_eq!(
+                observed_session.as_str(),
+                Some(session.as_str()),
+                "stage=poll iteration={iteration} session changed: {current}"
+            );
+        }
+        match classify_command_poll_body(&current) {
+            CommandPollObservation::Terminal => return current,
+            CommandPollObservation::Running | CommandPollObservation::BoundedWaitExpired => {}
+            CommandPollObservation::Invalid => {
+                panic!("stage=poll iteration={iteration} unknown command response: {current}")
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stage=poll iteration={iteration} terminal observation expired: {current}"
+        );
+        current = tool(
+            pipe,
+            &format!("poll-{iteration}"),
+            "command_control",
+            json!({"action":"poll","session_id":session,"wait_ms":1000}),
+        );
+    }
+}
+
+fn read_stderr(pipe: &mut Pipe, iteration: usize, reference: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let read = tool(
+            pipe,
+            &format!("read-{iteration}"),
+            "command_control",
+            json!({"action":"read","output_ref":reference,"stream":"stderr","limit":1048576}),
+        );
+        if read["result"]["structuredContent"]["data"]["content"].is_string()
+            && read["result"]["isError"] == false
+        {
+            return read;
+        }
+        let error = &read["result"]["structuredContent"]["error"];
+        // Match the shared retained-stderr read regression's typed busy errors.
+        // Only retry this read, keeping the same reference and owner connection.
+        assert!(
+            classify_command_poll_body(&read) == CommandPollObservation::BoundedWaitExpired
+                || (error["code"] == "RuntimeUnavailable" && error["retryable"] == true),
+            "stage=read iteration={iteration} unexpected output response: {read}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "stage=read iteration={iteration} bounded read retries expired: {read}"
+        );
+    }
+}
+
 #[test]
 fn local_route_retains_failed_stderr_and_enforces_session_ownership_ten_times() {
     let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Full);
@@ -83,34 +152,28 @@ fn local_route_retains_failed_stderr_and_enforces_session_ownership_ten_times() 
     let mut other = client(&executable);
     initialize(&mut other);
     for iteration in 0..10 {
+        eprintln!("LOCAL_PIPE stage=start iteration={iteration}");
         let marker = format!("LOCAL_RETAINED_STDERR_{iteration}");
         let started = tool(
             &mut owner,
             "same-id",
             "exec_command",
-            json!({"command":format!("Write-Error {marker}"),"shell":"windows_powershell","yield_time_ms":0,"timeout_ms":10000}),
+            json!({"command":format!("Write-Error {marker}"),"shell":"windows_powershell","yield_time_ms":0,"timeout_ms":120000}),
         );
         let session = started["result"]["structuredContent"]["data"]["session_id"]
             .as_str()
-            .unwrap()
+            .unwrap_or_else(|| panic!("stage=start iteration={iteration}: {started}"))
             .to_owned();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let terminal = loop {
-            assert!(Instant::now() < deadline);
-            let result = tool(
-                &mut owner,
-                "poll",
-                "command_control",
-                json!({"action":"poll","session_id":session,"wait_ms":100}),
-            );
-            if result["result"]["structuredContent"]["data"]["status"] != "running" {
-                break result;
-            }
-        };
+        let terminal = settle_command(&mut owner, iteration, started);
+        eprintln!("LOCAL_PIPE stage=terminal iteration={iteration} response={terminal}");
         assert_eq!(terminal["result"]["isError"], true, "{terminal}");
+        assert_eq!(
+            terminal["result"]["structuredContent"]["error"]["code"], "ProcessFailed",
+            "stage=terminal iteration={iteration}: {terminal}"
+        );
         let stderr = terminal["result"]["structuredContent"]["data"]["output_refs"]["stderr"]
             .as_str()
-            .unwrap();
+            .unwrap_or_else(|| panic!("stage=stderr-ref iteration={iteration}: {terminal}"));
         let replay = tool(
             &mut owner,
             "replay",
@@ -118,20 +181,20 @@ fn local_route_retains_failed_stderr_and_enforces_session_ownership_ten_times() 
             json!({"action":"poll","session_id":session,"wait_ms":0}),
         );
         assert_eq!(
-            replay["result"]["structuredContent"]["data"]["output_refs"]["stderr"],
-            stderr
+            replay["result"]["structuredContent"]["data"]["output_refs"]["stderr"], stderr,
+            "stage=replay iteration={iteration} terminal={terminal} replay={replay}"
         );
-        let read = tool(
-            &mut owner,
-            "read",
-            "command_control",
-            json!({"action":"read","output_ref":stderr,"stream":"stderr","limit":1048576}),
+        assert_eq!(
+            replay["result"]["structuredContent"]["error"]["code"], "ProcessFailed",
+            "stage=replay iteration={iteration}: {replay}"
         );
+        let read = read_stderr(&mut owner, iteration, stderr);
         assert!(
             read["result"]["structuredContent"]["data"]["content"]
                 .as_str()
                 .unwrap()
-                .contains(&marker)
+                .contains(&marker),
+            "stage=marker iteration={iteration} terminal={terminal} read={read}"
         );
         let denied = tool(
             &mut other,
@@ -260,18 +323,31 @@ fn cancellation_timeout_and_disconnect_never_replay_a_side_effect() {
     initialize(&mut other);
     send(
         &owner,
-        &json!({"jsonrpc":"2.0","id":"cancel-owner","method":"tools/call","params":{"name":"exec_command","arguments":{"command":"Start-Sleep -Seconds 20","shell":"windows_powershell","yield_time_ms":10000,"timeout_ms":60000}}}),
+        &json!({"jsonrpc":"2.0","id":"cancel-owner","method":"tools/call","params":{"name":"exec_command","arguments":{"command":"Start-Sleep -Seconds 120","shell":"windows_powershell","yield_time_ms":10000,"timeout_ms":180000}}}),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while fixture.runtime().active_task_summaries().is_empty() {
-        assert!(Instant::now() < deadline);
+        assert!(
+            Instant::now() < deadline,
+            "stage=cancel-owner activation expired"
+        );
         thread::sleep(Duration::from_millis(20));
     }
     send(
         &other,
         &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-owner"}}),
     );
-    thread::sleep(Duration::from_millis(250));
+    // Notifications are forwarded synchronously on this connection. A later
+    // tools/list response is a barrier for processing the foreign cancellation.
+    send(
+        &other,
+        &json!({"jsonrpc":"2.0","id":"cancel-barrier","method":"tools/list"}),
+    );
+    let barrier = response(&mut other, json!("cancel-barrier"));
+    assert!(
+        barrier["result"]["tools"].is_array(),
+        "stage=cancel-barrier: {barrier}"
+    );
     assert!(
         !fixture.runtime().active_task_summaries().is_empty(),
         "another session cancelled the owner request"
@@ -297,18 +373,75 @@ fn cancellation_timeout_and_disconnect_never_replay_a_side_effect() {
     );
     send(
         &owner,
-        &json!({"jsonrpc":"2.0","id":"abandon","method":"tools/call","params":{"name":"exec_command","arguments":{"command":"Add-Content -LiteralPath 'executions.txt' -Value 'once'; Start-Sleep -Seconds 20","shell":"windows_powershell","yield_time_ms":10000,"timeout_ms":60000}}}),
+        &json!({"jsonrpc":"2.0","id":"abandon","method":"tools/call","params":{"name":"exec_command","arguments":{"command":"Add-Content -LiteralPath 'executions.txt' -Value 'once'; Start-Sleep -Seconds 120","shell":"windows_powershell","yield_time_ms":10000,"timeout_ms":180000}}}),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !workspace.join("executions.txt").is_file() {
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(20));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut started = Value::Null;
+    let side_effect = workspace.join("executions.txt");
+    loop {
+        if let Some(bytes) = owner
+            .receive_with_tick(Duration::from_millis(20))
+            .unwrap_or_else(|error| {
+                panic!("stage=side-effect response: {error}; started={started}")
+            })
+        {
+            let received = codec::validate_message(&bytes).unwrap();
+            if received.get("id") == Some(&json!("abandon")) {
+                assert_eq!(
+                    classify_command_poll_body(&received),
+                    CommandPollObservation::Running,
+                    "stage=side-effect unexpected start status: {received}"
+                );
+                assert_eq!(
+                    received["result"]["isError"], false,
+                    "stage=side-effect start failed: {received}"
+                );
+                started = received;
+            } else {
+                assert!(
+                    received.get("method").is_some(),
+                    "stage=side-effect unmatched response: {received}"
+                );
+            }
+        }
+        let contents = std::fs::read_to_string(&side_effect);
+        if let Ok(contents) = &contents {
+            assert!(
+                contents.lines().filter(|line| *line == "once").count() <= 1,
+                "stage=side-effect duplicate execution; started={started}; file={contents:?}"
+            );
+            if contents.lines().collect::<Vec<_>>() == ["once"] && !started.is_null() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stage=side-effect file deadline; started={started}; file={contents:?}; active={:?}",
+            fixture.runtime().active_task_summaries()
+        );
     }
     owner.close();
     other.close();
+    drop(owner);
+    drop(other);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while runtime.registered_connections() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "stage=disconnect connections={}; started={started}; active={:?}; file={:?}",
+            runtime.registered_connections(),
+            fixture.runtime().active_task_summaries(),
+            std::fs::read_to_string(&side_effect)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     runtime.stop();
-    let contents = std::fs::read_to_string(workspace.join("executions.txt")).unwrap();
-    assert_eq!(contents.lines().filter(|line| *line == "once").count(), 1);
+    let contents = std::fs::read_to_string(&side_effect).unwrap();
+    assert_eq!(
+        contents.lines().filter(|line| *line == "once").count(),
+        1,
+        "stage=after-stop started={started}; file={contents:?}"
+    );
     let name = pipe_name(&installation_id(executable.parent().unwrap()).unwrap()).unwrap();
     assert!(Pipe::connect(&name, &workspace.join("untrusted.exe")).is_err());
     fixture.shutdown();

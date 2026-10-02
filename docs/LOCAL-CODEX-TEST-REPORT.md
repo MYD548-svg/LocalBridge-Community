@@ -2,7 +2,25 @@
 
 实际验证测试-非正式发布。基线 `de756be2b57f48a908108922ea869b84a70fab87`，工作分支 `codex/local-codex`。本轮在本地收敛后执行一次普通推送；推送结果与最终 SHA 由交付消息记录。推送后不查询 Actions，不创建 PR、不合并、不发布、不重装。
 
-## 2026-10-02 本地管道认证夹具修复
+## 2026-10-02 管道响应关闭与测试同步修复
+
+已核验提交 `2cb495488c681764e703960d855f78483007da5a` 的 [CI push 36973145250](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36973145250)，于香港时间 2026-10-02 **14:52** 结束：原 19 项门禁为 **13 PASS、1 FAIL、5 NOT_RUN**。六项编译/Clippy 预检、Broker/Adapter 发布构建与暂存完整性通过；原 Tunnel 认证和 retained-stderr 回归各 10 次通过。`auth-repeat` 的四项本地管道测试中，错误安装身份测试通过，其余三项分别因副作用文件等待超时、未初始化错误响应读取遇到 Win32 错误 233、stderr 内容不含标记而失败。上次 bearer 缺失已消除。后续完整 Rust 测试、独立 Clippy、NSIS、安装包完整性及最终产物五项未执行，仅有诊断产物，没有新安装包。
+
+关闭缺陷已确认：正常工作线程返回后调用 `Pipe::close()`，其服务器路径执行 `DisconnectNamedPipe`，会丢弃未读响应。依据微软的[强制断开说明](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-disconnectnamedpipe)及[服务器关闭后的 CLOSING 状态说明](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/6b6c8b8b-c5ac-4fa5-9182-619459fce7c7)，本轮在本机重新进行有限的 Win32 对照：同一进程中的管道写入 8 字节帧后，强制断开再关闭时 Peek/Read 失败、错误 233、读到 0 字节；直接释放服务器句柄后 Peek 显示 8 字节，Read 完整读回相同 8 字节。脚本与日志保留于 `.local-tmp/pipe-close-fix-20261002/win32-close-comparison.*`。该试验只验证 Win32 关闭语义，不是完整 Rust、认证、协议或安装包验收。
+
+本次提取工作线程处理及注销逻辑：正常返回后先移除连接登记，再释放最后的服务器句柄，不强制断开、不等待客户端读取。手动停止、身份拒绝、帧错误及写入失败保留强制关闭；原解析失败和非法协议版本的提前返回显式保留强制关闭。新增真实 Win32 管道 Rust 回归，在工作线程完成信号确认服务端句柄已释放后，客户端才读取，验证完整错误响应与原请求 ID，并检查登记已移除及 EOF。帧、JSON-RPC、认证、ACL 和双向安装身份校验没有调整。
+
+stderr 场景保持 10 次循环，命令预算改为 120 秒、终态观察为 180 秒，明确要求 `ProcessFailed`，继续验证标记、稳定引用、终态重放及跨会话 `OutputNotFound`。管道与共享 HTTP 测试复用同一命令分类：仅已知运行/终态状态及明确可重试的传输等待超时有效，未知状态立即失败；只读输出对齐共享回归的明确可重试错误，始终使用相同会话/引用，不重提 `exec_command`。取消场景用另一会话的 `tools/list` 响应作为通知处理屏障，所有者休眠 120 秒、执行上限 180 秒。副作用场景保留 `Add-Content`，后续休眠 120 秒、执行上限 180 秒，在 60 秒内同时检查启动响应及文件完整的一行 `once`，实际错误立即失败；关闭并释放客户端句柄，等连接工作线程注销后才停止服务，最终仍断言恰好一次。专用 300 毫秒超时及 `ProcessTimedOut` 保留。诊断补充阶段、迭代、公开响应、命令/文件状态，不记录 bearer 或认证头。文件与 stderr 原失败的具体原因仍未完整定位，短预算只作为强假设，未宣称已确认另一生产缺陷。
+
+本次实际本地证据保留于 `.local-tmp/pipe-close-fix-20261002/`：共享前 **11 项 PASS**，基础集合 **37 项 PASS**（含 bundled Python 子套件 **11 项 PASS**）、前端 **8 个文件 23 项 PASS**及生产构建通过，公开内容、许可证、架构与额外敏感扫描通过。锁定依赖在全新独立目录执行离线 `npm ci`，现有 `node_modules`、测试夹具、输出及日志全部保留。Rust 1.85 改动文件格式检查及 `git diff --check` 为 PASS。
+
+默认、Broker、Adapter 六项完整编译/Clippy 预检均实际尝试，保持原参数矩阵的 `--locked`、默认 `--all-targets`、对应二进制 feature/目标范围及 `-D warnings`，使用独立于共享构建目录的 `.local-tmp/local-codex-target` 缓存。六项分别退出 101，均因缺少 MSVC `link.exe` 在依赖构建脚本阶段 **BLOCKED**，未到达项目完整编译或 lint。未安装工具链。新关闭回归、全部本地管道测试、Guard `[401, 401, 200]`、认证回归及完整 Rust 行为套件均 **NOT_RUN**；资源发布构建、当前版本暂存完整性及打包/安装包/产物验证未执行。原 19 项门禁本地映射为 **11 PASS、2 BLOCKED、6 NOT_RUN**，无当前可运行检查 FAIL；六项预检的环境阻断不能算通过。
+
+静态复核确认：新增辅助方法/回归限于 Windows 测试构建，生产工作线程按原停止与资源回收逻辑注销；通知按同一连接顺序处理、取消不跨会话，输出读取仍绑定所有者。后续门禁保留 Adapter/Broker 暂存构建证据、安装包实际载荷、MIT 随包许可及逐项 SHA-256 检查，原 19 项门禁、重复次数与 Actions 配置未修改。这些审查不能替代执行结果；云端后续五项仍未验证。
+
+本轮从 `2cb4954` 修改，仅提交运行时、共享辅助逻辑、管道回归及本报告，普通推送一次、核对远端 SHA 后停止；不查询新 Actions、不创建 PR、不合并或发布、不删除文件。**本次新提交的云端状态为 UNVERIFIED**。下文保留历史各轮记录，不作为本次新提交的通过证据。
+
+## 2026-10-02 本地管道认证夹具修复（历史记录）
 
 已核验提交 `b471d7ed06e9590ff5448fae5b332880e5d1d4b7` 的 [CI push 36957941525](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/36957941525)，运行于香港时间 2026-10-02 11:23 结束，原 19 项门禁结果为 **13 PASS、1 FAIL、5 NOT_RUN**。六项编译/Clippy 预检、Broker 与 Adapter 发布构建、暂存完整性均通过，枚举大小修复已得到该提交云端验证。`auth-repeat` 内原 Tunnel 认证探测 10 次、retained stderr 回归 10 次通过，随后四项 `local_connection::tests` 全部在获取连接 bearer 时因 `Option::unwrap()` 遇到 `None` 失败，尚未进入实际管道行为断言。后续完整 Rust 测试、独立 Clippy、NSIS、安装包完整性和最终产物五项未执行；仅有诊断产物，没有安装包。上轮提交的云端结果由此更新为 FAIL。
 

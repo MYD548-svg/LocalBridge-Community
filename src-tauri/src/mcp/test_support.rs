@@ -674,15 +674,24 @@ pub(crate) enum CommandPollObservation {
 }
 
 pub(crate) fn classify_command_poll_response(response: &ClientResponse) -> CommandPollObservation {
-    let content = &response.body["result"]["structuredContent"];
+    classify_command_poll_body(&response.body)
+}
+
+pub(crate) fn classify_command_poll_body(body: &Value) -> CommandPollObservation {
+    let content = &body["result"]["structuredContent"];
     if let Some(status) = content["data"]["status"].as_str() {
-        return if status == "running" {
-            CommandPollObservation::Running
-        } else {
-            CommandPollObservation::Terminal
+        return match status {
+            "running" => CommandPollObservation::Running,
+            "completed" | "failed" | "timed_out" | "cancelled" | "lost" => {
+                CommandPollObservation::Terminal
+            }
+            _ => CommandPollObservation::Invalid,
         };
     }
-    if content["error"]["code"] == "OperationTimedOut" {
+    if content["error"]["code"] == "OperationTimedOut"
+        && content["error"]["retryable"] == true
+        && content["error"]["phase"] == "transport"
+    {
         return CommandPollObservation::BoundedWaitExpired;
     }
     CommandPollObservation::Invalid
@@ -745,6 +754,15 @@ fn command_poll_classification_matches_the_facade_response_contract() {
         classify_command_poll_response(&observation(json!({}))),
         CommandPollObservation::Invalid
     );
+    for structured in [
+        json!({"data":{"status":"unknown"}}),
+        json!({"error":{"code":"OperationTimedOut","retryable":false,"phase":"transport"}}),
+    ] {
+        assert_eq!(
+            classify_command_poll_response(&observation(structured)),
+            CommandPollObservation::Invalid
+        );
+    }
 }
 
 /// Submit a detached exec_command and return the first response that carries a

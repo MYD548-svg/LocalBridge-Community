@@ -68,11 +68,7 @@ impl LocalRuntime {
                                 let credential = bearer.clone();
                                 let peers = peers.clone();
                                 workers.push(thread::spawn(move || {
-                                    serve_client(pipe.clone(), port, credential);
-                                    pipe.close();
-                                    if let Ok(mut peers) = peers.lock() {
-                                        peers.retain(|peer| !peer.same_connection(&pipe));
-                                    }
+                                    serve_and_unregister(pipe, port, credential, peers);
                                 }));
                             }
                         }
@@ -105,6 +101,11 @@ impl LocalRuntime {
         self.thread
             .as_ref()
             .is_some_and(|thread| !thread.is_finished())
+    }
+
+    #[cfg(test)]
+    pub(super) fn registered_connections(&self) -> usize {
+        self.connections.lock().unwrap().len()
     }
 
     pub fn stop(&mut self) {
@@ -281,12 +282,27 @@ fn forward(pipe: &Pipe, reply: io::Result<HttpReply>, request: &Value) {
     }
 }
 
+fn serve_and_unregister(
+    pipe: Pipe,
+    port: u16,
+    bearer: Arc<SecretString>,
+    peers: Arc<Mutex<Vec<Pipe>>>,
+) {
+    serve_client(pipe.clone(), port, bearer);
+    if let Ok(mut peers) = peers.lock() {
+        peers.retain(|peer| !peer.same_connection(&pipe));
+    }
+    // Release the final server handle after unregistering. DisconnectNamedPipe
+    // would discard an error response that the client has not read yet.
+}
+
 fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
     let sockets = SocketPool::default();
     let Ok(bytes) = pipe.receive_frame(Duration::from_secs(10)) else {
         return;
     };
     let Ok(request) = validate_message(&bytes) else {
+        pipe.close();
         return;
     };
     if request.get("method").and_then(Value::as_str) != Some("initialize")
@@ -308,6 +324,7 @@ fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || byte == b'-')
     {
+        pipe.close();
         return;
     }
     let reply = match http(&sockets, port, &bearer, "POST", None, requested, &bytes) {
@@ -453,5 +470,51 @@ fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
     );
     for worker in workers {
         let _ = worker.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uninitialized_error_survives_server_worker_retirement() {
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let name = pipe_name(&crate::security::random_hex(32).unwrap()).unwrap();
+        let listener = Pipe::listen(&name, true).unwrap();
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let server_peers = peers.clone();
+        let expected_client = executable.clone();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            listener
+                .accept(&expected_client, &AtomicBool::new(false))
+                .unwrap();
+            server_peers.lock().unwrap().push(listener.clone());
+            let bearer = SecretString::new(crate::security::random_hex(32).unwrap()).unwrap();
+            serve_and_unregister(listener, 0, Arc::new(bearer), server_peers);
+            // No server Pipe remains when this signal reaches the client.
+            finished.send(()).unwrap();
+        });
+        let mut client = Pipe::connect(&name, &executable).unwrap();
+        let request_id = json!("uninitialized-delayed-reader");
+        client
+            .send(
+                &serde_json::to_vec(&json!({
+                    "jsonrpc":"2.0", "id":request_id, "method":"tools/list"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        completion.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(peers.lock().unwrap().is_empty());
+        let bytes = client.receive_frame(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            validate_message(&bytes).unwrap(),
+            json!({"jsonrpc":"2.0","id":request_id,
+                "error":{"code":-32000,"message":"initialize is required"}})
+        );
+        assert!(client.receive_with_tick(Duration::from_secs(1)).is_err());
+        worker.join().unwrap();
     }
 }
