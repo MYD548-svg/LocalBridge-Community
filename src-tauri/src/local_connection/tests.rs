@@ -179,6 +179,140 @@ fn simultaneous_clients_initialize_and_call_without_retrying_requests() {
 }
 
 #[test]
+fn output_read_local_pipe_preserves_owned_output_and_errors_with_the_facade_locked() {
+    let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Full);
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let mut runtime = LocalRuntime::start(
+        &executable,
+        fixture.runtime().port(),
+        fixture.runtime().local_connector_bearer().unwrap(),
+    )
+    .unwrap();
+    let mut owner = client(&executable);
+    initialize(&mut owner);
+    let mut other = client(&executable);
+    initialize(&mut other);
+    let initial = tool(
+        &mut owner,
+        "output-read-start",
+        "exec_command",
+        json!({
+            "command":"Write-Output LB_PIPE_LOCKED_STDOUT; Write-Error LB_PIPE_LOCKED_STDERR",
+            "shell":"windows_powershell","yield_time_ms":0,"timeout_ms":120000
+        }),
+    );
+    let terminal = settle_command(&mut owner, 71_000, initial);
+    assert_eq!(
+        terminal["result"]["structuredContent"]["error"]["code"],
+        "ProcessFailed"
+    );
+    let data = &terminal["result"]["structuredContent"]["data"];
+    let public = data["session_id"].as_str().unwrap();
+    let stdout = data["output_refs"]["stdout"].as_str().unwrap().to_owned();
+    let stderr = data["output_refs"]["stderr"].as_str().unwrap().to_owned();
+    fixture.runtime().with_output_read_guard_held(|executions| {
+        let owner_id = executions
+            .execution_for_public_session(&crate::domain::PublicSessionId::new(public))
+            .unwrap()
+            .owner_session
+            .unwrap();
+        let outputs = executions.output_handles();
+        let expired = outputs.retain_local(owner_id.clone(), "stdout", "old".into());
+        for _ in 0..crate::execution::output_handles::MAX_LOCAL_RETAINED_OUTPUT_HANDLES {
+            outputs.retain_local(owner_id.clone(), "stdout", "filler".into());
+        }
+        let local = outputs.retain_local(owner_id, "stdout", "甲🙂尾".into());
+        for reference in [&stdout, &stderr, &local] {
+            let denied = tool(
+                &mut other,
+                "output-read-same-id",
+                "command_control",
+                json!({"action":"read","output_ref":reference,"stream":"stderr"}),
+            );
+            assert_eq!(denied["id"], "output-read-same-id");
+            assert_eq!(
+                denied["result"]["structuredContent"]["error"]["code"], "OutputNotFound",
+                "{denied}"
+            );
+        }
+        for reference in ["lb-output-unknown", expired.as_str()] {
+            let denied = tool(
+                &mut owner,
+                "output-read-same-id",
+                "command_control",
+                json!({"action":"read","output_ref":reference}),
+            );
+            assert_eq!(
+                denied["result"]["structuredContent"]["error"]["code"],
+                "OutputNotFound"
+            );
+        }
+        let mismatch = tool(
+            &mut owner,
+            "output-read-mismatch",
+            "command_control",
+            json!({"action":"read","output_ref":stdout,"stream":"stderr"}),
+        );
+        let error = &mismatch["result"]["structuredContent"]["error"];
+        assert_eq!(error["code"], "InvalidArgument");
+        assert_eq!(error["details"]["expected"], "stdout");
+        assert_eq!(error["details"]["actual"], "stderr");
+        for (stream, reference, marker) in [
+            ("stdout", &stdout, "LB_PIPE_LOCKED_STDOUT"),
+            ("stderr", &stderr, "LB_PIPE_LOCKED_STDERR"),
+        ] {
+            let first = tool(
+                &mut owner,
+                "output-read-same-id",
+                "command_control",
+                json!({"action":"read","output_ref":reference,"stream":stream,"limit":1048576}),
+            );
+            assert_eq!(first["id"], "output-read-same-id");
+            assert_eq!(first["result"]["isError"], false, "{first}");
+            let page = &first["result"]["structuredContent"]["data"];
+            assert_eq!(page["output_ref"], reference.as_str());
+            assert!(page["content"].as_str().unwrap().contains(marker));
+            let second = tool(
+                &mut owner,
+                "output-read-again",
+                "command_control",
+                json!({"action":"read","output_ref":reference,"stream":stream,"limit":1048576}),
+            );
+            assert_eq!(
+                second["result"]["structuredContent"],
+                first["result"]["structuredContent"]
+            );
+        }
+        let page = tool(
+            &mut owner,
+            "output-read-unicode",
+            "command_control",
+            json!({"action":"read","output_ref":local,"offset":3,"limit":1}),
+        );
+        assert_eq!(page["result"]["structuredContent"]["data"]["content"], "🙂");
+        assert_eq!(
+            page["result"]["structuredContent"]["data"]["next_offset"],
+            7
+        );
+        let invalid = tool(
+            &mut owner,
+            "output-read-unaligned",
+            "command_control",
+            json!({"action":"read","output_ref":local,"offset":1}),
+        );
+        assert_eq!(
+            invalid["result"]["structuredContent"]["error"]["code"],
+            "InvalidArgument"
+        );
+    });
+    owner.close();
+    other.close();
+    runtime.stop();
+    assert_eq!(super::runtime::connected_clients(), 0);
+    fixture.shutdown();
+}
+
+#[test]
 fn local_route_retains_failed_stderr_and_enforces_session_ownership_ten_times() {
     let fixture = PublicRuntimeFixture::start_authenticated(PermissionMode::Full);
     let executable = std::env::current_exe().unwrap().canonicalize().unwrap();

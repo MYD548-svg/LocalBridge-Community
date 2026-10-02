@@ -1,9 +1,10 @@
 import { cargoCommand } from "./ci-gate.mjs";
 import { runStage } from "./process.mjs";
 
-// Run the new exit regressions and previously compiled configuration/pipe
+// Run output-read, exit and previously compiled configuration/pipe regressions
 // behavior first, without removing any original repetition or full-suite gate.
 for (const [id, filter] of [
+  ["output-read", "output_read_"],
   ["policy-shutdown", "mcp::server::tests::policy_shutdown_"],
   ["local-registration", "local_connection::registration::tests::"],
   ["local-pipe-connect", "local_connection::pipe::tests::"],

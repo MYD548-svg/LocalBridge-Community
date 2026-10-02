@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -28,12 +29,13 @@ use crate::domain::{
 };
 #[cfg(test)]
 use crate::execution::output_handles::MAX_LOCAL_RETAINED_OUTPUT_HANDLES;
-use crate::execution::output_handles::{OutputHandleRegistry, OutputOwner};
+use crate::execution::output_handles::{OutputHandle, OutputHandleRegistry};
 use crate::state::{
     Capability, CurrentTaskStatus, PermissionMode, RuntimeFault, SafeTaskSummary,
     TaskExecutionState, TaskKind,
 };
 
+use super::http::McpCancellationClient;
 use super::observation::WorkspaceObservationSeed;
 #[cfg(test)]
 use super::public_contract::EXEC_COMMAND_FIELDS;
@@ -1093,14 +1095,17 @@ impl PublicCommandSessions {
             .map(|handle| handle.as_str().to_string())
     }
 
+    #[cfg(test)]
     fn private_output(&self, public_output_ref: &str) -> Option<String> {
         self.outputs.private(public_output_ref)
     }
 
+    #[cfg(test)]
     fn local_output(&self, public_output_ref: &str) -> Option<(String, String)> {
         self.outputs.local(public_output_ref)
     }
 
+    #[cfg(test)]
     fn output_stream(&self, public_output_ref: &str) -> Option<String> {
         self.outputs.stream(public_output_ref)
     }
@@ -1111,13 +1116,9 @@ impl PublicCommandSessions {
         owner: &McpSessionId,
         executions: &ExecutionRegistry,
     ) -> bool {
-        match self.outputs.owner(public_output_ref) {
-            Some(OutputOwner::McpSession(output_owner)) => &output_owner == owner,
-            Some(OutputOwner::PublicSession(public_session)) => executions
-                .execution_for_public_session(&PublicSessionId::new(public_session))
-                .is_some_and(|execution| execution.owner_session.as_ref() == Some(owner)),
-            None => false,
-        }
+        self.outputs
+            .snapshot(public_output_ref)
+            .is_some_and(|output| output_owned_by(&output, owner, executions))
     }
 
     #[cfg(test)]
@@ -1269,7 +1270,7 @@ pub struct CodingToolsRuntimeAdapter {
     runtime: CodingToolsRuntime,
     workspace: PathBuf,
     workspace_authority: WorkspaceResolver,
-    workspace_lifetime_pin: WorkspaceLifetimePin,
+    workspace_lifetime_pin: Arc<WorkspaceLifetimePin>,
     shell_executor: ShellExecutor,
     toolbox: ToolboxResolver,
     public_commands: PublicCommandSessions,
@@ -1278,9 +1279,220 @@ pub struct CodingToolsRuntimeAdapter {
     cached_default_cwd: Option<String>,
     cached_project_discovery: Option<Value>,
     pending_runtime_fault: Option<RuntimeFault>,
+    output_read_fault: Arc<Mutex<Option<RuntimeFault>>>,
+}
+
+// Clones retain only immutable workspace authority, output mappings and the
+// authenticated transport. They never retain PolicyGuard or process ownership.
+#[derive(Clone)]
+pub(crate) struct RetainedOutputReader {
+    outputs: OutputHandleRegistry,
+    executions: ExecutionRegistry,
+    workspace_authority: WorkspaceResolver,
+    workspace_lifetime_pin: Arc<WorkspaceLifetimePin>,
+    client: McpCancellationClient,
+    pending_fault: Arc<Mutex<Option<RuntimeFault>>>,
+}
+
+impl RetainedOutputReader {
+    pub(crate) fn read(
+        &self,
+        arguments: &Value,
+        owner: &McpSessionId,
+        request_id: &Value,
+    ) -> Result<Value, FacadeError> {
+        self.workspace_authority
+            .input_path(".")
+            .map_err(normalize_path_authority_error)?;
+        self.workspace_lifetime_pin
+            .validate_current()
+            .map_err(normalize_path_authority_error)?;
+        let object = object_args(arguments)?;
+        ensure_only_keys(
+            object,
+            &["action", "output_ref", "stream", "offset", "limit"],
+        )?;
+        if required_string(object, "action")? != "read" {
+            return Err(invalid_argument());
+        }
+        let mut stable = object.clone();
+        stable.remove("action");
+        read_retained_output(
+            &self.outputs,
+            &self.executions,
+            Some(owner),
+            &stable,
+            |private| {
+                normalize_output_read_transport(
+                    self.client.read_output_with_request_id(private, request_id),
+                    &self.pending_fault,
+                )
+            },
+        )
+    }
+}
+
+fn output_owned_by(
+    output: &OutputHandle,
+    owner: &McpSessionId,
+    executions: &ExecutionRegistry,
+) -> bool {
+    match output {
+        OutputHandle::Local { owner_session, .. } => owner_session == owner,
+        OutputHandle::Private {
+            owner_public_session_id,
+            ..
+        } => executions
+            .execution_for_public_session(&PublicSessionId::new(owner_public_session_id.clone()))
+            .is_some_and(|execution| execution.owner_session.as_ref() == Some(owner)),
+    }
+}
+
+fn normalize_output_read_result(raw: Value) -> Result<Value, FacadeError> {
+    if raw.get("isError").and_then(Value::as_bool) == Some(true)
+        || raw
+            .pointer("/structuredContent/ok")
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        let mut error = normalize_private_error(&raw);
+        // The private read_output contract reports an expired retained session
+        // as SESSION_NOT_FOUND. It is an unavailable output, not a transport loss.
+        if matches!(
+            error.code,
+            FacadeErrorCode::NotFound | FacadeErrorCode::SessionUnavailable
+        ) {
+            error.code = FacadeErrorCode::OutputNotFound;
+        }
+        Err(error)
+    } else {
+        Ok(raw)
+    }
+}
+
+fn normalize_output_read_transport(
+    result: Result<Value, CodingToolsRuntimeError>,
+    pending_fault: &Mutex<Option<RuntimeFault>>,
+) -> Result<Value, FacadeError> {
+    let raw = result.map_err(|error| {
+        if !matches!(error, CodingToolsRuntimeError::RequestTimeout) {
+            *pending_fault
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.runtime_fault());
+        }
+        normalize_runtime_error(error)
+    })?;
+    normalize_output_read_result(raw)
+}
+
+fn read_retained_output(
+    outputs: &OutputHandleRegistry,
+    executions: &ExecutionRegistry,
+    owner: Option<&McpSessionId>,
+    object: &Map<String, Value>,
+    mut read_private: impl FnMut(Value) -> Result<Value, FacadeError>,
+) -> Result<Value, FacadeError> {
+    ensure_only_keys(object, &["output_ref", "stream", "offset", "limit"])?;
+    let public_output_ref = required_string(object, "output_ref")?;
+    let unavailable = || {
+        if owner.is_some() {
+            FacadeError::new(
+                FacadeErrorCode::OutputNotFound,
+                "output handle is unavailable to the current MCP session",
+                false,
+            )
+        } else {
+            FacadeError::new(
+                FacadeErrorCode::OutputNotFound,
+                "输出句柄不存在或已超过保留期",
+                false,
+            )
+            .with_details(json!({"output_ref":public_output_ref}))
+        }
+    };
+    // One immutable snapshot; release the registry lock before ownership lookup
+    // or transport I/O. No output reader takes nested registry locks.
+    let output = outputs
+        .snapshot(public_output_ref)
+        .ok_or_else(unavailable)?;
+    if owner.is_some_and(|owner| !output_owned_by(&output, owner, executions)) {
+        return Err(unavailable());
+    }
+    let stream = object
+        .get("stream")
+        .and_then(Value::as_str)
+        .unwrap_or("stdout");
+    let retained_stream = match &output {
+        OutputHandle::Private { stream, .. } | OutputHandle::Local { stream, .. } => stream,
+    };
+    if stream != retained_stream {
+        return Err(FacadeError::new(
+            FacadeErrorCode::InvalidArgument,
+            "stream 与 output_ref 所属输出流不一致",
+            false,
+        )
+        .with_details(json!({
+            "field":"stream", "output_ref":public_output_ref,
+            "expected":retained_stream, "actual":stream
+        })));
+    }
+    let offset = object.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let limit = object
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(65_536);
+    let mut read_private = |arguments| {
+        read_private(arguments).map_err(|error| {
+            if error.code == FacadeErrorCode::OutputNotFound {
+                unavailable()
+            } else {
+                error
+            }
+        })
+    };
+    match output {
+        OutputHandle::Local { content, .. } => {
+            public_local_output_page(public_output_ref, stream, &content, offset, limit)
+        }
+        OutputHandle::Private {
+            private_output_ref, ..
+        } => {
+            if stream == "stderr" {
+                let raw = read_private(json!({
+                    "output_ref":private_output_ref,"stream":"stderr","offset":0,"limit":1048576
+                }))?;
+                return public_stderr_page(&raw, public_output_ref, offset, limit);
+            }
+            let mut private = Map::new();
+            private.insert("output_ref".into(), Value::String(private_output_ref));
+            for key in ["stream", "offset", "limit"] {
+                if let Some(value) = object.get(key) {
+                    private.insert(key.into(), value.clone());
+                }
+            }
+            let raw = read_private(Value::Object(private))?;
+            Ok(CodingToolsRuntimeAdapter::normalize_read_output(
+                &raw,
+                public_output_ref,
+            ))
+        }
+    }
 }
 
 impl CodingToolsRuntimeAdapter {
+    fn output_reader(&self) -> Result<RetainedOutputReader, FacadeError> {
+        Ok(RetainedOutputReader {
+            outputs: self.public_commands.outputs.clone(),
+            executions: self.executions.clone(),
+            workspace_authority: self.workspace_authority.clone(),
+            workspace_lifetime_pin: Arc::clone(&self.workspace_lifetime_pin),
+            client: self
+                .runtime
+                .cancellation_client()
+                .map_err(normalize_runtime_error)?,
+            pending_fault: Arc::clone(&self.output_read_fault),
+        })
+    }
     fn new_with_executions(
         runtime: CodingToolsRuntime,
         executions: ExecutionRegistry,
@@ -1302,7 +1514,7 @@ impl CodingToolsRuntimeAdapter {
             runtime,
             workspace,
             workspace_authority,
-            workspace_lifetime_pin,
+            workspace_lifetime_pin: Arc::new(workspace_lifetime_pin),
             shell_executor: ShellExecutor::default(),
             toolbox,
             public_commands: PublicCommandSessions {
@@ -1314,6 +1526,7 @@ impl CodingToolsRuntimeAdapter {
             cached_default_cwd: None,
             cached_project_discovery: None,
             pending_runtime_fault: None,
+            output_read_fault: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1653,7 +1866,12 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
     }
 
     fn take_runtime_fault(&mut self) -> Option<RuntimeFault> {
-        self.pending_runtime_fault.take()
+        self.pending_runtime_fault.take().or_else(|| {
+            self.output_read_fault
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        })
     }
 
     fn coding_context(&self, project_path: &str, objective: &str) -> Result<Value, FacadeError> {
@@ -1929,85 +2147,15 @@ impl WorkspaceRuntimeAdapter for CodingToolsRuntimeAdapter {
     ) -> Result<Value, FacadeError> {
         let object = arguments.as_object().ok_or_else(invalid_argument)?;
         if action == CommandControlAction::Read {
-            let public_output_ref = required_string(object, "output_ref")?;
-            let stream = object
-                .get("stream")
-                .and_then(Value::as_str)
-                .unwrap_or("stdout");
-            let retained_stream = self
-                .public_commands
-                .output_stream(public_output_ref)
-                .ok_or_else(|| {
-                    FacadeError::new(
-                        FacadeErrorCode::OutputNotFound,
-                        "输出句柄不存在或已超过保留期",
-                        false,
-                    )
-                    .with_details(json!({"output_ref":public_output_ref}))
-                })?;
-            if stream != retained_stream {
-                return Err(FacadeError::new(
-                    FacadeErrorCode::InvalidArgument,
-                    "stream 与 output_ref 所属输出流不一致",
-                    false,
+            let outputs = self.public_commands.outputs.clone();
+            let executions = self.executions.clone();
+            return read_retained_output(&outputs, &executions, None, object, |private| {
+                normalize_output_read_transport(
+                    self.runtime
+                        .call_tool_with_request_id("read_output", private, request_id),
+                    &self.output_read_fault,
                 )
-                .with_details(json!({
-                    "field":"stream",
-                    "output_ref":public_output_ref,
-                    "expected":retained_stream,
-                    "actual":stream
-                })));
-            }
-            if let Some((_retained_stream, content)) =
-                self.public_commands.local_output(public_output_ref)
-            {
-                return public_local_output_page(
-                    public_output_ref,
-                    stream,
-                    &content,
-                    object.get("offset").and_then(Value::as_u64).unwrap_or(0),
-                    object
-                        .get("limit")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(65_536),
-                );
-            }
-            let private_output_ref = self
-                .public_commands
-                .private_output(public_output_ref)
-                .ok_or_else(|| {
-                    FacadeError::new(
-                        FacadeErrorCode::OutputNotFound,
-                        "输出句柄不存在或已超过保留期",
-                        false,
-                    )
-                    .with_details(json!({"output_ref":public_output_ref}))
-                })?;
-            if stream == "stderr" {
-                let raw = self.private_call(
-                    "read_output",
-                    json!({"output_ref":private_output_ref,"stream":"stderr","offset":0,"limit":1048576}),
-                    request_id,
-                )?;
-                return public_stderr_page(
-                    &raw,
-                    public_output_ref,
-                    object.get("offset").and_then(Value::as_u64).unwrap_or(0),
-                    object
-                        .get("limit")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(65_536),
-                );
-            }
-            let mut private = Map::new();
-            private.insert("output_ref".into(), Value::String(private_output_ref));
-            for key in ["stream", "offset", "limit"] {
-                if let Some(value) = object.get(key) {
-                    private.insert(key.into(), value.clone());
-                }
-            }
-            let raw = self.private_call("read_output", Value::Object(private), request_id)?;
-            return Ok(Self::normalize_read_output(&raw, public_output_ref));
+            });
         }
 
         let public_session_id = required_string(object, "session_id")?.to_string();
@@ -3357,6 +3505,10 @@ struct WorkflowCallContext<'a> {
 }
 
 impl AgentFacade<CodingToolsRuntimeAdapter> {
+    pub(crate) fn output_reader(&self) -> Result<RetainedOutputReader, FacadeError> {
+        self.adapter.output_reader()
+    }
+
     pub(crate) fn from_coding_runtime_with_executions(
         runtime: CodingToolsRuntime,
         policy: CapabilityPolicy,
@@ -7771,6 +7923,278 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn output_read_transport_errors_preserve_fault_and_private_error_contracts() {
+        let fault = Mutex::new(None);
+        let timeout =
+            normalize_output_read_transport(Err(CodingToolsRuntimeError::RequestTimeout), &fault)
+                .unwrap_err();
+        assert_eq!(timeout.code, FacadeErrorCode::OperationTimedOut);
+        assert!(
+            fault.lock().unwrap().is_none(),
+            "a bounded read timeout is not a runtime fault"
+        );
+        let disconnected = normalize_output_read_transport(
+            Err(CodingToolsRuntimeError::ConnectionUnavailable),
+            &fault,
+        )
+        .unwrap_err();
+        assert_eq!(disconnected.code, FacadeErrorCode::SessionUnavailable);
+        assert_eq!(
+            fault.lock().unwrap().take(),
+            Some(RuntimeFault::McpHealthTimeout)
+        );
+        for code in ["OUTPUT_NOT_FOUND", "SESSION_NOT_FOUND"] {
+            let missing = normalize_output_read_transport(
+                Ok(json!({"isError":true,"structuredContent":{"ok":false,"error":{"code":code}}})),
+                &fault,
+            )
+            .unwrap_err();
+            assert_eq!(missing.code, FacadeErrorCode::OutputNotFound);
+        }
+        assert!(
+            fault.lock().unwrap().is_none(),
+            "an expired output must not fault the runtime"
+        );
+    }
+
+    #[test]
+    fn output_read_rejections_never_call_the_private_runtime() {
+        let workspace = crate::mcp::test_support::temp_workspace();
+        let executions = ExecutionRegistry::for_workspace(&workspace).unwrap();
+        let owner = McpSessionId::new("read-owner");
+        let other = McpSessionId::new("read-other");
+        let public = PublicSessionId::new("read-public");
+        executions
+            .start_owned(
+                TaskId::new("read-task"),
+                public.clone(),
+                Some(owner.clone()),
+            )
+            .unwrap();
+        let outputs = executions.output_handles();
+        let refs = outputs.register(
+            public.as_str(),
+            &crate::execution::output_handles::OutputReferences {
+                primary: Some("private-out".into()),
+                stdout: Some("private-out".into()),
+                stderr: None,
+            },
+        );
+        let reference = refs.stdout.unwrap();
+        let expired = outputs.retain_local(owner.clone(), "stdout", "expired".into());
+        for _ in 0..MAX_LOCAL_RETAINED_OUTPUT_HANDLES {
+            outputs.retain_local(owner.clone(), "stdout", "retained".into());
+        }
+        let calls = std::cell::Cell::new(0);
+        for (session, args, code) in [
+            (
+                &owner,
+                json!({"output_ref":"unknown"}),
+                FacadeErrorCode::OutputNotFound,
+            ),
+            (
+                &owner,
+                json!({"output_ref":expired}),
+                FacadeErrorCode::OutputNotFound,
+            ),
+            (
+                &other,
+                json!({"output_ref":reference,"stream":"stderr"}),
+                FacadeErrorCode::OutputNotFound,
+            ),
+            (
+                &owner,
+                json!({"output_ref":reference,"stream":"stderr"}),
+                FacadeErrorCode::InvalidArgument,
+            ),
+            (
+                &owner,
+                json!({"output_ref":reference,"extra":true}),
+                FacadeErrorCode::InvalidArgument,
+            ),
+            (&owner, json!({}), FacadeErrorCode::InvalidArgument),
+        ] {
+            let error = read_retained_output(
+                &outputs,
+                &executions,
+                Some(session),
+                args.as_object().unwrap(),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    panic!("a rejected read must not reach the runtime");
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, code);
+            if session == &owner && args.get("stream").is_some() {
+                let envelope = error.to_mcp_result();
+                let details = &envelope["structuredContent"]["error"]["details"];
+                assert_eq!(details["field"], "stream");
+                assert_eq!(details["expected"], "stdout");
+                assert_eq!(details["actual"], "stderr");
+            }
+        }
+        assert_eq!(calls.get(), 0);
+        let args = json!({"output_ref":reference});
+        let expired_private = read_retained_output(
+            &outputs,
+            &executions,
+            Some(&owner),
+            args.as_object().unwrap(),
+            |_| {
+                normalize_output_read_transport(
+                    Ok(json!({"isError":true,"structuredContent":{"ok":false,"error":{"code":"SESSION_NOT_FOUND"}}})),
+                    &Mutex::new(None),
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(expired_private.code, FacadeErrorCode::OutputNotFound);
+        assert_eq!(
+            expired_private.to_mcp_result()["structuredContent"]["error"]["message"],
+            "output handle is unavailable to the current MCP session"
+        );
+        crate::mcp::test_support::cleanup_test_directory(&workspace);
+    }
+
+    #[test]
+    fn output_read_ownership_follows_orphaning_and_adoption_without_replacing_references() {
+        let workspace = crate::mcp::test_support::temp_workspace();
+        let executions = ExecutionRegistry::for_workspace(&workspace).unwrap();
+        let public = PublicSessionId::new("adopted-output-public");
+        let started = executions
+            .start_with_adoption(TaskId::new("adopted-output-task"), public.clone())
+            .unwrap();
+        let old = McpSessionId::new("old-output-owner");
+        let next = McpSessionId::new("next-output-owner");
+        executions
+            .bind_owner(&started.execution_id, old.clone())
+            .unwrap();
+        let outputs = executions.output_handles();
+        let reference = outputs
+            .register(
+                public.as_str(),
+                &crate::execution::output_handles::OutputReferences {
+                    primary: Some("private-adopted".into()),
+                    stdout: Some("private-adopted".into()),
+                    stderr: None,
+                },
+            )
+            .stdout
+            .unwrap();
+        let args = json!({"output_ref":reference});
+        let calls = std::cell::Cell::new(0);
+        let read = |owner| {
+            read_retained_output(
+                &outputs,
+                &executions,
+                Some(owner),
+                args.as_object().unwrap(),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(json!({"isError":false,"structuredContent":{"content":"adopted"}}))
+                },
+            )
+        };
+        assert!(read(&old).is_ok());
+        assert_eq!(
+            read(&next).unwrap_err().code,
+            FacadeErrorCode::OutputNotFound
+        );
+        executions.orphan_owned_by(&old).unwrap();
+        for owner in [&old, &next] {
+            assert_eq!(
+                read(owner).unwrap_err().code,
+                FacadeErrorCode::OutputNotFound
+            );
+        }
+        executions
+            .adopt_owner(&public, &started.adoption_token, next.clone())
+            .unwrap();
+        assert_eq!(
+            read(&old).unwrap_err().code,
+            FacadeErrorCode::OutputNotFound
+        );
+        let page = read(&next).unwrap();
+        assert_eq!(page["structuredContent"]["data"]["output_ref"], reference);
+        assert_eq!(page["structuredContent"]["data"]["content"], "adopted");
+        assert_eq!(
+            calls.get(),
+            2,
+            "only each current owner may read private output"
+        );
+        crate::mcp::test_support::cleanup_test_directory(&workspace);
+    }
+
+    #[test]
+    fn output_read_snapshots_keep_pagination_and_stream_normalization() {
+        let workspace = crate::mcp::test_support::temp_workspace();
+        let executions = ExecutionRegistry::for_workspace(&workspace).unwrap();
+        let owner = McpSessionId::new("page-owner");
+        let outputs = executions.output_handles();
+        let local = outputs.retain_local(owner.clone(), "stdout", "甲🙂尾".into());
+        for (offset, limit, content, next) in [(0, 3, "甲", 3), (3, 1, "🙂", 7)] {
+            let args = json!({"output_ref":local,"offset":offset,"limit":limit});
+            let result = read_retained_output(
+                &outputs,
+                &executions,
+                Some(&owner),
+                args.as_object().unwrap(),
+                |_| panic!("local output has no runtime read"),
+            )
+            .unwrap();
+            assert_eq!(result["structuredContent"]["data"]["content"], content);
+            assert_eq!(result["structuredContent"]["data"]["next_offset"], next);
+        }
+        let invalid = json!({"output_ref":local,"offset":1});
+        assert_eq!(
+            read_retained_output(
+                &outputs,
+                &executions,
+                Some(&owner),
+                invalid.as_object().unwrap(),
+                |_| panic!("local output has no runtime read")
+            )
+            .unwrap_err()
+            .code,
+            FacadeErrorCode::InvalidArgument
+        );
+        let public = PublicSessionId::new("page-public");
+        executions
+            .start_owned(
+                TaskId::new("page-task"),
+                public.clone(),
+                Some(owner.clone()),
+            )
+            .unwrap();
+        let refs = outputs.register(
+            public.as_str(),
+            &crate::execution::output_handles::OutputReferences {
+                primary: Some("private-stderr".into()),
+                stdout: Some("private-stdout".into()),
+                stderr: Some("private-stderr".into()),
+            },
+        );
+        for (stream, reference, private_ref) in [
+            ("stdout", refs.stdout.unwrap(), "private-stdout"),
+            ("stderr", refs.stderr.unwrap(), "private-stderr"),
+        ] {
+            let args = json!({"output_ref":reference,"stream":stream,"offset":0,"limit":4});
+            let result = read_retained_output(&outputs, &executions, Some(&owner), args.as_object().unwrap(), |private| {
+                assert_eq!(private["output_ref"], private_ref);
+                assert_eq!(private["limit"], if stream == "stderr" { 1048576 } else { 4 });
+                // The registry is available again before entering transport I/O.
+                assert!(outputs.snapshot(&reference).is_some());
+                Ok(json!({"isError":false,"structuredContent":{"content":"PAGE","stream":stream,"offset":0,"requested_offset":0,"limit":4,"next_offset":null,"total_stream_bytes":4,"truncated":false}}))
+            }).unwrap();
+            assert_eq!(result["structuredContent"]["data"]["output_ref"], reference);
+            assert_eq!(result["structuredContent"]["data"]["content"], "PAGE");
+            assert!(!result.to_string().contains(private_ref));
+        }
+        crate::mcp::test_support::cleanup_test_directory(&workspace);
+    }
 
     #[test]
     fn schema42_unified_error_diagnostics_preserve_detail_and_map_transport() {

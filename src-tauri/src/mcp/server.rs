@@ -67,8 +67,8 @@ use super::client_auth::ClientAuthenticator;
 use super::facade::{
     AGENT_API_REVISION, AgentFacade, CodingRuntimeHealth, CodingToolsRuntimeAdapter,
     FacadeCallError, FacadeDenied, FacadeError, FacadeErrorCode, FilesystemAction,
-    FilesystemRequest, TaskCallIdentity, normalize_path_authority_error, parse_filesystem_request,
-    public_error_output_schema, public_safe_summary, public_task_kind,
+    FilesystemRequest, RetainedOutputReader, TaskCallIdentity, normalize_path_authority_error,
+    parse_filesystem_request, public_error_output_schema, public_safe_summary, public_task_kind,
     run_workspace_filesystem_with_authority, stable_command_error, stable_public_tool_catalog,
     stable_success, validate_workspace_context_probe,
 };
@@ -98,6 +98,7 @@ struct ConnectionContext<'a> {
     guard: &'a Mutex<AgentFacade<CodingToolsRuntimeAdapter>>,
     public_policy: &'a RwLock<CapabilityPolicy>,
     cancellation: &'a McpCancellationClient,
+    output_reader: &'a RetainedOutputReader,
     policy_state: &'a PolicyStateSource,
     workspace_observation: &'a WorkspaceObservationSeed,
     observed_workspace: &'a Path,
@@ -169,6 +170,7 @@ struct ServeContext {
     guard: PolicyGuard,
     public_policy: Arc<RwLock<CapabilityPolicy>>,
     cancellation: McpCancellationClient,
+    output_reader: RetainedOutputReader,
     control_plane: ControlPlane,
     policy_state: PolicyStateSource,
     workspace_observation: Arc<WorkspaceObservationSeed>,
@@ -682,6 +684,9 @@ impl PolicyEnforcementRuntime {
                 .workspace_observation_seed()
                 .map_err(|_| PolicyEnforcementError::UpstreamFacadeNegotiationFailed)?,
         );
+        let output_reader = guard
+            .output_reader()
+            .map_err(|_| PolicyEnforcementError::UpstreamFacadeNegotiationFailed)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|_| PolicyEnforcementError::BindFailed)?;
         listener
@@ -715,6 +720,7 @@ impl PolicyEnforcementRuntime {
                         guard: thread_guard,
                         public_policy: thread_policy,
                         cancellation,
+                        output_reader,
                         control_plane: thread_control_plane,
                         policy_state: thread_policy_state,
                         workspace_observation,
@@ -748,6 +754,15 @@ impl PolicyEnforcementRuntime {
 
     pub const fn port(&self) -> u16 {
         self.port
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn with_output_read_guard_held<T>(
+        &self,
+        test: impl FnOnce(&ExecutionRegistry) -> T,
+    ) -> T {
+        let _held = self.guard.as_ref().unwrap().lock().unwrap();
+        test(&self.control_plane.executions())
     }
 
     pub(crate) fn active_task_summaries(&self) -> Vec<String> {
@@ -972,6 +987,7 @@ fn serve(listener: TcpListener, context: ServeContext) -> PolicyGuard {
         guard,
         public_policy,
         cancellation,
+        output_reader,
         control_plane,
         policy_state,
         workspace_observation,
@@ -1081,6 +1097,7 @@ fn serve(listener: TcpListener, context: ServeContext) -> PolicyGuard {
                 let worker_privileged = privileged.as_ref().map(Arc::clone);
                 let worker_stopping = Arc::clone(&stopping);
                 let worker_cancellation = cancellation.clone();
+                let worker_output_reader = output_reader.clone();
                 #[cfg(test)]
                 let worker_shutdown_test = shutdown_test.clone();
                 let mut spawn_failure_stream = stream.try_clone().ok();
@@ -1092,6 +1109,7 @@ fn serve(listener: TcpListener, context: ServeContext) -> PolicyGuard {
                             guard: &worker_guard,
                             public_policy: &worker_policy,
                             cancellation: &worker_cancellation,
+                            output_reader: &worker_output_reader,
                             policy_state: &worker_policy_state,
                             workspace_observation: &worker_observation,
                             observed_workspace: &worker_workspace,
@@ -1209,6 +1227,7 @@ fn handle_connection(mut stream: TcpStream, context: ConnectionContext<'_>) -> R
         guard,
         public_policy,
         cancellation,
+        output_reader,
         policy_state,
         workspace_observation,
         observed_workspace,
@@ -1936,6 +1955,49 @@ fn handle_connection(mut stream: TcpStream, context: ConnectionContext<'_>) -> R
                     private_request_id.clone(),
                     requests.clone(),
                     cancellation.clone(),
+                );
+            }
+            if name == "command_control" && command_action == Some("read") {
+                if stopping.load(Ordering::Acquire) {
+                    requests.remove(&request_key);
+                    return write_mcp_http_error(
+                        &mut stream,
+                        503,
+                        mcp_unavailable("server_stopping"),
+                        Some(session),
+                    );
+                }
+                let diagnostic_key = request_diagnostic_key(&id);
+                record_mcp_request_start(&diagnostic_key, session, name);
+                let decision = public_policy
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .decide_public(mode, name, &arguments);
+                let result = if decision.allowed {
+                    output_reader
+                        .read(
+                            &arguments,
+                            &session_id,
+                            &rpc_request_id_to_json(&private_request_id),
+                        )
+                        .unwrap_or_else(|error| error.to_mcp_result())
+                } else {
+                    FacadeDenied {
+                        reason: decision
+                            .deny_reason
+                            .expect("denied output read contains reason"),
+                        capability: decision.descriptor.capability,
+                    }
+                    .to_mcp_result()
+                };
+                if let Some(error) = operation_error_from_facade_result(&Ok(result.clone())) {
+                    requests.record_error(request_key.clone(), error);
+                }
+                requests.remove(&request_key);
+                return finalize_special_handler_request(
+                    &diagnostic_key,
+                    session,
+                    write_rpc_result(&mut stream, id, result, Some(session)),
                 );
             }
             let registered_task = scheduled_task.clone();
@@ -5313,6 +5375,149 @@ mod tests {
                 .code,
             FacadeErrorCode::NotFound
         );
+    }
+
+    #[test]
+    fn output_read_http_keeps_errors_and_real_output_available_while_facade_is_locked() {
+        let fixture = PublicRuntimeFixture::start(PermissionMode::Full);
+        let pep = fixture.runtime();
+        let owner = initialize(pep.port(), 71_000).session.unwrap();
+        let other = initialize(pep.port(), 71_001).session.unwrap();
+        let initial = public_tool_call(
+            pep.port(),
+            &owner,
+            71_002,
+            "exec_command",
+            json!({
+                "command":"Write-Output LB_LOCKED_STDOUT; Write-Error LB_LOCKED_STDERR",
+                "shell":"windows_powershell","yield_time_ms":0,"timeout_ms":120000
+            }),
+        );
+        let (terminal, _) = settle_public_command(pep.port(), &owner, 71_100, initial);
+        assert_tool_error(&terminal, "ProcessFailed");
+        let stdout = terminal.body["result"]["structuredContent"]["data"]["output_refs"]["stdout"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let stderr = terminal.body["result"]["structuredContent"]["data"]["output_refs"]["stderr"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        pep.with_output_read_guard_held(|executions| {
+            let outputs = executions.output_handles();
+            let owner_id = McpSessionId::new(owner.clone());
+            let expired = outputs.retain_local(owner_id.clone(), "stdout", "old".into());
+            for _ in 0..crate::execution::output_handles::MAX_LOCAL_RETAINED_OUTPUT_HANDLES {
+                outputs.retain_local(owner_id.clone(), "stdout", "filler".into());
+            }
+            let local = outputs.retain_local(owner_id, "stdout", "甲🙂尾".into());
+            let mut request_id = 72_000;
+            let mut read = |session: &str, args: Value| {
+                request_id += 1;
+                let reply =
+                    public_tool_call(pep.port(), session, request_id, "command_control", args);
+                assert_eq!(reply.body["id"], request_id);
+                assert_eq!(reply.session.as_deref(), Some(session));
+                reply
+            };
+            for reference in ["lb-output-unknown", expired.as_str()] {
+                assert_tool_error(
+                    &read(&owner, json!({"action":"read","output_ref":reference})),
+                    "OutputNotFound",
+                );
+            }
+            for reference in [&stdout, &stderr, &local] {
+                assert_tool_error(
+                    &read(
+                        &other,
+                        json!({"action":"read","output_ref":reference,"stream":"stderr"}),
+                    ),
+                    "OutputNotFound",
+                );
+            }
+            let mismatch = read(
+                &owner,
+                json!({"action":"read","output_ref":stdout,"stream":"stderr"}),
+            );
+            assert_tool_error(&mismatch, "InvalidArgument");
+            let details = &mismatch.body["result"]["structuredContent"]["error"]["details"];
+            assert_eq!(details["field"], "stream");
+            assert_eq!(details["expected"], "stdout");
+            assert_eq!(details["actual"], "stderr");
+            for (stream, reference, marker) in [
+                ("stdout", &stdout, "LB_LOCKED_STDOUT"),
+                ("stderr", &stderr, "LB_LOCKED_STDERR"),
+            ] {
+                let first = read(
+                    &owner,
+                    json!({"action":"read","output_ref":reference,"stream":stream,"limit":1048576}),
+                );
+                assert_eq!(first.body["result"]["isError"], false, "{:#?}", first.body);
+                let data = &first.body["result"]["structuredContent"]["data"];
+                assert_eq!(data["output_ref"], reference.as_str());
+                assert!(data["content"].as_str().unwrap().contains(marker));
+                let second = read(
+                    &owner,
+                    json!({"action":"read","output_ref":reference,"stream":stream,"limit":1048576}),
+                );
+                assert_eq!(
+                    second.body["result"]["structuredContent"],
+                    first.body["result"]["structuredContent"]
+                );
+            }
+            let page = read(
+                &owner,
+                json!({"action":"read","output_ref":local,"offset":3,"limit":1}),
+            );
+            assert_eq!(
+                page.body["result"]["structuredContent"]["data"]["content"],
+                "🙂"
+            );
+            assert_eq!(
+                page.body["result"]["structuredContent"]["data"]["next_offset"],
+                7
+            );
+            assert_tool_error(
+                &read(
+                    &owner,
+                    json!({"action":"read","output_ref":local,"offset":1}),
+                ),
+                "InvalidArgument",
+            );
+            assert_tool_error(
+                &read(
+                    &owner,
+                    json!({"action":"read","output_ref":local,"extra":true}),
+                ),
+                "InvalidArgument",
+            );
+            // Live policy changes must still apply while the foreground lock is held.
+            let original = policy(&repo_root());
+            let narrowed = CapabilityPolicy::from_toml(
+                &fs::read_to_string(repo_root().join("runtime-policy.toml"))
+                    .unwrap()
+                    .replace("\"command_control\", ", ""),
+            )
+            .unwrap();
+            *pep.public_policy.write().unwrap() = narrowed;
+            assert_tool_error(
+                &read(&owner, json!({"action":"read","output_ref":local})),
+                "PolicyDenied",
+            );
+            *pep.public_policy.write().unwrap() = original;
+        });
+        assert!(pep.control_plane.requests().all().is_empty());
+        assert_eq!(pep.control_plane.scheduler().snapshot().control_active, 0);
+        assert_eq!(delete(pep.port(), &other), 204);
+        let closed = public_tool_call(
+            pep.port(),
+            &other,
+            73_000,
+            "command_control",
+            json!({"action":"read","output_ref":stdout}),
+        );
+        assert_eq!(closed.status, 404);
+        fixture.shutdown();
     }
 
     #[test]

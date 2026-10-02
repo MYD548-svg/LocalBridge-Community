@@ -64,6 +64,13 @@ test("targeted local diagnosis reuses the declared gate instead of copying comma
   assert.throws(() => selectStages(CI_STAGES, { from: "rust-test", through: "format" }));
 });
 
+test("the full Rust gate collects independent target failures without weakening its result", () => {
+  const rust = CI_STAGES.find(({ id }) => id === "rust-test");
+  assert.ok(rust.args.includes("--no-fail-fast"));
+  assert.ok(rust.args.includes("--locked"));
+  assert.deepEqual(rust.args.slice(-2), ["--", "--test-threads=1"]);
+});
+
 test("a running desktop binary can use the same Rust gate with an isolated target directory", () => {
   assert.deepEqual(cargoCommand(["test"], {}).args, ["+1.85.0", "test"]);
   assert.deepEqual(

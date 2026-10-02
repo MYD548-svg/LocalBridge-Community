@@ -95,6 +95,7 @@ export const CI_STAGES = validateStages([
     ...cargo(
       "test",
       "--quiet",
+      "--no-fail-fast",
       "--manifest-path",
       "src-tauri/Cargo.toml",
       "--locked",

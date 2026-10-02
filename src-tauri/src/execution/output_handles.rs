@@ -6,7 +6,7 @@ pub(crate) const MAX_LOCAL_RETAINED_OUTPUT_HANDLES: usize = 8;
 pub(crate) const MAX_PRIVATE_RETAINED_OUTPUT_HANDLES: usize = 256;
 
 #[derive(Debug, Clone)]
-enum OutputHandle {
+pub(crate) enum OutputHandle {
     Private {
         private_output_ref: String,
         owner_public_session_id: String,
@@ -98,6 +98,7 @@ impl OutputHandleState {
         public
     }
 
+    #[cfg(test)]
     pub(crate) fn private(&self, public_output_ref: &str) -> Option<String> {
         match self.handles.get(public_output_ref)? {
             OutputHandle::Private {
@@ -107,6 +108,7 @@ impl OutputHandleState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn local(&self, public_output_ref: &str) -> Option<(String, String)> {
         match self.handles.get(public_output_ref)? {
             OutputHandle::Private { .. } => None,
@@ -116,6 +118,7 @@ impl OutputHandleState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn stream(&self, public_output_ref: &str) -> Option<String> {
         match self.handles.get(public_output_ref)? {
             OutputHandle::Private { stream, .. } | OutputHandle::Local { stream, .. } => {
@@ -196,6 +199,14 @@ impl OutputReferences {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OutputHandleRegistry(Arc<Mutex<OutputHandleState>>);
 impl OutputHandleRegistry {
+    pub(crate) fn snapshot(&self, public: &str) -> Option<OutputHandle> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .handles
+            .get(public)
+            .cloned()
+    }
     #[cfg(test)]
     pub(crate) fn public_for_private(&self, private: &str, owner: &str, stream: &str) -> String {
         self.0
@@ -280,18 +291,21 @@ impl OutputHandleRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain_local(owner, stream, content)
     }
+    #[cfg(test)]
     pub(crate) fn private(&self, public: &str) -> Option<String> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .private(public)
     }
+    #[cfg(test)]
     pub(crate) fn local(&self, public: &str) -> Option<(String, String)> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .local(public)
     }
+    #[cfg(test)]
     pub(crate) fn stream(&self, public: &str) -> Option<String> {
         self.0
             .lock()

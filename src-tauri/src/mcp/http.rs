@@ -77,6 +77,22 @@ impl std::fmt::Debug for McpCancellationClient {
 }
 
 impl McpCancellationClient {
+    // A dedicated retained-output call uses the already authenticated session,
+    // without borrowing the mutable foreground runtime or creating a session.
+    pub(crate) fn read_output_with_request_id(
+        &self,
+        arguments: Value,
+        request_id: &Value,
+    ) -> Result<Value, CodingToolsRuntimeError> {
+        let mut session = McpSession {
+            port: self.port,
+            bearer: Arc::clone(&self.bearer),
+            session_id: Some(Arc::clone(&self.session_id)),
+            next_id: 1,
+        };
+        session.call_tool_with_request_id("read_output", arguments, request_id)
+    }
+
     pub(crate) fn cancel_request(&self, request_id: &Value) -> Result<(), CodingToolsRuntimeError> {
         if !valid_request_id(request_id) {
             return Err(CodingToolsRuntimeError::ProtocolMismatch);
@@ -874,6 +890,84 @@ mod tests {
     use crate::control_plane::command_control::COMMAND_CONTROL_TRANSPORT_HEADROOM_MS;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn output_read_client_preserves_authentication_session_and_request_id() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "output read client did not connect"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("output read listener failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 1024];
+            let (header_end, content_length) = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "output read request closed before its headers");
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(header_end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..header_end])
+                        .unwrap()
+                        .to_ascii_lowercase();
+                    assert!(headers.contains("authorization: bearer test-bearer"));
+                    assert!(headers.contains("mcp-session-id: test-session"));
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    break (header_end + 4, content_length);
+                }
+            };
+            while bytes.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "output read request closed before its body");
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            let request: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
+            assert_eq!(request["id"], "output-read-private-id");
+            assert_eq!(request["method"], "tools/call");
+            assert_eq!(request["params"]["name"], "read_output");
+            assert_eq!(
+                request["params"]["arguments"]["output_ref"],
+                "private-output"
+            );
+            let body = json!({"jsonrpc":"2.0","id":request["id"],"result":{"isError":false,"structuredContent":{"content":"retained"}}}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nMcp-Session-Id: test-session\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let client = McpCancellationClient {
+            port,
+            bearer: Arc::new(InternalBearer::new("test-bearer").unwrap()),
+            session_id: Arc::from("test-session"),
+        };
+        let result = client
+            .read_output_with_request_id(
+                json!({"output_ref":"private-output"}),
+                &json!("output-read-private-id"),
+            )
+            .unwrap();
+        assert_eq!(result["structuredContent"]["content"], "retained");
+        server.join().unwrap();
+    }
 
     #[test]
     fn command_control_reserves_outer_response_headroom() {
