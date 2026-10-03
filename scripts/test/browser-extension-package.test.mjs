@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync } from "node:fs";
-import { extensionId, makeZip, readStoredZip, safePackageName, sha256, verifyExtensionFiles } from "./browser-extension-package.mjs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { extensionId, makeZip, readStoredZip, safePackageName, sha256, verifyExtensionFiles, verifyExtensionArchive } from "./browser-extension-package.mjs";
+import { buildBrowserExtension } from "../build-browser-extension.mjs";
 test("stored release ZIP roundtrips Unicode and rejects corruption and aliases", () => {
   const files = new Map([["manifest.json", Buffer.from("{}")], ["图解.txt", Buffer.from("中文 空格")]]);
   const archive = makeZip(files), read = readStoredZip(archive);
@@ -11,6 +14,57 @@ test("stored release ZIP roundtrips Unicode and rejects corruption and aliases",
   assert.throws(() => readStoredZip(makeZip(new Map([["a", Buffer.from("x")], ["A", Buffer.from("y")]]))));
   for (const name of ["../a","C:/a","/a","a\\b","a//b","CON.txt","a:stream"]) assert.equal(safePackageName(name), false);
 });
+
+// The bundler and compiler are fixtures; ZIP validation and evidence writes use
+// production code. Real TypeScript/Vite builds run separately in frontend-build.
+for (const development of [false, true]) {
+  for (const failure of ["identity", "source", "typecheck", "bundle", "empty", "hash"]) {
+    test(`${development ? "development" : "release"} extension failure invalidates old PASS: ${failure}`, async () => {
+      const repository = mkdtempSync(join(tmpdir(), "localbridge-extension-build-regression-"));
+      const source = join(repository, "extensions/chatgpt-web");
+      const evidence = join(repository, development ? "tests/artifacts/browser-extension-dev" : "tests/artifacts/browser-extension");
+      const put = (path, bytes) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, bytes); };
+      const suffix = development ? ".dev" : "";
+      for (const name of ["identity" + suffix + ".json", "extension-id" + suffix + ".txt"]) put(join(source, name), readFileSync(new URL("../../extensions/chatgpt-web/" + name, import.meta.url)));
+      for (const name of ["popup.html", "popup.css", "INSTALL.html", "INSTALL.svg"]) put(join(source, name), "fixture asset");
+      put(join(repository, "package.json"), JSON.stringify({ version: "0.1.5" }));
+      const evidencePath = join(evidence, "extension-build.json");
+      const options = {
+        repository, development, checkout: () => "a".repeat(40), worktree: () => false,
+        typecheck: () => assert.equal(JSON.parse(readFileSync(evidencePath)).status, "BUILDING"),
+        bundle: async (config) => put(join(config.build.outDir, config.build.lib.fileName()), "fixture compiled script"),
+      };
+      const old = await buildBrowserExtension(options);
+      assert.equal(old.status, "PASS");
+      assert.equal(verifyExtensionArchive(old.archive, repository, development).extensionId, old.extensionId);
+      put(join(evidence, "user.txt"), "preserved");
+      let checked = 0;
+      const next = { ...options, typecheck: () => { checked++; options.typecheck(); } };
+      if (failure === "identity") {
+        const identity = JSON.parse(readFileSync(join(source, "identity" + suffix + ".json")));
+        identity.id = "a".repeat(32); put(join(source, "identity" + suffix + ".json"), JSON.stringify(identity));
+      }
+      if (failure === "source") next.checkout = () => "unavailable";
+      if (failure === "typecheck") next.typecheck = () => { options.typecheck(); throw new Error("fixture typecheck failed"); };
+      if (failure === "bundle") next.bundle = async () => { throw new Error("fixture bundler failed"); };
+      if (failure === "empty") next.bundle = async (config) => put(join(config.build.outDir, config.build.lib.fileName()), "");
+      if (failure === "hash") next.verifyArchive = (archive, root, dev) => {
+        const files = readStoredZip(readFileSync(archive));
+        files.set("background.js", Buffer.from("tampered after metadata"));
+        writeFileSync(archive, makeZip(files));
+        return verifyExtensionArchive(archive, root, dev);
+      };
+      await assert.rejects(buildBrowserExtension(next));
+      const failed = JSON.parse(readFileSync(evidencePath));
+      assert.equal(failed.status, "FAIL");
+      assert.equal(failed.development, development);
+      assert.equal(failed.sha256, undefined);
+      if (failure === "identity" || failure === "source") assert.equal(checked, 0);
+      assert.equal(readFileSync(join(evidence, "user.txt"), "utf8"), "preserved");
+      assert.equal(readFileSync(join(old.directory, "background.js"), "utf8"), "fixture compiled script");
+    });
+  }
+}
 test("fixed public key derives the committed extension ID", () => {
   const identity = JSON.parse(readFileSync(new URL("../../extensions/chatgpt-web/identity.json", import.meta.url), "utf8"));
   assert.equal(extensionId(identity.key), identity.id);

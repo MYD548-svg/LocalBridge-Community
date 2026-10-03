@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { stageBroker, stageAdapter, stageBrowserHost, compilePreflight } from "../prepare-lb018-resources.mjs";
+import { stageBroker, stageAdapter, stageBrowserHost, compilePreflight, prepareResources } from "../prepare-lb018-resources.mjs";
 import { updateManifest } from "./update-tunnel.mjs";
 import { verifyRuntime, verifyHash, sha256, rejectExtras, installerEntryPaths, rejectDuplicateInstallerEntries } from "./runtime-integrity.mjs";
 import { runStages } from "./process.mjs";
@@ -71,7 +71,7 @@ test("broker bootstrap, repeated build and failure invalidate old success", () =
     assert.equal(JSON.parse(readFileSync(join(directory, evidence))).sha256, sha256(content));
   }
   assert.throws(() => stageBroker(directory, () => { throw new Error("compiler failed"); }), /compiler failed/);
-  assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, "BUILDING");
+  assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, "FAIL");
   const empty = fixture();
   assert.throws(() => stageBroker(empty, () => put(empty, binary, "")), /empty/);
 });
@@ -140,6 +140,12 @@ test("complete bundled trees pass; changed runtime source fails", () => {
   assert.throws(() => verifyRuntime(directory), /missing/);
   put(directory, evidencePath, evidenceJson);
   assert.equal(verifyRuntime(directory).status, "PASS");
+  for (const path of ["src-tauri/target/browser-host-stage/localbridge-browser-host.exe", "src-tauri/target/browser-host-stage/native-host-template.json"]) {
+    const original = readFileSync(join(directory, path));
+    put(directory, path, "tampered-browser-payload");
+    assert.throws(() => verifyRuntime(directory), /SHA256 mismatch/);
+    put(directory, path, original);
+  }
   const aria = "src-tauri/target/toolbox-stage/bin/aria2c.exe";
   put(directory, aria, "corrupt");
   assert.throws(() => verifyRuntime(directory), /mismatch/);
@@ -172,7 +178,7 @@ test("failed stage prevents later stages from executing", () => {
 
 // No real compiler is spawned: failures must invalidate existing broker evidence
 // and prevent release builds, including when a previous attempt passed.
-for (const failure of [0, 1, 2, 3, 4, 5, 6, 7, "release", null]) {
+for (const failure of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, "multiple", "spawn", "release", null]) {
   test(`compile preflight and broker staging order: ${failure ?? "success"}`, () => {
     const directory = fixture();
     const evidence = "src-tauri/target/release-stage/broker-build.json";
@@ -187,11 +193,16 @@ for (const failure of [0, 1, 2, 3, 4, 5, 6, 7, "release", null]) {
       assert.equal(args[0], "+1.85.0");
       assert.equal(args[args.indexOf("--manifest-path") + 1], "src-tauri/Cargo.toml");
       assert.equal(args[args.indexOf("--target-dir") + 1], "src-tauri/target");
+      assert.ok(args.includes("--locked"));
+      if (args[1] === "clippy") assert.deepEqual(args.slice(-3), ["--", "-D", "warnings"]);
       const index = calls.length;
       if (index < 2) assert.ok(!args.includes("--features"));
-      else assert.equal(args[args.indexOf("--features") + 1], index < 4 ? "privileged-broker" : index < 6 ? "mcp-adapter" : "browser-host");
+      else assert.equal(args[args.indexOf("--features") + 1], index < 4 ? "privileged-broker" : index < 6 ? "mcp-adapter" : index < 8 ? "browser-host" : "browser-host-dev");
+      if (index >= 8) assert.equal(args[args.indexOf("--bin") + 1], "localbridge-browser-host");
       calls.push(args[1]);
-      return { status: failure === index ? 17 : 0 };
+      if (failure === "spawn" && index === 2) throw new Error("fixture process launch failed");
+      if (failure === "spawn" && index === 7) return { status: null, error: new Error("fixture executable missing") };
+      return { status: failure === index || (failure === "multiple" && [1, 5, 9].includes(index)) ? 17 : 0 };
     }, () => "a".repeat(40));
     const build = () => {
       calls.push("release");
@@ -203,17 +214,22 @@ for (const failure of [0, 1, 2, 3, 4, 5, 6, 7, "release", null]) {
     else assert.throws(action, /failed/);
     const report = JSON.parse(readFileSync(join(directory, reportPath)));
     assert.equal(report.checkoutSha, "a".repeat(40));
-    if (Number.isInteger(failure)) {
+    const expectedCalls = ["test", "clippy", "test", "clippy", "test", "clippy", "test", "clippy", "test", "clippy"];
+    if (Number.isInteger(failure) || failure === "multiple" || failure === "spawn") {
       assert.equal(report.status, "FAIL");
-      assert.deepEqual(calls, ["test", "clippy", "test", "clippy", "test", "clippy", "test", "clippy"].slice(0, failure + 1));
-      assert.equal(report.checks[failure].exitCode, 17);
+      assert.deepEqual(calls, expectedCalls);
+      const failedIndices = Number.isInteger(failure) ? [failure] : failure === "multiple" ? [1, 5, 9] : [2, 7];
+      for (const index of failedIndices) {
+        assert.equal(report.checks[index].exitCode, failure === "spawn" ? null : 17);
+        assert.ok(report.error.includes(report.checks[index].id));
+      }
       assert.deepEqual(report.checks.map((check) => check.status),
-        report.checks.map((_, index) => index < failure ? "PASS" : index === failure ? "FAIL" : "NOT_RUN"));
+        report.checks.map((_, index) => failedIndices.includes(index) ? "FAIL" : "PASS"));
     } else {
       assert.equal(report.status, "PASS");
-      assert.deepEqual(calls, ["test", "clippy", "test", "clippy", "test", "clippy", "test", "clippy", "release"]);
+      assert.deepEqual(calls, [...expectedCalls, "release"]);
     }
-    assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, failure === null ? "PASS" : "BUILDING");
+    assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, failure === null ? "PASS" : "FAIL");
   });
 }
 
@@ -228,11 +244,13 @@ test("adapter staging invalidates stale evidence and rejects installer hash drif
   put(directory, staged, "tampered-adapter");
   assert.throws(() => verifyHash(join(directory, staged), initial.sha256), /mismatch/);
   assert.throws(() => stageAdapter(directory, () => { throw new Error("adapter compiler failed"); }), /compiler failed/);
-  assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, "BUILDING");
+  assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, "FAIL");
   stageAdapter(directory, () => put(directory, binary, "second-adapter"));
   assert.equal(JSON.parse(readFileSync(join(directory, evidence))).sha256, sha256("second-adapter"));
   put(directory, "src-tauri/target/local-mcp-stage/unregistered.exe", "extra");
   assert.throws(() => stageAdapter(directory, () => {}), /remove manually/);
+  assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, "FAIL");
+  assert.equal(readFileSync(join(directory, "src-tauri/target/local-mcp-stage/unregistered.exe"), "utf8"), "extra");
 });
 
 test("browser host failure invalidates success and preserves foreign files", () => {
@@ -243,9 +261,67 @@ test("browser host failure invalidates success and preserves foreign files", () 
   const evidence = join(directory, "src-tauri/target/browser-host-stage/browser-host-build.json");
   assert.equal(JSON.parse(readFileSync(evidence)).sourceSha, "a".repeat(40));
   assert.throws(() => stageBrowserHost(directory, () => { throw new Error("host compiler failed"); }, () => "b".repeat(40)), /failed/);
-  assert.equal(JSON.parse(readFileSync(evidence)).status, "BUILDING");
+  assert.equal(JSON.parse(readFileSync(evidence)).status, "FAIL");
+  stageBrowserHost(directory, () => put(directory, binary, "new-host"), () => "c".repeat(40));
   put(directory, "src-tauri/target/browser-host-stage/foreign.exe", "preserved");
   assert.throws(() => stageBrowserHost(directory, () => {}), /remove manually/);
+  assert.equal(JSON.parse(readFileSync(evidence)).status, "FAIL");
+  assert.equal(readFileSync(join(directory, "src-tauri/target/browser-host-stage/foreign.exe"), "utf8"), "preserved");
+});
+
+for (const checkout of [() => "old", () => { throw new Error("checkout unavailable"); }]) {
+  test(`preflight rejects unknown source before launching checks: ${checkout}`, () => {
+    const directory = fixture();
+    let launches = 0;
+    assert.throws(() => compilePreflight(directory, () => { launches++; return { status: 0 }; }, checkout));
+    const report = JSON.parse(readFileSync(join(directory, "tests/artifacts/ci/COMPILE-PREFLIGHT.json")));
+    assert.equal(launches, 0);
+    assert.equal(report.status, "FAIL");
+    assert.ok(report.checks.every((check) => check.status === "NOT_RUN"));
+  });
+}
+
+test("resource preparation invalidates all old native evidence before prerequisite failure", () => {
+  const directory = fixture();
+  const records = ["release-stage/broker-build.json", "local-mcp-stage/adapter-build.json", "browser-host-stage/browser-host-build.json"];
+  for (const record of records) put(directory, "src-tauri/target/" + record, JSON.stringify({ status: "PASS", sha256: "a".repeat(64) }));
+  put(directory, "src-tauri/target/local-mcp-stage/user.txt", "preserved");
+  assert.throws(() => prepareResources({ repository: directory }), /missing/);
+  for (const record of records) assert.equal(JSON.parse(readFileSync(join(directory, "src-tauri/target/" + record))).status, "FAIL");
+  assert.equal(readFileSync(join(directory, "src-tauri/target/local-mcp-stage/user.txt"), "utf8"), "preserved");
+});
+
+for (const [name, stage, binary, evidence] of [
+  ["broker", stageBroker, "localbridge-privileged-broker.exe", "release-stage/broker-build.json"],
+  ["adapter", stageAdapter, "localbridge-mcp.exe", "local-mcp-stage/adapter-build.json"],
+  ["browser", (directory, build) => stageBrowserHost(directory, build, () => "a".repeat(40)), "localbridge-browser-host.exe", "browser-host-stage/browser-host-build.json"],
+]) {
+  test(`${name} rejects empty replacement after a successful stage`, () => {
+    const directory = fixture();
+    put(directory, "extensions/chatgpt-web/identity.json", readFileSync(join(root, "extensions/chatgpt-web/identity.json")));
+    stage(directory, () => put(directory, "src-tauri/target/release/" + binary, "good"));
+    assert.throws(() => stage(directory, () => put(directory, "src-tauri/target/release/" + binary, "")), /empty/);
+    assert.equal(JSON.parse(readFileSync(join(directory, "src-tauri/target/" + evidence))).status, "FAIL");
+    stage(directory, () => put(directory, "src-tauri/target/release/" + binary, "new-good"));
+    const foreign = "src-tauri/target/" + dirname(evidence) + "/user.txt";
+    put(directory, foreign, "preserved");
+    assert.throws(() => stage(directory, () => {}), /remove manually/);
+    assert.equal(JSON.parse(readFileSync(join(directory, "src-tauri/target/" + evidence))).status, "FAIL");
+    assert.equal(readFileSync(join(directory, foreign), "utf8"), "preserved");
+  });
+}
+
+test("host identity and checkout failures invalidate an earlier successful stage", () => {
+  for (const failure of ["identity", "checkout"]) {
+    const directory = fixture();
+    put(directory, "extensions/chatgpt-web/identity.json", readFileSync(join(root, "extensions/chatgpt-web/identity.json")));
+    stageBrowserHost(directory, () => put(directory, "src-tauri/target/release/localbridge-browser-host.exe", "good"), () => "a".repeat(40));
+    if (failure === "identity") put(directory, "extensions/chatgpt-web/identity.json", "invalid JSON");
+    let builds = 0;
+    assert.throws(() => stageBrowserHost(directory, () => builds++, () => "invalid"));
+    assert.equal(builds, 0);
+    assert.equal(JSON.parse(readFileSync(join(directory, "src-tauri/target/browser-host-stage/browser-host-build.json"))).status, "FAIL");
+  }
 });
 
 test("NSIS explicitly covers both browsers and views with ownership checks", () => {

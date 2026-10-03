@@ -1449,8 +1449,8 @@ fn handle_connection(mut stream: TcpStream, context: ConnectionContext<'_>) -> R
             .header("x-localbridge-browser-grant")
             .map(str::to_owned);
         if let Some(token) = &browser_binding {
-            if !crate::browser_connection::authority::global()
-                .is_some_and(|authority| authority.consume(token, observed_workspace).is_ok())
+            if crate::browser_connection::authority::global()
+                .is_none_or(|authority| authority.consume(token, observed_workspace).is_err())
             {
                 return write_rpc_error(
                     &mut stream,
