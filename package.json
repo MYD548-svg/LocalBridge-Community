@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite --config vite.config.ts",
-    "build": "tsc -b && vite build --config vite.config.ts",
+    "build": "tsc -b && vite build --config vite.config.ts && npm run build:extension",
+    "build:extension": "tsc -p extensions/chatgpt-web/tsconfig.json && node scripts/build-browser-extension.mjs",
     "toolbox:prepare": "node scripts/prepare-toolbox.mjs",
-    "test": "vitest run"
+    "test": "vitest run && vitest run --config extensions/chatgpt-web/vitest.config.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

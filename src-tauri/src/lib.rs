@@ -1,4 +1,5 @@
 pub mod app;
+pub mod browser_connection;
 pub mod commands;
 pub mod control_plane;
 pub mod credentials;
@@ -50,6 +51,12 @@ macro_rules! localbridge_invoke_handler {
             commands::local_connection::connect_codex,
             commands::local_connection::auto_connect_codex,
             commands::local_connection::disconnect_codex,
+            commands::browser_connection::get_browser_connection_state,
+            commands::browser_connection::import_browser_extension,
+            commands::browser_connection::choose_browser_extension,
+            commands::browser_connection::approve_browser_pairing,
+            commands::browser_connection::revoke_browser_pairing,
+            commands::browser_connection::open_browser_extension_directory,
             commands::onboarding::save_onboarding_connection,
             commands::onboarding::open_openai_tunnel_settings,
             commands::onboarding::open_openai_api_keys,

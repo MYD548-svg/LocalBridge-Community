@@ -49,6 +49,17 @@ fn main() {
             }
             let _ = lifecycle.start_update_check(UpdateCheckTrigger::Startup);
             app.manage(lifecycle);
+            match localbridge_lib::browser_connection::service::BrowserService::start(app.handle())
+            {
+                Ok(service) => {
+                    app.manage(std::sync::Mutex::new(service));
+                }
+                Err(_) => {
+                    eprintln!(
+                        "Browser connection control unavailable; existing clients remain available."
+                    );
+                }
+            }
             install_tray(app.handle())?;
             let wake_app = app.handle().clone();
             single_instance.start_wake_listener(move || {
@@ -66,12 +77,15 @@ fn main() {
     app.run(keep_background_process_alive);
 }
 
-fn keep_background_process_alive(_app: &tauri::AppHandle, event: RunEvent) {
-    if let RunEvent::ExitRequested {
-        code: None, api, ..
-    } = event
-    {
-        api.prevent_exit();
+fn keep_background_process_alive(app: &tauri::AppHandle, event: RunEvent) {
+    match event {
+        RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+        RunEvent::Exit => {
+            if let Some(service) = app.try_state::<std::sync::Mutex<localbridge_lib::browser_connection::service::BrowserService>>() {
+                if let Ok(mut service) = service.lock() { service.stop(); }
+            }
+        }
+        _ => {}
     }
 }
 

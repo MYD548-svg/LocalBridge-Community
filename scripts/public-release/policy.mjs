@@ -47,6 +47,7 @@ const PUBLIC_EXACT = new Set([
   "runtime-policy.toml",
   "scripts/prepare-toolbox.mjs",
   "scripts/prepare-lb018-resources.mjs",
+  "scripts/build-browser-extension.mjs",
   "scripts/build-community.ps1",
   "scripts/build-tunnel-client.ps1",
   "scripts/verify-runtime.ps1",
@@ -55,6 +56,8 @@ const PUBLIC_EXACT = new Set([
   "docs/LOCAL-CODEX-ADAPTATION.md",
   "docs/LOCAL-CODEX-USAGE.md",
   "docs/LOCAL-CODEX-TEST-REPORT.md",
+  "docs/CHATGPT-WEB-INTEGRATION-PLAN.md",
+  "docs/CHATGPT-WEB-TEST-REPORT.md",
   "docs/licenses/mcp-proxy-MIT.txt",
   "TEST-REPORT.md",
   "BUILD-PROVENANCE.json",
@@ -69,6 +72,7 @@ const PUBLIC_PREFIXES = [
   "assets/",
   "schema/",
   "src/",
+  "extensions/chatgpt-web/",
   "src-tauri/",
   "runtime/",
   "scripts/public-release/",
@@ -120,7 +124,7 @@ export function sanitizePublicText(value, text) {
   }
   if (path === "package.json") {
     const manifest = JSON.parse(text);
-    const publicScripts = new Set(["dev", "build", "toolbox:prepare", "test"]);
+    const publicScripts = new Set(["dev", "build", "build:extension", "toolbox:prepare", "test"]);
     manifest.scripts = Object.fromEntries(Object.entries(manifest.scripts ?? {}).filter(([name]) => publicScripts.has(name)));
     manifest.license = manifest.license ?? "MIT";
     return `${JSON.stringify(manifest, null, 2)}\n`;

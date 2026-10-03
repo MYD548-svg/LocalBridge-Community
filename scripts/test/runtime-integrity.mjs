@@ -72,7 +72,7 @@ function resolveInstallerSevenZip(root) {
   }
   throw new Error("no 7-Zip installation available for installer payload verification");
 }
-function verifyInstallerPayload(root, evidence, adapterEvidence) {
+function verifyInstallerPayload(root, evidence, adapterEvidence, hostEvidence) {
   const bundleDir = join(root, "src-tauri/target/release/bundle/nsis");
   if (!existsSync(bundleDir)) return;
   const installers = filesBelow(bundleDir).filter((name) => name.endsWith("-setup.exe"));
@@ -90,12 +90,21 @@ function verifyInstallerPayload(root, evidence, adapterEvidence) {
   if (!licenseEntry) throw new Error("installer adapter attribution missing");
   const brokerEntry = paths.find((path) => path.toLowerCase() === "localbridge-privileged-broker.exe");
   if (!brokerEntry) throw new Error("installer payload does not carry the attested privileged broker");
+  const hostEntry = paths.find((path) => path.toLowerCase() === "localbridge-browser-host.exe");
+  const templateEntry = paths.find((path) => path.toLowerCase() === "native-host-template.json");
+  if (!hostEntry || !templateEntry) throw new Error("installer browser gateway or manifest missing");
   // Extraction is retained: this repository forbids automatic bulk deletion.
   const extraction = mkdtempSync(join(tmpdir(), "localbridge-installer-verify-"));
   const unpacked = spawnSync(sevenZip, ["x", "-y", `-o${extraction}`, installer, brokerEntry, adapterEntry, licenseEntry], { windowsHide: true });
   if (unpacked.status !== 0) throw new Error(`installer broker extraction failed (${unpacked.status ?? unpacked.error})`);
   verifyHash(join(extraction, brokerEntry), evidence.sha256);
   verifyHash(join(extraction, adapterEntry), adapterEvidence.sha256);
+  for (const entry of [hostEntry, templateEntry]) {
+    const extracted = spawnSync(sevenZip, ["x", "-y", "-o" + extraction, installer, entry], { windowsHide: true });
+    if (extracted.status !== 0) throw new Error("browser payload extraction failed");
+  }
+  verifyHash(join(extraction, hostEntry), hostEvidence.sha256);
+  verifyHash(join(extraction, templateEntry), hostEvidence.templateSha256);
   verifyHash(join(extraction, licenseEntry), sha256(requiredFile(join(root, "docs/licenses/mcp-proxy-MIT.txt"))));
   console.log(`installer payload verified; broker extraction retained at ${extraction}`);
 }
@@ -178,7 +187,17 @@ export function verifyRuntime(root, { bundledOnly = false, lockFile = "provenanc
   requiredFile(join(root, "docs/licenses/mcp-proxy-MIT.txt"));
   if (config?.bundle?.resources?.["target/local-mcp-stage/localbridge-mcp.exe"] !== "localbridge-mcp.exe" || config?.bundle?.resources?.["../docs/licenses/mcp-proxy-MIT.txt"] !== "licenses/mcp-proxy-MIT.txt") throw new Error("installer must embed the attested staged adapter and license");
   rejectExtras(dirname(adapter), ["localbridge-mcp.exe", "adapter-build.json"]);
-  verifyInstallerPayload(root, evidence, adapterEvidence);
+  const host = join(root, "src-tauri/target/browser-host-stage/localbridge-browser-host.exe");
+  const hostEvidence = JSON.parse(requiredFile(join(dirname(host), "browser-host-build.json")));
+  const identity = JSON.parse(requiredFile(join(root, "extensions/chatgpt-web/identity.json")));
+  if (hostEvidence.status !== "PASS" || !/^[a-f0-9]{40}$/.test(hostEvidence.sourceSha ?? "") || hostEvidence.protocolVersion !== identity.protocol || hostEvidence.extensionId !== identity.id) throw new Error("browser host build incomplete or incompatible");
+  verifyHash(host, hostEvidence.sha256);
+  verifyHash(join(dirname(host), "native-host-template.json"), hostEvidence.templateSha256);
+  const template = JSON.parse(requiredFile(join(dirname(host), "native-host-template.json")));
+  if (template.name !== identity.host || template.path !== "localbridge-browser-host.exe" || template.type !== "stdio" || JSON.stringify(template.allowed_origins) !== JSON.stringify(["chrome-extension://" + identity.id + "/"])) throw new Error("browser host registration template drift");
+  if (config?.bundle?.resources?.["target/browser-host-stage/localbridge-browser-host.exe"] !== "localbridge-browser-host.exe" || config?.bundle?.resources?.["target/browser-host-stage/native-host-template.json"] !== "native-host-template.json") throw new Error("installer must embed the attested browser gateway");
+  rejectExtras(dirname(host), ["localbridge-browser-host.exe", "browser-host-build.json", "native-host-template.json"]);
+  verifyInstallerPayload(root, evidence, adapterEvidence, hostEvidence);
   rejectExtras(dirname(broker), ["localbridge-privileged-broker.exe", "broker-build.json"]);
   }
   return { status: "PASS", coverage: bundledOnly ? "bundled-only" : "bundled-and-staged" };

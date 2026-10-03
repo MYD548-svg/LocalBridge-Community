@@ -1638,7 +1638,7 @@ fn update_start_error(error: UpdateStartError) -> UiError {
     UiError::from(operation)
 }
 
-fn open_system_url(url: &str) -> UiResult<()> {
+pub(crate) fn open_system_url(url: &str) -> UiResult<()> {
     let operation = wide("open");
     let target = wide(url);
     let result = unsafe {

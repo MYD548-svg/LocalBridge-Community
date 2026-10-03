@@ -22,6 +22,8 @@ export function compilePreflight(repository, execute = (program, args) => spawnS
     ["broker-clippy", ["clippy", ...common, "--features", "privileged-broker", "--bin", "localbridge-privileged-broker", "--", "-D", "warnings"]],
     ["adapter-compile", ["test", ...common, "--features", "mcp-adapter", "--bin", "localbridge-mcp", "--no-run"]],
     ["adapter-clippy", ["clippy", ...common, "--features", "mcp-adapter", "--bin", "localbridge-mcp", "--", "-D", "warnings"]],
+    ["browser-compile", ["test", ...common, "--features", "browser-host", "--all-targets", "--no-run"]],
+    ["browser-clippy", ["clippy", ...common, "--features", "browser-host", "--all-targets", "--", "-D", "warnings"]],
   ].map(([id, args]) => ({ id, program: "cargo", args: ["+1.85.0", ...args], status: "NOT_RUN", exitCode: null }));
   const directory = resolve(repository, "tests/artifacts/ci");
   mkdirSync(directory, { recursive: true });
@@ -85,6 +87,31 @@ export function stageAdapter(repository, build, preflight = () => {}) {
   if (sha256(requiredFile(staged)) !== hash) throw new Error("adapter staging mismatch");
   writeFileSync(evidence, JSON.stringify({ status: "PASS", sha256: hash, builtAt: new Date().toISOString() }, null, 2) + "\n");
 }
+export function stageBrowserHost(repository, build, checkout = () => {
+  const git = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8", windowsHide: true });
+  if (git.status !== 0) throw new Error("cannot identify browser host checkout");
+  return git.stdout.trim();
+}) {
+  const stage = resolve(repository, "src-tauri/target/browser-host-stage");
+  rejectExtras(stage, ["localbridge-browser-host.exe", "browser-host-build.json", "native-host-template.json"]);
+  mkdirSync(stage, { recursive: true });
+  const staged = resolve(stage, "localbridge-browser-host.exe");
+  const evidence = resolve(stage, "browser-host-build.json");
+  writeFileSync(evidence, JSON.stringify({ status: "BUILDING" }));
+  if (!existsSync(staged)) writeFileSync(staged, Buffer.alloc(0));
+  const identity = JSON.parse(requiredFile(resolve(repository, "extensions/chatgpt-web/identity.json")));
+  const template = { name: identity.host, description: "LocalBridge ChatGPT web gateway", path: "localbridge-browser-host.exe", type: "stdio", allowed_origins: ["chrome-extension://" + identity.id + "/"] };
+  writeFileSync(resolve(stage, "native-host-template.json"), JSON.stringify(template, null, 2) + "\n");
+  const sourceSha = checkout();
+  if (!/^[a-f0-9]{40}$/.test(sourceSha)) throw new Error("invalid browser host source SHA");
+  build();
+  const binary = resolve(repository, "src-tauri/target/release/localbridge-browser-host.exe");
+  const hash = sha256(requiredFile(binary));
+  copyFileSync(binary, staged);
+  verifyStaged();
+  function verifyStaged() { if (sha256(requiredFile(staged)) !== hash) throw new Error("browser host staging mismatch"); }
+  writeFileSync(evidence, JSON.stringify({ status: "PASS", sourceSha, sha256: hash, templateSha256: sha256(requiredFile(resolve(stage, "native-host-template.json"))), protocolVersion: identity.protocol, extensionId: identity.id }, null, 2) + "\n");
+}
 export function prepareResources({ compile = false } = {}) {
   for (const forbidden of ["runtime/tunnel-client/cloudflared.exe", "runtime/tunnel-client/cloudflared-manifest.json"]) {
     if (existsSync(resolve(root, forbidden))) throw new Error(`forbidden payload: ${forbidden}`);
@@ -95,8 +122,16 @@ export function prepareResources({ compile = false } = {}) {
   const adapterStage = resolve(root, "src-tauri/target/local-mcp-stage");
   mkdirSync(adapterStage, { recursive: true });
   if (!existsSync(resolve(adapterStage, "localbridge-mcp.exe"))) writeFileSync(resolve(adapterStage, "localbridge-mcp.exe"), Buffer.alloc(0));
+  const hostStage = resolve(root, "src-tauri/target/browser-host-stage");
+  mkdirSync(hostStage, { recursive: true });
+  if (!existsSync(resolve(hostStage, "localbridge-browser-host.exe"))) writeFileSync(resolve(hostStage, "localbridge-browser-host.exe"), Buffer.alloc(0));
+  // The manifest is a resource of the same crate that is compiling the host.
+  const identity = JSON.parse(requiredFile(resolve(root, "extensions/chatgpt-web/identity.json")));
+  writeFileSync(resolve(hostStage, "native-host-template.json"), JSON.stringify({ name: identity.host, description: "LocalBridge ChatGPT web gateway", path: "localbridge-browser-host.exe", type: "stdio", allowed_origins: ["chrome-extension://" + identity.id + "/"] }, null, 2) + "\n");
+  writeFileSync(resolve(hostStage, "browser-host-build.json"), JSON.stringify({ status: "BUILDING" }));
   stageBroker(root, () => run("cargo", ["+1.85.0", "build", "--manifest-path", "src-tauri/Cargo.toml", "--target-dir", "src-tauri/target", "--locked", "--release", "--features", "privileged-broker", "--bin", "localbridge-privileged-broker"]), () => { if (compile) compilePreflight(root); });
   stageAdapter(root, () => run("cargo", ["+1.85.0", "build", "--manifest-path", "src-tauri/Cargo.toml", "--target-dir", "src-tauri/target", "--locked", "--release", "--features", "mcp-adapter", "--bin", "localbridge-mcp"]));
+  stageBrowserHost(root, () => run("cargo", ["+1.85.0", "build", "--manifest-path", "src-tauri/Cargo.toml", "--target-dir", "src-tauri/target", "--locked", "--release", "--features", "browser-host", "--bin", "localbridge-browser-host"]));
   console.log("LB018_RELEASE_RESOURCES=PASS broker=release toolbox=pinned");
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

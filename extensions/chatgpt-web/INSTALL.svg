@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="280" viewBox="0 0 860 280">
+<rect width="860" height="280" rx="20" fill="#e9f0fb"/>
+<g font-family="Microsoft YaHei,system-ui,sans-serif" fill="#17345a">
+<text x="28" y="42" font-size="23" font-weight="bold">首次连接：四步准备</text>
+<g fill="white" stroke="#bdd0ea"><rect x="25" y="65" width="185" height="170" rx="15"/><rect x="235" y="65" width="185" height="170" rx="15"/><rect x="445" y="65" width="185" height="170" rx="15"/><rect x="655" y="65" width="180" height="170" rx="15"/></g>
+<g font-size="19" font-weight="bold"><text x="42" y="100">① 安装应用</text><text x="251" y="100">② 导入扩展 ZIP</text><text x="462" y="100">③ 浏览器加载</text><text x="672" y="100">④ 确认连接</text></g>
+<g font-size="15"><text x="42" y="138">网关随应用安装</text><text x="42" y="168">启动本地服务</text><text x="42" y="198">选择工作区</text><text x="251" y="138">应用校验并准备</text><text x="251" y="168">固定加载目录</text><text x="251" y="198">复制目录路径</text><text x="462" y="138">开启开发者模式</text><text x="462" y="168">加载解压缩扩展</text><text x="462" y="198">选择复制的目录</text><text x="672" y="138">打开 ChatGPT</text><text x="672" y="168">本机确认配对</text><text x="672" y="198">启用当前聊天</text></g>
+<text x="28" y="262" font-size="14">工具执行和结果发送均由你确认。首次加载后，日常使用只需连接与启用聊天。</text>
+</g></svg>

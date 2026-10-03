@@ -24,6 +24,13 @@ path = "src/main.rs"
 # resources-mapped attested staged broker.
 privileged-broker = []
 mcp-adapter = []
+browser-host = []
+browser-host-dev = ["browser-host"]
+
+[[bin]]
+name = "localbridge-browser-host"
+path = "bin/browser-host/main.rs"
+required-features = ["browser-host"]
 
 [[bin]]
 name = "localbridge-mcp"
@@ -68,7 +75,9 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Com",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_UI_Shell",
+  "Win32_UI_Controls_Dialogs",
   "Win32_UI_Shell_Common",
 ] }
 zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
@@ -120,6 +129,11 @@ path = "../tests/integration/packaging/lb019pre_release_no_console.rs"
 [[test]]
 name = "chatgpt_black_box"
 path = "../tests/black-box/chatgpt/live_client.rs"
+
+[[test]]
+name = "browser_host_process"
+path = "../tests/integration/browser/browser_host.rs"
+required-features = ["browser-host"]
 
 [profile.release]
 strip = true

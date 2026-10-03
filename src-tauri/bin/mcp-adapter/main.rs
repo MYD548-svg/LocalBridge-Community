@@ -3,7 +3,7 @@
 // mcp-proxy transport separation adaptation; see docs/licenses/mcp-proxy-MIT.txt.
 use localbridge_lib::local_connection::{codec, pipe, profile};
 
-use std::io::{self, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -37,7 +37,8 @@ fn failure(phase: &'static str, error: io::Error) -> AdapterError {
 
 fn run() -> Result<(), AdapterError> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 2 || args[0] != "--install-id" {
+    let browser = args.len() == 3 && args[2] == "--browser";
+    if (!browser && args.len() != 2) || args[0] != "--install-id" {
         return Err(failure(
             "arguments",
             io::Error::other("invalid adapter arguments"),
@@ -65,8 +66,51 @@ fn run() -> Result<(), AdapterError> {
     let ended = input_ended.clone();
     std::thread::spawn(move || {
         let mut input = io::stdin().lock();
+        if browser {
+            let mut line = String::new();
+            let prelude = input
+                .by_ref()
+                .take(1025)
+                .read_line(&mut line)
+                .ok()
+                .filter(|size| *size <= 1024 && line.ends_with('\n'))
+                .and_then(|_| serde_json::from_str::<serde_json::Value>(&line).ok());
+            if !prelude
+                .as_ref()
+                .and_then(|value| value["browserGrant"].as_str())
+                .is_some_and(|token| {
+                    token.len() < 128
+                        && token.starts_with("browser-")
+                        && token
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+            {
+                input_peer.close();
+                return;
+            }
+            if input_peer.send(line.as_bytes()).is_err() {
+                return;
+            }
+        }
         loop {
-            match codec::read_stdio(&mut input) {
+            let next = if browser {
+                let mut line = Vec::new();
+                match input
+                    .by_ref()
+                    .take((codec::MAX_FRAME_BYTES + 1) as u64)
+                    .read_until(b'\n', &mut line)
+                {
+                    Ok(0) => Ok(None),
+                    Ok(count) if count <= codec::MAX_FRAME_BYTES && line.ends_with(b"\n") => {
+                        Ok(Some(line))
+                    }
+                    _ => Err(io::Error::other("invalid browser adapter frame")),
+                }
+            } else {
+                codec::read_stdio(&mut input)
+            };
+            match next {
                 Ok(Some(bytes)) => {
                     if input_peer.send(&bytes).is_err() {
                         break;

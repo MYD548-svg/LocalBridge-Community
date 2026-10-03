@@ -141,7 +141,7 @@ impl ConnectionSettings {
 }
 
 #[cfg(windows)]
-fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -163,7 +163,7 @@ fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
     fs::rename(source, target)
 }
 

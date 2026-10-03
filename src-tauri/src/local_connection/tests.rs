@@ -667,3 +667,128 @@ fn both_sides_reject_a_process_from_another_installation() {
     runtime.stop();
     fixture.shutdown();
 }
+
+#[test]
+fn browser_authorization_actual_pipe_durable_dedup_and_revocation() {
+    use crate::browser_connection::authority::{Authority, WorkspaceStamp};
+    use std::sync::Arc;
+    let workspace = crate::mcp::test_support::temp_workspace()
+        .canonicalize()
+        .unwrap();
+    let validated = crate::workspace::WorkspaceValidator
+        .validate(&workspace)
+        .unwrap();
+    let stamp = WorkspaceStamp {
+        path: workspace.to_string_lossy().into_owned(),
+        identity: validated.identity().as_str().into(),
+        permission: serde_json::to_string(&PermissionMode::Full).unwrap(),
+    };
+    let source = stamp.clone();
+    let authority = Arc::new(
+        Authority::open(
+            workspace.join("browser-test-state.json"),
+            Arc::new(move || Some(source.clone())),
+        )
+        .unwrap(),
+    );
+    crate::browser_connection::authority::install(authority.clone()).unwrap();
+    let instance = "11111111-1111-1111-1111-111111111111";
+    let secret = "a".repeat(64);
+    let origin = format!(
+        "chrome-extension://{}/",
+        crate::browser_connection::EXTENSION_ID.trim()
+    );
+    authority.pair(instance, &secret, &origin).unwrap();
+    authority
+        .approve(instance, &authority.summaries().unwrap()[0].context)
+        .unwrap();
+    let fixture =
+        PublicRuntimeFixture::start_authenticated_in(workspace.clone(), PermissionMode::Full);
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let mut runtime = LocalRuntime::start(
+        &executable,
+        fixture.runtime().port(),
+        fixture.runtime().local_connector_bearer().unwrap(),
+    )
+    .unwrap();
+    let token = authority
+        .grant(instance, &secret, &origin, "chat-one")
+        .unwrap();
+    let mut pipe = client(&executable);
+    send(&pipe, &json!({"browserGrant":token}));
+    send(
+        &pipe,
+        &json!({"mcp":{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"arbitrary untrusted field","version":"1"}}}}),
+    );
+    assert_eq!(
+        response(&mut pipe, json!("init"))["result"]["protocolVersion"],
+        "2025-11-25"
+    );
+    send(
+        &pipe,
+        &json!({"mcp":{"jsonrpc":"2.0","method":"notifications/initialized"}}),
+    );
+    let request = json!({"jsonrpc":"2.0","id":"write","method":"tools/call","params":{"name":"filesystem","arguments":{"action":"write","path":"browser-once.txt","content":"once","encoding":"utf8"}}});
+    let mut envelope = json!({"mcp":request,"observation":{"message":"assistant-one","branch":"user-one","index":0}});
+    send(&pipe, &envelope);
+    let initial = response(&mut pipe, json!("write"));
+    assert_eq!(initial["result"]["isError"], false, "{initial}");
+    std::fs::write(
+        workspace.join("browser-once.txt"),
+        "user-changed-after-call",
+    )
+    .unwrap();
+    envelope["mcp"]["id"] = json!("duplicate");
+    send(&pipe, &envelope);
+    let duplicate = response(&mut pipe, json!("duplicate"));
+    assert_eq!(duplicate["result"], initial["result"]);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("browser-once.txt")).unwrap(),
+        "user-changed-after-call"
+    );
+    assert_eq!(super::runtime::browser_successful_calls(), 1);
+    assert_eq!(super::runtime::successful_calls(), 0);
+    send(
+        &pipe,
+        &json!({"mcp":{"jsonrpc":"2.0","id":"browser-running","method":"tools/call","params":{"name":"exec_command","arguments":{"command":"Add-Content -LiteralPath browser-running.txt -Value once; Start-Sleep -Seconds 120","shell":"powershell","workdir":".","yield_time_ms":1000,"timeout_ms":180000,"max_output_bytes":65536}}},"observation":{"message":"assistant-running","branch":"user-two","index":0}}),
+    );
+    let running = response(&mut pipe, json!("browser-running"));
+    assert_eq!(running["result"]["isError"], false, "{running}");
+    assert!(
+        running["result"]["structuredContent"]["data"]["session_id"].is_string(),
+        "{running}"
+    );
+    authority.revoke(instance).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while super::runtime::browser_connected_clients() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "revoked browser session did not close"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        authority
+            .grant(instance, &secret, &origin, "another-chat")
+            .is_err()
+    );
+    runtime.stop();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.runtime().active_task_summaries().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "browser cancellation did not settle: {:?}",
+            fixture.runtime().active_task_summaries()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("browser-running.txt"))
+            .unwrap()
+            .lines()
+            .filter(|line| *line == "once")
+            .count(),
+        1
+    );
+    fixture.shutdown();
+}

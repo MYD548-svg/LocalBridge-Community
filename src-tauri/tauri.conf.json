@@ -35,6 +35,8 @@
       "../LICENSE": "LICENSE",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
       "target/local-mcp-stage/localbridge-mcp.exe": "localbridge-mcp.exe",
+      "target/browser-host-stage/localbridge-browser-host.exe": "localbridge-browser-host.exe",
+      "target/browser-host-stage/native-host-template.json": "native-host-template.json",
       "../docs/licenses/mcp-proxy-MIT.txt": "licenses/mcp-proxy-MIT.txt"
     },
     "windows": {

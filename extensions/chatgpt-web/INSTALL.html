@@ -1,0 +1,6 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LocalBridge 扩展安装</title>
+<style>body{max-width:860px;margin:40px auto;padding:0 24px;font:17px/1.8 system-ui;color:#193456;background:#f4f7fc}img{width:100%}li{margin:15px 0}code{background:white;padding:3px 8px;border-radius:6px}</style>
+<h1>把 LocalBridge 接到 ChatGPT 网页</h1><p>首发从 GitHub 下载扩展压缩包。网关已随 LocalBridge 安装，无需启动其他代理或填写密钥。</p><img src="INSTALL.svg" alt="安装 LocalBridge、导入 ZIP、浏览器加载、确认连接四步图解">
+<ol><li>安装 LocalBridge 并启动本地服务，选择允许使用的工作区。</li><li>在“ChatGPT 网页”卡片导入此 ZIP，或选择此解压目录。应用会准备固定加载目录，并提供复制路径按钮。</li><li>Edge 地址栏输入 <code>edge://extensions</code>；Chrome 输入 <code>chrome://extensions</code>。开启“开发者模式”，点击“加载解压缩的扩展”，选择应用提供的目录，目录内应有 manifest.json。</li><li>打开或刷新 ChatGPT 网页，点击工具栏 LocalBridge 图标，选择“连接这台电脑”，在 LocalBridge 确认工作区与权限，再“为此聊天启用工具”。</li><li>选择本轮工具，填入说明并手动发送。助手生成工具请求后，在扩展内检查参数、确认执行、填入实际结果并手动发送。</li></ol>
+<h2>更新与恢复</h2><p>先停止工具并关闭扩展，在 LocalBridge 导入新版 ZIP，再启用扩展、点击“重新加载”并刷新 ChatGPT。固定加载目录请保留；无需保留下载的 ZIP。输入框有草稿时先保存或发送，再回填结果。</p>
+<p>配对撤销后，重置扩展配对身份再申请。企业策略禁止手动加载时，请联系设备管理员。结果未知的请求不会自动重发。回填内容会进入在线聊天。</p></html>

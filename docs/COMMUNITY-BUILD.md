@@ -40,4 +40,10 @@ Each invocation writes `tests/artifacts/ci/TEST-REPORT.json` with commit, profil
 
 Diagnostics upload even on failure. Verified installer uploads run only after success. No Release is published automatically. Full acceptance requires both workflows succeeding for the same repaired commit; local edits alone do not establish this.
 
+The same nineteen stages now include the ChatGPT extension tests/build/ZIP and the standalone browser host. Resource preflight compiles and lints the browser-host feature; the serial Rust stage also executes the new native-process and authenticated named-pipe tests. NSIS embeds the attested host and fixed-origin manifest template, writes an absolute manifest, and registers Edge/Chrome in both Windows registry views with ownership checks. Post-package verification extracts the host/template and checks their hashes as well as duplicate payload entries.
+
+Candidate artifacts include the installer, extension ZIP, Chinese HTML/SVG guide, checksums and provenance bound to the current checkout SHA. Development builds use node scripts/build-browser-extension.mjs --development and the browser-host-dev Cargo feature in an isolated target directory; their identity and host registration must remain separate. They are not bundled in release artifacts.
+
+For codex/chatgpt-web-integration without a PR, one ordinary push is expected to trigger CI only (one Windows job); Community keeps its main/release/tag/PR triggers. This task stops after the push and remote SHA comparison. Cloud results are UNVERIFIED and the two-workflow release acceptance above is deferred.
+
 Live ChatGPT connection, interactive UAC and clean Windows installation remain separate NOT_RUN acceptance items. A successful NSIS build proves packaging only.

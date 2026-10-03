@@ -331,7 +331,7 @@ fn open_allowlisted_url(url: &str) -> UiResult<()> {
     Ok(())
 }
 
-fn pick_windows_workspace_folder() -> UiResult<Option<String>> {
+pub(crate) fn pick_windows_workspace_folder() -> UiResult<Option<String>> {
     let initialized = unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) };
     if initialized < 0 {
         return Err(UiError::from("无法初始化文件夹选择器"));

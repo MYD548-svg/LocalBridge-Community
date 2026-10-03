@@ -1,3 +1,4 @@
+pub mod browser_connection;
 pub mod diagnostics;
 pub mod error;
 pub mod local_connection;

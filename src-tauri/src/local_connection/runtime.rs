@@ -21,12 +21,24 @@ use super::profile::installation_id;
 use crate::credentials::SecretString;
 
 static SUCCESSFUL_CALLS: AtomicUsize = AtomicUsize::new(0);
+static BROWSER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static BROWSER_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+pub fn browser_successful_calls() -> usize {
+    BROWSER_CALLS.load(Ordering::Acquire)
+}
+pub fn browser_connected_clients() -> usize {
+    BROWSER_CLIENTS.load(Ordering::Acquire)
+}
 pub fn successful_calls() -> usize {
-    SUCCESSFUL_CALLS.load(Ordering::Acquire)
+    SUCCESSFUL_CALLS
+        .load(Ordering::Acquire)
+        .saturating_sub(browser_successful_calls())
 }
 static CLIENTS: AtomicUsize = AtomicUsize::new(0);
 pub fn connected_clients() -> usize {
-    CLIENTS.load(Ordering::Acquire)
+    CLIENTS
+        .load(Ordering::Acquire)
+        .saturating_sub(browser_connected_clients())
 }
 
 pub struct LocalRuntime {
@@ -44,6 +56,8 @@ impl LocalRuntime {
         let name = pipe_name(&installation_id(parent)?)?;
         let listener = Pipe::listen(&name, true)?;
         SUCCESSFUL_CALLS.store(0, Ordering::Release);
+        BROWSER_CALLS.store(0, Ordering::Release);
+        BROWSER_CLIENTS.store(0, Ordering::Release);
         let stopping = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(Mutex::new(Vec::new()));
         let stop = stopping.clone();
@@ -173,6 +187,16 @@ struct HttpReply {
     body: Vec<u8>,
     session: Option<String>,
 }
+struct BrowserGrantLease(Option<String>);
+impl Drop for BrowserGrantLease {
+    fn drop(&mut self) {
+        if let (Some(token), Some(authority)) =
+            (&self.0, crate::browser_connection::authority::global())
+        {
+            authority.close(token);
+        }
+    }
+}
 
 fn http(
     pool: &SocketPool,
@@ -182,6 +206,20 @@ fn http(
     session: Option<&str>,
     protocol: &str,
     body: &[u8],
+) -> io::Result<HttpReply> {
+    http_scoped(pool, port, bearer, method, session, protocol, body, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn http_scoped(
+    pool: &SocketPool,
+    port: u16,
+    bearer: &SecretString,
+    method: &str,
+    session: Option<&str>,
+    protocol: &str,
+    body: &[u8],
+    browser: Option<&str>,
 ) -> io::Result<HttpReply> {
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
@@ -201,6 +239,16 @@ fn http(
     );
     if let Some(session) = session {
         headers.push_str(&format!("Mcp-Session-Id: {session}\r\n"));
+    }
+    if let Some(token) = browser {
+        if token.len() > 128
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(io::Error::other("invalid browser authorization"));
+        }
+        headers.push_str(&format!("X-LocalBridge-Browser-Grant: {token}\r\n"));
     }
     headers.push_str("\r\n");
     stream.write_all(headers.as_bytes())?;
@@ -298,10 +346,20 @@ fn serve_and_unregister(
 
 fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
     let sockets = SocketPool::default();
-    let Ok(bytes) = pipe.receive_frame(Duration::from_secs(10)) else {
+    let Ok(mut bytes) = pipe.receive_frame(Duration::from_secs(10)) else {
         return;
     };
-    let Ok(request) = validate_message(&bytes) else {
+    let browser = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|value| value["browserGrant"].as_str().map(str::to_owned));
+    let _grant_lease = BrowserGrantLease(browser.clone());
+    if browser.is_some() {
+        bytes = match pipe.receive_frame(Duration::from_secs(10)) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+    }
+    let Ok((request, bytes, _)) = decode_client_frame(&bytes, browser.is_some()) else {
         pipe.close();
         return;
     };
@@ -327,7 +385,16 @@ fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
         pipe.close();
         return;
     }
-    let reply = match http(&sockets, port, &bearer, "POST", None, requested, &bytes) {
+    let reply = match http_scoped(
+        &sockets,
+        port,
+        &bearer,
+        "POST",
+        None,
+        requested,
+        &bytes,
+        browser.as_deref(),
+    ) {
         Ok(reply) => reply,
         Err(_) => {
             forward(&pipe, Err(io::Error::other("initialize failed")), &request);
@@ -359,10 +426,19 @@ fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
     };
     forward(&pipe, Ok(reply), &request);
     CLIENTS.fetch_add(1, Ordering::AcqRel);
+    if browser.is_some() {
+        BROWSER_CLIENTS.fetch_add(1, Ordering::AcqRel);
+    }
     let pending = Arc::new(AtomicUsize::new(0));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     let mut notification_clock = Instant::now();
     loop {
+        if browser.as_ref().is_some_and(|token| {
+            !crate::browser_connection::authority::global()
+                .is_some_and(|authority| authority.valid_current(token))
+        }) {
+            break;
+        }
         if notification_clock.elapsed() >= Duration::from_secs(1) {
             if let Ok(reply) = http(
                 &sockets,
@@ -385,7 +461,8 @@ fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
         let Some(bytes) = bytes else {
             continue;
         };
-        let Ok(request) = validate_message(&bytes) else {
+        let Ok((request, bytes, observation)) = decode_client_frame(&bytes, browser.is_some())
+        else {
             break;
         };
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
@@ -431,6 +508,40 @@ fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
             ));
             continue;
         }
+        let journal = if request["method"] == "tools/call" {
+            if let Some(token) = &browser {
+                let admission = observation
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("assistant identity required"))
+                    .and_then(|observation| {
+                        crate::browser_connection::authority::global()
+                            .ok_or_else(|| io::Error::other("browser control unavailable"))?
+                            .claim(token, observation, &request)
+                    });
+                match admission {
+                    Ok(crate::browser_connection::authority::Claim::New(key)) => Some(key),
+                    Ok(crate::browser_connection::authority::Claim::Existing(previous)) => {
+                        let mut reply = previous["result"].clone();
+                        if !reply.is_object()
+                            || !matches!(previous["state"].as_str(), Some("succeeded" | "failed"))
+                        {
+                            reply = json!({"jsonrpc":"2.0","error":{"code":-32011,"message":"请求已有记录，状态不明时禁止重放","data":previous}});
+                        }
+                        reply["id"] = request["id"].clone();
+                        let _ = pipe.send(&serde_json::to_vec(&reply).unwrap());
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = pipe.send(&error_reply(request["id"].clone(), &error.to_string()));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         pending.fetch_add(1, Ordering::AcqRel);
         workers.retain(|worker| !worker.is_finished());
         let sockets = sockets.clone();
@@ -439,25 +550,57 @@ fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
         let owner = session.clone();
         let version = protocol.clone();
         let pending = pending.clone();
+        let browser = browser.clone();
         workers.push(thread::spawn(move || {
-            forward(
-                &peer,
-                http(
-                    &sockets,
-                    port,
-                    &credential,
-                    "POST",
-                    Some(&owner),
-                    &version,
-                    &bytes,
-                ),
-                &request,
+            let mut reply = http(
+                &sockets,
+                port,
+                &credential,
+                "POST",
+                Some(&owner),
+                &version,
+                &bytes,
             );
+            if let (Some(token), Some(key), Some(authority)) = (
+                &browser,
+                &journal,
+                crate::browser_connection::authority::global(),
+            ) {
+                match reply
+                    .as_ref()
+                    .ok()
+                    .and_then(|reply| validate_message(&reply.body).ok())
+                {
+                    Some(message) => {
+                        if authority.finish(token, key, &message).is_err() {
+                            authority.unknown(token, key);
+                            reply = Ok(HttpReply { body: serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32011,"message":"结果记录未完成，状态未知；禁止自动重放"}})).unwrap(), session: None });
+                        }
+                        if message.get("result").is_some()
+                            && message.pointer("/result/isError").and_then(Value::as_bool)
+                                != Some(true)
+                        {
+                            BROWSER_CALLS.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    None => {
+                        authority.unknown(token, key);
+                        reply = Ok(HttpReply { body: serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32011,"message":"执行结果未知；禁止自动重放"}})).unwrap(), session: None });
+                    }
+                }
+            }
+            forward(&peer, reply, &request);
             pending.fetch_sub(1, Ordering::AcqRel);
         }));
     }
     pipe.close();
     CLIENTS.fetch_sub(1, Ordering::AcqRel);
+    if let Some(token) = &browser {
+        BROWSER_CLIENTS.fetch_sub(1, Ordering::AcqRel);
+        if let Some(authority) = crate::browser_connection::authority::global() {
+            authority.close(token);
+        }
+    }
     sockets.close();
     let _ = http(
         &SocketPool::default(),
@@ -471,6 +614,31 @@ fn serve_client(mut pipe: Pipe, port: u16, bearer: Arc<SecretString>) {
     for worker in workers {
         let _ = worker.join();
     }
+}
+
+fn decode_client_frame(
+    bytes: &[u8],
+    browser: bool,
+) -> io::Result<(
+    Value,
+    Vec<u8>,
+    Option<crate::browser_connection::authority::Observation>,
+)> {
+    if !browser {
+        return validate_message(bytes).map(|request| (request, bytes.to_vec(), None));
+    }
+    let envelope: Value = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+    let message = serde_json::to_vec(&envelope["mcp"]).map_err(io::Error::other)?;
+    let request = validate_message(&message)?;
+    if message.len() > crate::browser_connection::protocol::MAX_REQUEST_BYTES {
+        return Err(io::Error::other("browser request too large"));
+    }
+    let observation = envelope
+        .get("observation")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value.clone()).map_err(io::Error::other))
+        .transpose()?;
+    Ok((request, message, observation))
 }
 
 #[cfg(test)]

@@ -54,7 +54,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: community-diagnostics
-          path: tests/artifacts/ci/
+          path: |
+            tests/artifacts/ci/
+            src-tauri/target/browser-host-stage/*.json
+            tests/artifacts/browser-extension/extension-build.json
           if-no-files-found: warn
       - name: Upload verified installer
         if: success()
@@ -62,4 +65,18 @@ jobs:
         with:
           name: community-verified-installer
           path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+      - name: Upload browser extension candidate
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: community-chatgpt-web-extension-candidate
+          path: |
+            tests/artifacts/browser-extension/*.zip
+            tests/artifacts/browser-extension/SHA256SUMS.txt
+            tests/artifacts/browser-extension/extension-build.json
+            extensions/chatgpt-web/INSTALL.html
+            extensions/chatgpt-web/INSTALL.svg
+            tests/artifacts/ci/BUILD-PROVENANCE.json
+            tests/artifacts/ci/SHA256SUMS.txt
           if-no-files-found: error

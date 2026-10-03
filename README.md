@@ -6,6 +6,8 @@
 
 本轮未生成新版安装包，完整 Windows 编译与实机验收仍受构建环境阻断，不能据此认定正式发布。参见 [本地连接使用说明](docs/LOCAL-CODEX-USAGE.md)、[来源与适配说明](docs/LOCAL-CODEX-ADAPTATION.md) 和 [本地验证报告](docs/LOCAL-CODEX-TEST-REPORT.md)。下文下载流程对应已发布的 Tunnel 版本。
 
+源码另包含 **ChatGPT 网页集成候选**：网关随 LocalBridge 安装，扩展以编译好的 ZIP 分发，首发采用 Edge/Chrome 开发者模式手动加载。应用准备固定目录，用户在应用确认配对、在扩展确认执行，并手动发送结果。此候选尚未发布；需要同一提交构建的新安装包和扩展 ZIP，现有安装包不能代替新增宿主。参见 [集成方案](docs/CHATGPT-WEB-INTEGRATION-PLAN.md)、[安装图解](extensions/chatgpt-web/INSTALL.html) 和 [本机检查报告](docs/CHATGPT-WEB-TEST-REPORT.md)。
+
 ## 让 ChatGPT 直接参与本地开发与 Windows 维护
 
 LocalBridge 将 ChatGPT 插件与 Windows 本地环境连接起来。无需反复上传文件或复制命令，就能让 ChatGPT 阅读和修改项目、运行开发任务，并协助完成常见的系统检查与维护工作。

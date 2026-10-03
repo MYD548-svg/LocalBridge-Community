@@ -33,12 +33,24 @@ export function artifacts() {
   const report = JSON.parse(requiredFile(join(evidenceRoot, "TEST-REPORT.json")));
   if (report.stages.find((stage) => stage.id === "nsis-package")?.status !== "PASS") throw new Error("No successful package stage in this run");
   if (statSync(join(bundleRoot, installers[0])).mtimeMs < Date.parse(report.startedAt)) throw new Error("Installer predates this gate run");
+  const sourceSha = command("git", ["rev-parse", "HEAD"]);
+  const hostEvidence = JSON.parse(requiredFile(join(root, "src-tauri/target/browser-host-stage/browser-host-build.json")));
+  const extensionEvidence = JSON.parse(requiredFile(join(root, "tests/artifacts/browser-extension/extension-build.json")));
+  if (hostEvidence.status !== "PASS" || hostEvidence.sourceSha !== sourceSha || extensionEvidence.status !== "PASS" || extensionEvidence.commit !== sourceSha) throw new Error("browser artifacts must bind to this checkout");
+  if (hostEvidence.extensionId !== extensionEvidence.extensionId || hostEvidence.protocolVersion !== extensionEvidence.protocol) throw new Error("browser artifact protocol or identity mismatch");
+  const extension = "tests/artifacts/browser-extension/LocalBridge-ChatGPT-Web-v" + extensionEvidence.version + ".zip";
+  if (sha256(requiredFile(join(root, extension))) !== extensionEvidence.sha256) throw new Error("extension ZIP hash mismatch");
   const paths = [
     `src-tauri/target/release/bundle/nsis/${installers[0]}`,
     "src-tauri/target/release/localbridge.exe",
     "src-tauri/target/release-stage/localbridge-privileged-broker.exe",
     "src-tauri/target/local-mcp-stage/localbridge-mcp.exe", "src-tauri/target/local-mcp-stage/adapter-build.json", "provenance/local-mcp-references.json", "docs/licenses/mcp-proxy-MIT.txt",
     "runtime-manifest.toml", "runtime-policy.toml", "provenance/runtime-lock.json",
+    "src-tauri/target/browser-host-stage/localbridge-browser-host.exe",
+    "src-tauri/target/browser-host-stage/browser-host-build.json",
+    "src-tauri/target/browser-host-stage/native-host-template.json",
+    extension, "tests/artifacts/browser-extension/extension-build.json", "tests/artifacts/browser-extension/SHA256SUMS.txt",
+    "extensions/chatgpt-web/INSTALL.html", "extensions/chatgpt-web/INSTALL.svg",
     "provenance/tunnel-client.json", "src-tauri/target/release-stage/broker-build.json",
     ...filesBelow(join(root, "runtime")).map((name) => `runtime/${name}`),
     ...filesBelow(join(root, "src-tauri/target/toolbox-stage")).map((name) => `src-tauri/target/toolbox-stage/${name}`),

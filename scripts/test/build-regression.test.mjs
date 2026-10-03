@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { stageBroker, stageAdapter, compilePreflight } from "../prepare-lb018-resources.mjs";
+import { stageBroker, stageAdapter, stageBrowserHost, compilePreflight } from "../prepare-lb018-resources.mjs";
 import { updateManifest } from "./update-tunnel.mjs";
 import { verifyRuntime, verifyHash, sha256, rejectExtras, installerEntryPaths, rejectDuplicateInstallerEntries } from "./runtime-integrity.mjs";
 import { runStages } from "./process.mjs";
@@ -102,7 +102,7 @@ test("installer payload census rejects duplicate entries that would overwrite at
 test("complete bundled trees pass; changed runtime source fails", () => {
   assert.equal(verifyRuntime(root, { bundledOnly: true }).status, "PASS");
   const directory = fixture();
-  for (const path of ["runtime", "runtime-manifest.toml", "provenance/runtime-lock.json", "src-tauri/src/tunnel/bundle.rs", "src-tauri/src/mcp/bundle.rs", "src-tauri/tauri.conf.json", "docs/licenses/mcp-proxy-MIT.txt"]) {
+  for (const path of ["runtime", "extensions/chatgpt-web/identity.json", "runtime-manifest.toml", "provenance/runtime-lock.json", "src-tauri/src/tunnel/bundle.rs", "src-tauri/src/mcp/bundle.rs", "src-tauri/tauri.conf.json", "docs/licenses/mcp-proxy-MIT.txt"]) {
     mkdirSync(dirname(join(directory, path)), { recursive: true });
     cpSync(join(root, path), join(directory, path), { recursive: true });
   }
@@ -120,6 +120,7 @@ test("complete bundled trees pass; changed runtime source fails", () => {
   put(directory, "src-tauri/target/toolbox-stage/bin/curl.cmd", '@echo off\r\n"%SystemRoot%\\System32\\curl.exe" %*\r\n');
   stageBroker(directory, () => put(directory, "src-tauri/target/release/localbridge-privileged-broker.exe", "fixture-broker"));
   stageAdapter(directory, () => put(directory, "src-tauri/target/release/localbridge-mcp.exe", "fixture-adapter"));
+  stageBrowserHost(directory, () => put(directory, "src-tauri/target/release/localbridge-browser-host.exe", "fixture-host"), () => "a".repeat(40));
   assert.equal(verifyRuntime(directory).status, "PASS");
   const configPath = "src-tauri/tauri.conf.json";
   const config = readFileSync(join(directory, configPath));
@@ -171,7 +172,7 @@ test("failed stage prevents later stages from executing", () => {
 
 // No real compiler is spawned: failures must invalidate existing broker evidence
 // and prevent release builds, including when a previous attempt passed.
-for (const failure of [0, 1, 2, 3, 4, 5, "release", null]) {
+for (const failure of [0, 1, 2, 3, 4, 5, 6, 7, "release", null]) {
   test(`compile preflight and broker staging order: ${failure ?? "success"}`, () => {
     const directory = fixture();
     const evidence = "src-tauri/target/release-stage/broker-build.json";
@@ -188,7 +189,7 @@ for (const failure of [0, 1, 2, 3, 4, 5, "release", null]) {
       assert.equal(args[args.indexOf("--target-dir") + 1], "src-tauri/target");
       const index = calls.length;
       if (index < 2) assert.ok(!args.includes("--features"));
-      else assert.equal(args[args.indexOf("--features") + 1], index < 4 ? "privileged-broker" : "mcp-adapter");
+      else assert.equal(args[args.indexOf("--features") + 1], index < 4 ? "privileged-broker" : index < 6 ? "mcp-adapter" : "browser-host");
       calls.push(args[1]);
       return { status: failure === index ? 17 : 0 };
     }, () => "a".repeat(40));
@@ -204,13 +205,13 @@ for (const failure of [0, 1, 2, 3, 4, 5, "release", null]) {
     assert.equal(report.checkoutSha, "a".repeat(40));
     if (Number.isInteger(failure)) {
       assert.equal(report.status, "FAIL");
-      assert.deepEqual(calls, ["test", "clippy", "test", "clippy", "test", "clippy"].slice(0, failure + 1));
+      assert.deepEqual(calls, ["test", "clippy", "test", "clippy", "test", "clippy", "test", "clippy"].slice(0, failure + 1));
       assert.equal(report.checks[failure].exitCode, 17);
       assert.deepEqual(report.checks.map((check) => check.status),
         report.checks.map((_, index) => index < failure ? "PASS" : index === failure ? "FAIL" : "NOT_RUN"));
     } else {
       assert.equal(report.status, "PASS");
-      assert.deepEqual(calls, ["test", "clippy", "test", "clippy", "test", "clippy", "release"]);
+      assert.deepEqual(calls, ["test", "clippy", "test", "clippy", "test", "clippy", "test", "clippy", "release"]);
     }
     assert.equal(JSON.parse(readFileSync(join(directory, evidence))).status, failure === null ? "PASS" : "BUILDING");
   });
@@ -232,4 +233,29 @@ test("adapter staging invalidates stale evidence and rejects installer hash drif
   assert.equal(JSON.parse(readFileSync(join(directory, evidence))).sha256, sha256("second-adapter"));
   put(directory, "src-tauri/target/local-mcp-stage/unregistered.exe", "extra");
   assert.throws(() => stageAdapter(directory, () => {}), /remove manually/);
+});
+
+test("browser host failure invalidates success and preserves foreign files", () => {
+  const directory = fixture();
+  put(directory, "extensions/chatgpt-web/identity.json", readFileSync(join(root, "extensions/chatgpt-web/identity.json")));
+  const binary = "src-tauri/target/release/localbridge-browser-host.exe";
+  stageBrowserHost(directory, () => put(directory, binary, "host"), () => "a".repeat(40));
+  const evidence = join(directory, "src-tauri/target/browser-host-stage/browser-host-build.json");
+  assert.equal(JSON.parse(readFileSync(evidence)).sourceSha, "a".repeat(40));
+  assert.throws(() => stageBrowserHost(directory, () => { throw new Error("host compiler failed"); }, () => "b".repeat(40)), /failed/);
+  assert.equal(JSON.parse(readFileSync(evidence)).status, "BUILDING");
+  put(directory, "src-tauri/target/browser-host-stage/foreign.exe", "preserved");
+  assert.throws(() => stageBrowserHost(directory, () => {}), /remove manually/);
+});
+
+test("NSIS explicitly covers both browsers and views with ownership checks", () => {
+  const hooks = readFileSync(join(root, "scripts/public-release/nsis-hooks.nsh"), "utf8");
+  for (const browser of ["Microsoft\\Edge", "Google\\Chrome"]) for (const view of [32, 64]) {
+    for (const macro of ["CheckRegistration", "Register", "Unregister"]) {
+      assert.ok(hooks.includes("!insertmacro LocalBridge" + macro + " " + view + ' "' + browser + '"'));
+    }
+  }
+  assert.ok(hooks.includes("--write-manifest"));
+  assert.ok(hooks.includes("--prepare-update"));
+  assert.ok(!/Delete\s+["'].*[*?]/.test(hooks));
 });

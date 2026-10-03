@@ -17,6 +17,7 @@ pub(crate) struct SessionRecord {
     pub created_at_ms: u64,
     pub last_seen_ms: u64,
     pub owned_requests: HashSet<RequestKey>,
+    pub browser_binding: Option<String>,
 }
 
 impl SessionRecord {
@@ -31,6 +32,7 @@ impl SessionRecord {
             created_at_ms: now,
             last_seen_ms: now,
             owned_requests: HashSet::new(),
+            browser_binding: None,
         }
     }
 

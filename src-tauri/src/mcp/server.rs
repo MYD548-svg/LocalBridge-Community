@@ -1205,6 +1205,18 @@ fn settle_closed_session(
     for task_id in scheduler.cancel_queued_by_session(&session.id) {
         let _ = tasks.finish(&task_id, TerminalOutcome::Cancelled);
     }
+    if session.browser_binding.is_some() {
+        for execution in executions.running_owned_by(&session.id) {
+            if let Some(handle) = &execution.runtime_handle {
+                let _ = executions.request_cancellation(&execution.public_session_id, "KILL");
+                if let Ok(result) = cancellation.kill_command_session(handle.as_str(), 1000) {
+                    if let Some(terminal) = runtime_cancellation_terminal(result) {
+                        let _ = executions.finish(&execution.id, terminal);
+                    }
+                }
+            }
+        }
+    }
     let _ = executions.orphan_owned_by(&session.id);
 }
 
@@ -1302,6 +1314,28 @@ fn handle_connection(mut stream: TcpStream, context: ConnectionContext<'_>) -> R
                 None,
             );
         };
+        if stored.browser_binding.as_ref().is_some_and(|token| {
+            !crate::browser_connection::authority::global()
+                .is_some_and(|authority| authority.valid(token, observed_workspace))
+        }) {
+            if let Some(closed) = sessions.close_and_remove(&session_id) {
+                settle_closed_session(
+                    &closed,
+                    requests,
+                    scheduler,
+                    tasks,
+                    executions,
+                    cancellation,
+                    privileged,
+                );
+            }
+            return write_mcp_http_error(
+                &mut stream,
+                404,
+                mcp_unavailable("browser_authorization_revoked"),
+                None,
+            );
+        }
         if request
             .header("mcp-protocol-version")
             .is_some_and(|version| version != stored.protocol)
@@ -1411,15 +1445,30 @@ fn handle_connection(mut stream: TcpStream, context: ConnectionContext<'_>) -> R
             );
         };
         let tool_catalog_signature = stable_tool_catalog_signature();
+        let browser_binding = request
+            .header("x-localbridge-browser-grant")
+            .map(str::to_owned);
+        if let Some(token) = &browser_binding {
+            if !crate::browser_connection::authority::global()
+                .is_some_and(|authority| authority.consume(token, observed_workspace).is_ok())
+            {
+                return write_rpc_error(
+                    &mut stream,
+                    id,
+                    -32003,
+                    "Browser authorization rejected",
+                    None,
+                );
+            }
+        }
         let session = new_session_id();
-        match sessions.insert_bounded(
-            SessionRecord::new(
-                session.clone(),
-                protocol.to_string(),
-                tool_catalog_signature,
-            ),
-            MAX_DOWNSTREAM_MCP_SESSIONS,
-        ) {
+        let mut record = SessionRecord::new(
+            session.clone(),
+            protocol.to_string(),
+            tool_catalog_signature,
+        );
+        record.browser_binding = browser_binding;
+        match sessions.insert_bounded(record, MAX_DOWNSTREAM_MCP_SESSIONS) {
             Ok(()) => {}
             Err(SessionInsertError::Capacity) => {
                 return write_mcp_http_error(
@@ -1462,6 +1511,33 @@ fn handle_connection(mut stream: TcpStream, context: ConnectionContext<'_>) -> R
     let Some(stored_session) = stored_session else {
         return write_mcp_http_error(&mut stream, 404, mcp_unavailable("session_not_found"), None);
     };
+    if stored_session
+        .browser_binding
+        .as_ref()
+        .is_some_and(|token| {
+            !crate::browser_connection::authority::global()
+                .is_some_and(|authority| authority.valid(token, observed_workspace))
+        })
+    {
+        if let Some(closed) = sessions.close_and_remove(&session_id) {
+            settle_closed_session(
+                &closed,
+                requests,
+                scheduler,
+                tasks,
+                executions,
+                cancellation,
+                privileged,
+            );
+        }
+        return write_rpc_error(
+            &mut stream,
+            id,
+            -32003,
+            "Browser authorization revoked or workspace changed",
+            Some(session),
+        );
+    }
     let current_signature = stable_tool_catalog_signature();
     if stored_session.tool_catalog_signature != current_signature {
         let _ = sessions.update(&session_id, |stored| {
@@ -7041,7 +7117,8 @@ mod tests {
             executable_workflow.body
         );
         assert!(
-            executable_workflow.body["result"]["structuredContent"]["data"]["commands"][0]["output"]
+            executable_workflow.body["result"]["structuredContent"]["data"]["commands"][0]
+                ["output"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("LB_SCHEMA27_AGENT")
