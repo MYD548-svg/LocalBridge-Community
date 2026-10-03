@@ -109,7 +109,7 @@ fn background_resume_is_suppressed_when_windows_login_autostart_is_disabled() {
 }
 
 #[test]
-fn manual_foreground_launch_ignores_login_autostart_and_manual_stop_latch() {
+fn local_foreground_launch_preserves_manual_stop_even_when_autostart_is_disabled() {
     let app_data = TempDir::new("foreground-data");
     let workspace = TempDir::new("foreground-workspace");
     let mut profile = StartupProfile::default();
@@ -118,7 +118,7 @@ fn manual_foreground_launch_ignores_login_autostart_and_manual_stop_latch() {
     let mut data = resumable_data(&workspace.0);
     data.settings.auto_start_services = false;
 
-    let config = build_background_resume_config(
+    let suppression = build_background_resume_config(
         &app_data.0,
         StartupMode::Foreground,
         &data,
@@ -126,9 +126,53 @@ fn manual_foreground_launch_ignores_login_autostart_and_manual_stop_latch() {
         PathBuf::from(r"C:\LocalBridge"),
     )
     .unwrap()
+    .unwrap_err();
+    assert_eq!(suppression, StartupSuppression::ManualStopLatched);
+}
+
+#[test]
+fn local_first_launch_does_not_require_old_onboarding_or_tunnel_credentials() {
+    let app_data = TempDir::new("local-no-onboarding");
+    let workspace = TempDir::new("local-project");
+    let mut data = resumable_data(&workspace.0);
+    data.settings.onboarding_complete = false;
+    data.settings.auto_start_services = false;
+    let config = build_background_resume_config(
+        &app_data.0,
+        StartupMode::Foreground,
+        &data,
+        &StartupProfile::default(),
+        PathBuf::from(r"C:\LocalBridge"),
+    )
+    .unwrap()
     .unwrap();
-    let freshly_validated = WorkspaceValidator.validate(&workspace.0).unwrap();
-    assert_eq!(config.workspace, freshly_validated.execution_path());
+    assert_eq!(
+        config.mode,
+        crate::local_connection::profile::ConnectionMode::Local
+    );
+    assert_eq!(
+        config.workspace,
+        WorkspaceValidator
+            .validate(&workspace.0)
+            .unwrap()
+            .execution_path()
+    );
+    let mut connection =
+        crate::local_connection::profile::ConnectionSettings::load(&app_data.0, false).unwrap();
+    connection.auto_connect_enabled = false;
+    connection.save(&app_data.0).unwrap();
+    assert_eq!(
+        build_background_resume_config(
+            &app_data.0,
+            StartupMode::Foreground,
+            &data,
+            &StartupProfile::default(),
+            PathBuf::from(r"C:\LocalBridge")
+        )
+        .unwrap()
+        .unwrap_err(),
+        StartupSuppression::ClientDisconnected
+    );
 }
 
 #[test]

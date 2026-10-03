@@ -62,6 +62,7 @@ fn main_projection_json_contract_matches_the_frontend_fixture() {
         }),
         projects: Some(vec![ProjectProjection {
             id: "workspace-1".into(),
+            name: "LocalBridge".into(),
             path: "D:/project/LocalBridge".into(),
             active: true,
         }]),

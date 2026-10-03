@@ -9,7 +9,7 @@ export type PrivilegeCode = "off" | "requested" | "awaiting" | "active" | "fault
 export type ServiceCode = "off" | "starting" | "online" | "recovering" | "fault";
 export type TaskKindCode = "read" | "search" | "modify" | "command" | "git" | "build" | "test" | "admin" | "other";
 export type TaskStateCode = "idle" | "running" | "waiting" | "blocked" | "failed" | "cancelled";
-export interface ProjectProjection { id: string; path: string; active: boolean }
+export interface ProjectProjection { id: string; name: string; path: string; active: boolean }
 export interface WorkspaceProjection { desiredPath: string | null; observedPath: string | null; effective: EffectiveAvailabilityCode }
 export interface ConnectionProjection { desiredTunnelId: string | null; observedTunnelId: string | null; effective: EffectiveAvailabilityCode }
 export interface TaskProjection { kind: TaskKindCode; summary: string | null; state: TaskStateCode; elapsedMs: number | null }
@@ -51,7 +51,7 @@ export const isBooleanOrNull = (value: unknown): value is boolean | null => valu
 export const isEnum = <T extends string>(value: unknown, values: readonly T[]): value is T => typeof value === "string" && values.includes(value as T);
 export const isEnumOrNull = <T extends string>(value: unknown, values: readonly T[]): value is T | null => value === null || isEnum(value, values);
 export const isUiErrorCategory = (value: unknown): value is UiErrorCategory => isEnum(value, errorCategories);
-const isProject = (value: unknown): value is ProjectProjection => isRecord(value) && typeof value.id === "string" && typeof value.path === "string" && typeof value.active === "boolean";
+const isProject = (value: unknown): value is ProjectProjection => isRecord(value) && typeof value.id === "string" && typeof value.name === "string" && value.name.trim().length > 0 && typeof value.path === "string" && typeof value.active === "boolean";
 const isWorkspace = (value: unknown): value is WorkspaceProjection => isRecord(value) && isStringOrNull(value.desiredPath) && isStringOrNull(value.observedPath) && isEnum(value.effective, effectiveAvailabilities);
 const isConnection = (value: unknown): value is ConnectionProjection => isRecord(value) && isStringOrNull(value.desiredTunnelId) && isStringOrNull(value.observedTunnelId) && isEnum(value.effective, effectiveAvailabilities);
 const isTask = (value: unknown): value is TaskProjection => isRecord(value) && isEnum(value.kind, taskKinds) && isStringOrNull(value.summary) && isEnum(value.state, taskStates) && isNumberOrNull(value.elapsedMs);
@@ -146,7 +146,8 @@ export const bridge = {
   clearKey: () => invoke<void>("delete_runtime_key"),
   retry: () => invoke<void>("retry_connection"),
   chooseProjectFolder: () => invoke<string | null>("choose_onboarding_workspace_folder"),
-  addProjectDeferred: (path: string) => invoke<string>("add_project", { path, deferActivation: true }),
+  addProjectDeferred: (path: string, name?: string) => invoke<string>("add_project", { path, ...(name === undefined ? {} : { name }), deferActivation: true }),
+  renameProject: (id: string, name: string) => invoke<void>("rename_project", { id, name }),
   addProject: (path: string) => invoke<void>("add_project", { path }),
   selectProject: (id: string, confirmedCancel = false) => invoke<void>("select_project", { id, confirmedCancel }),
   removeProject: (id: string, confirmedCancel = false) => invoke<void>("remove_project", { id, confirmedCancel }),

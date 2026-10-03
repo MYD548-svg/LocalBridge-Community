@@ -3,7 +3,7 @@ const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 import { connectionApi, parseConnectionState } from "../features/connection/api";
 
-const state = { mode: "local", codexDetected: true, serviceReady: true, configurationComplete: false, connectedClients: 0, successfulCalls: 0, affectedTasks: [] };
+const state = { mode: "local", codexDetected: true, serviceReady: true, configurationComplete: false, autoConnectEnabled: true, connectedClients: 0, successfulCalls: 0, affectedTasks: [] };
 describe("independent local connection state", () => {
   it("keeps service readiness, configuration and a real client distinct", async () => {
     invoke.mockResolvedValue(state);

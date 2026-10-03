@@ -116,6 +116,7 @@ struct UiFaultProjection {
 #[serde(rename_all = "camelCase")]
 struct ProjectProjection {
     id: String,
+    name: String,
     path: String,
     active: bool,
 }
@@ -333,6 +334,7 @@ fn get_main_projection_blocking(lifecycle: &DesktopLifecycle) -> UiResult<MainPr
             .iter()
             .map(|project| ProjectProjection {
                 id: project.id.clone(),
+                name: project.name.clone(),
                 path: project
                     .accessible_path
                     .clone()
@@ -476,6 +478,9 @@ pub async fn set_permission_mode(mode: String, app: AppHandle) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
         let lifecycle = app.state::<DesktopLifecycle>();
         let requested = parse_permission(&mode)?;
+        let _operation = PROJECT_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("设置正忙，请重试"))?;
         if requested != PermissionMode::Elevated {
             reset_admin_consent();
         }
@@ -604,6 +609,9 @@ fn reconcile_explicit_permission(lifecycle: &DesktopLifecycle) -> UiResult<()> {
 #[tauri::command]
 pub async fn set_auto_start(enabled: bool, app: AppHandle) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
+        let _operation = PROJECT_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("设置正忙，请重试"))?;
         let (store, mut data) = load_app_data(&app)?;
         let previous = data.settings.auto_start_services;
         if previous == enabled {
@@ -630,6 +638,9 @@ pub async fn set_auto_start(enabled: bool, app: AppHandle) -> UiResult<()> {
 #[tauri::command]
 pub async fn set_close_window_continue_running(enabled: bool, app: AppHandle) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
+        let _operation = PROJECT_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("设置正忙，请重试"))?;
         let lifecycle = app.state::<DesktopLifecycle>();
         let (store, mut data) = load_app_data(&app)?;
         data.settings.close_window_continue_running = enabled;
@@ -759,12 +770,13 @@ pub async fn retry_connection(app: AppHandle) -> UiResult<()> {
 #[tauri::command]
 pub async fn add_project(
     path: String,
+    name: Option<String>,
     defer_activation: Option<bool>,
     app: AppHandle,
 ) -> UiResult<String> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<String> {
         let lifecycle = app.state::<DesktopLifecycle>();
-        add_project_blocking(path, defer_activation, &app, &lifecycle)
+        add_named_project_blocking(path, name, defer_activation, &app, &lifecycle)
     })
     .await
     .map_err(|_| UiError::internal("Ui.ProjectAddJoinFailed", "项目添加后台任务异常"))?
@@ -777,11 +789,36 @@ pub(crate) fn add_project_blocking(
     app: &AppHandle,
     lifecycle: &DesktopLifecycle,
 ) -> UiResult<String> {
+    add_named_project_blocking(path, None, defer_activation, app, lifecycle)
+}
+
+pub(crate) static PROJECT_OPERATION: Mutex<()> = Mutex::new(());
+
+fn add_named_project_blocking(
+    path: String,
+    name: Option<String>,
+    defer_activation: Option<bool>,
+    app: &AppHandle,
+    lifecycle: &DesktopLifecycle,
+) -> UiResult<String> {
+    let _operation = PROJECT_OPERATION
+        .lock()
+        .map_err(|_| UiError::from("项目设置正忙，请重试"))?;
+    let name = name.map(|name| name.trim().to_owned());
+    if name.as_ref().is_some_and(|name| name.is_empty()) {
+        return Err(UiError::from("项目名称不能为空"));
+    }
     let candidate_path = PathBuf::from(path);
     let validated = WorkspaceValidator
         .validate(&candidate_path)
         .map_err(|_| "所选项目无法验证".to_string())?;
     let (store, mut data) = load_app_data(app)?;
+    let existing = data
+        .workspace
+        .registry
+        .entries()
+        .iter()
+        .any(|entry| entry.validated_identity.as_str() == validated.identity().as_str());
     let generated = WorkspaceId::from_validated(new_workspace_id())
         .map_err(|_| "无法创建项目记录".to_string())?;
     let id = data
@@ -794,8 +831,16 @@ pub(crate) fn add_project_blocking(
             unix_seconds(),
         )
         .map_err(|_| "无法保存项目记录".to_string())?;
+    if !existing {
+        if let Some(name) = name {
+            data.workspace
+                .registry
+                .rename(&id, &name)
+                .map_err(|_| "无法设置项目名称".to_string())?;
+        }
+    }
     let id_value = id.as_str().to_owned();
-    if defer_activation.unwrap_or(false) {
+    if defer_activation.unwrap_or(false) || data.workspace.active_workspace_id.is_some() {
         store
             .save(&data)
             .map_err(|_| "无法保存项目记录".to_string())?;
@@ -815,6 +860,27 @@ pub(crate) fn add_project_blocking(
 }
 
 #[tauri::command]
+pub async fn rename_project(id: String, name: String, app: AppHandle) -> UiResult<()> {
+    tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
+        let _operation = PROJECT_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("项目设置正忙，请重试"))?;
+        let id = WorkspaceId::from_validated(id).map_err(|_| "项目不存在".to_string())?;
+        let (store, mut data) = load_app_data(&app)?;
+        data.workspace
+            .registry
+            .rename(&id, &name)
+            .map_err(|_| "项目不存在或名称为空".to_string())?;
+        store
+            .save(&data)
+            .map_err(|_| "无法保存项目名称".to_string())?;
+        refresh_settings_snapshot(&app, &app.state::<DesktopLifecycle>())
+    })
+    .await
+    .map_err(|_| UiError::from("项目命名后台任务异常"))?
+}
+
+#[tauri::command]
 pub async fn select_project(
     id: String,
     confirmed_cancel: Option<bool>,
@@ -822,8 +888,7 @@ pub async fn select_project(
 ) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
         let lifecycle = app.state::<DesktopLifecycle>();
-        super::local_connection::ensure_idle(&lifecycle, confirmed_cancel.unwrap_or(false))?;
-        select_project_blocking(id, &app, &lifecycle)
+        select_project_with_confirmation(id, &app, &lifecycle, confirmed_cancel.unwrap_or(false))
     })
     .await
     .map_err(|_| UiError::internal("Ui.ProjectSelectJoinFailed", "项目切换后台任务异常"))?
@@ -835,6 +900,18 @@ pub(crate) fn select_project_blocking(
     app: &AppHandle,
     lifecycle: &DesktopLifecycle,
 ) -> UiResult<()> {
+    select_project_with_confirmation(id, app, lifecycle, false)
+}
+
+fn select_project_with_confirmation(
+    id: String,
+    app: &AppHandle,
+    lifecycle: &DesktopLifecycle,
+    confirmed_cancel: bool,
+) -> UiResult<()> {
+    let _operation = PROJECT_OPERATION
+        .lock()
+        .map_err(|_| UiError::from("项目设置正忙，请重试"))?;
     let id = WorkspaceId::from_validated(id).map_err(|_| "项目不存在".to_string())?;
     let (store, mut data) = load_app_data(app)?;
     let entry = data
@@ -849,6 +926,7 @@ pub(crate) fn select_project_blocking(
     if entry.validated_identity.as_str() != validated.identity().as_str() {
         return Err(UiError::from("项目身份已变化，请重新添加"));
     }
+    super::local_connection::ensure_idle(lifecycle, confirmed_cancel)?;
     activate_project(
         app,
         lifecycle,
@@ -881,6 +959,9 @@ fn remove_project_blocking(
     lifecycle: &DesktopLifecycle,
     confirmed_cancel: bool,
 ) -> UiResult<()> {
+    let _operation = PROJECT_OPERATION
+        .lock()
+        .map_err(|_| UiError::from("项目设置正忙，请重试"))?;
     let id = WorkspaceId::from_validated(id).map_err(|_| "项目不存在".to_string())?;
     let (store, mut data) = load_app_data(app)?;
     if data.workspace.registry.get(&id).is_none() {
@@ -1020,6 +1101,9 @@ fn runtime_reconciliation_message(
 #[tauri::command]
 pub async fn restart_services(app: AppHandle) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
+        let _operation = PROJECT_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("项目设置正忙，请重试"))?;
         clear_manual_stop_for_explicit_action(&app)?;
         let lifecycle = app.state::<DesktopLifecycle>();
         lifecycle.set_desired_services(ServiceIntent::Enabled);
@@ -1038,6 +1122,9 @@ pub async fn restart_services(app: AppHandle) -> UiResult<()> {
 #[tauri::command]
 pub async fn stop_services(app: AppHandle) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
+        let _operation = PROJECT_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("项目设置正忙，请重试"))?;
         let app_data = app_data_dir(&app)?;
         let lifecycle = app.state::<DesktopLifecycle>();
         let report =
@@ -1125,16 +1212,10 @@ pub(crate) fn refresh_settings_snapshot(
     lifecycle: &DesktopLifecycle,
 ) -> UiResult<()> {
     let (_, data) = load_app_data(app)?;
-    if lifecycle
-        .desired_state()
-        .snapshot()
-        .state
-        .connection
-        .as_ref()
-        .is_some_and(|connection| {
-            connection.mode == crate::local_connection::profile::ConnectionMode::Local
-        })
-    {
+    let connection =
+        crate::local_connection::profile::ConnectionSettings::load(&app_data_dir(app)?, false)
+            .map_err(|_| UiError::from("无法读取连接模式"))?;
+    if connection.mode == crate::local_connection::profile::ConnectionMode::Local {
         lifecycle.publish_settings_snapshot(
             crate::control_plane::snapshot::SettingsProjection::from_app_data(&data, false, None),
             None,

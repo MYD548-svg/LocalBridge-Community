@@ -39,7 +39,14 @@ fn main() {
         .setup(move |app| {
             let lifecycle = DesktopLifecycle::new(PrivilegeController::new());
             let app_data_dir = app.path().app_data_dir()?;
-            let _startup = configure_desktop_startup(&app_data_dir, startup_mode, &lifecycle)?;
+            if configure_desktop_startup(&app_data_dir, startup_mode, &lifecycle).is_err() {
+                lifecycle.publish_settings_fault(localbridge_lib::domain::OperationError::new(
+                    "Startup.ConfigurationUnavailable",
+                    localbridge_lib::domain::ErrorCategory::Unavailable,
+                    "启动配置无法读取，请在诊断中检查；原有配置已保留",
+                    true,
+                ));
+            }
             let _ = lifecycle.start_update_check(UpdateCheckTrigger::Startup);
             app.manage(lifecycle);
             install_tray(app.handle())?;
@@ -101,7 +108,7 @@ fn handle_main_window_event(window: &tauri::Window<tauri::Wry>, event: &WindowEv
 #[cfg(debug_assertions)]
 #[derive(Clone, Copy)]
 enum FixedWindowE2eView {
-    Onboarding,
+    IncompleteSetup,
     Dashboard,
 }
 
@@ -109,7 +116,7 @@ enum FixedWindowE2eView {
 impl FixedWindowE2eView {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Onboarding => "onboarding",
+            Self::IncompleteSetup => "incomplete-setup",
             Self::Dashboard => "dashboard",
         }
     }
@@ -144,6 +151,8 @@ struct FixedWindowE2eMetrics {
     dashboard_card_border_width_before_settings: Option<String>,
     dashboard_card_box_shadow_before_settings: Option<String>,
     settings_replace_lefts: Vec<f64>,
+    local_connection_status_count: usize,
+    local_settings_status_count: usize,
     settings_sheet_overflowing: bool,
     settings_sheet_border_radius: Option<String>,
     settings_sheet_clip_path: Option<String>,
@@ -229,6 +238,8 @@ const FIXED_WINDOW_E2E_METRICS_SCRIPT: &str = r#"
     dashboardCardBorderWidthBeforeSettings: initialDashboardSurface.borderWidth,
     dashboardCardBoxShadowBeforeSettings: initialDashboardSurface.boxShadow,
     settingsReplaceLefts,
+    localConnectionStatusCount: document.querySelectorAll('.local-connection-status').length,
+    localSettingsStatusCount: document.querySelectorAll('.connection-panel ul').length,
     settingsSheetOverflowing: !!sheet && sheet.scrollHeight > sheet.clientHeight,
     settingsSheetBorderRadius: sheetStyle?.borderRadius || null,
     settingsSheetClipPath: sheetStyle?.clipPath || null,
@@ -258,7 +269,8 @@ fn fixed_window_e2e_view() -> Option<FixedWindowE2eView> {
         .ok()?
         .as_str()
     {
-        "onboarding" => Some(FixedWindowE2eView::Onboarding),
+        // Retain the historical runner argument, with the new dashboard-first contract.
+        "onboarding" | "incomplete-setup" => Some(FixedWindowE2eView::IncompleteSetup),
         "dashboard" => Some(FixedWindowE2eView::Dashboard),
         _ => None,
     }
@@ -385,7 +397,7 @@ fn execute_fixed_window_e2e(
         ));
     }
 
-    let metrics = collect_fixed_window_e2e_metrics(window, view, metrics_rx)?;
+    let metrics = collect_fixed_window_e2e_metrics(window, metrics_rx)?;
     assert_fixed_window_e2e_metrics(&metrics, view)?;
     if std::env::var_os("LOCALBRIDGE_CSP_E2E").is_some() && !metrics.inline_script_blocked {
         return Err("production CSP allowed an untrusted inline script".to_string());
@@ -418,13 +430,13 @@ fn execute_fixed_window_e2e(
         return Err("recreated main WebView has the wrong identity".into());
     }
 
-    let dashboard_geometry = if matches!(view, FixedWindowE2eView::Dashboard) {
+    let dashboard_geometry = if metrics.settings_replace_lefts.len() == 2 {
         format!(
             " settings_replace_delta={:.2}px rounded_scroll=true scrollbar_arrows=false scroll_surface=true",
             (metrics.settings_replace_lefts[0] - metrics.settings_replace_lefts[1]).abs()
         )
     } else {
-        String::new()
+        " local_status=true tunnel_credentials_hidden=true rounded_scroll=true scrollbar_arrows=false scroll_surface=true".to_string()
     };
     Ok(format!(
         "logical={}x{} physical={}x{} webview={}x{} native_scale={} dpr={} decorations=false resizable=false maximizable=false chrome=edge-to-edge controls=drag,minimize,close minimize_click=true close_destroy=true reopen_recreates_webview=true{}",
@@ -443,7 +455,6 @@ fn execute_fixed_window_e2e(
 #[cfg(debug_assertions)]
 fn collect_fixed_window_e2e_metrics(
     window: &WebviewWindow<tauri::Wry>,
-    view: FixedWindowE2eView,
     metrics_rx: &Receiver<String>,
 ) -> Result<FixedWindowE2eMetrics, String> {
     let deadline = Instant::now() + Duration::from_secs(12);
@@ -455,10 +466,10 @@ fn collect_fixed_window_e2e_metrics(
         if let Ok(payload) = metrics_rx.recv_timeout(Duration::from_millis(150)) {
             last_payload = payload;
             if let Ok(metrics) = serde_json::from_str::<FixedWindowE2eMetrics>(&last_payload) {
-                let dashboard_ready = !matches!(view, FixedWindowE2eView::Dashboard)
-                    || (metrics.settings_replace_lefts.len() == 2
-                        && metrics.settings_sheet_clip_path.is_some());
-                if metrics.view == view.as_str() && dashboard_ready {
+                let dashboard_ready = (metrics.local_settings_status_count == 1
+                    || metrics.settings_replace_lefts.len() == 2)
+                    && metrics.settings_sheet_clip_path.is_some();
+                if metrics.view == "dashboard" && dashboard_ready {
                     return Ok(metrics);
                 }
             }
@@ -518,17 +529,14 @@ fn assert_fixed_window_e2e_metrics(
             metrics.controls
         ));
     }
+    if metrics.onboarding.is_some() {
+        return Err("startup still forces onboarding before the dashboard".into());
+    }
+    if metrics.local_connection_status_count != 1 {
+        return Err("dashboard connection and tool-call status missing".into());
+    }
     match view {
-        FixedWindowE2eView::Onboarding => {
-            let child = metrics
-                .onboarding
-                .as_ref()
-                .ok_or("onboarding shell missing")?;
-            if child.width > content.width + 1.0 || child.height > content.height + 1.0 {
-                return Err("onboarding exceeds fixed chrome content area".into());
-            }
-        }
-        FixedWindowE2eView::Dashboard => {
+        FixedWindowE2eView::IncompleteSetup | FixedWindowE2eView::Dashboard => {
             let child = metrics
                 .dashboard
                 .as_ref()
@@ -569,12 +577,21 @@ fn assert_fixed_window_e2e_metrics(
                     "dashboard card still has an independent shadow: {card_shadow}"
                 ));
             }
-            let replace_delta =
-                (metrics.settings_replace_lefts[0] - metrics.settings_replace_lefts[1]).abs();
-            if replace_delta > 1.0 {
-                return Err(format!(
-                    "Settings replacement buttons are not in one action column: delta={replace_delta:.2}px"
-                ));
+            if metrics.local_settings_status_count == 1 {
+                if !metrics.settings_replace_lefts.is_empty() {
+                    return Err("local mode exposed Tunnel credential controls".into());
+                }
+            } else {
+                if metrics.settings_replace_lefts.len() != 2 {
+                    return Err("advanced mode lost credential controls".into());
+                }
+                let replace_delta =
+                    (metrics.settings_replace_lefts[0] - metrics.settings_replace_lefts[1]).abs();
+                if replace_delta > 1.0 {
+                    return Err(format!(
+                        "Settings replacement buttons are not in one action column: delta={replace_delta:.2}px"
+                    ));
+                }
             }
             if !metrics.settings_sheet_overflowing {
                 return Err("forced Settings sheet did not produce real overflow".into());

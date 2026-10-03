@@ -51,6 +51,8 @@ impl PersistedWorkspaceIdentity {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceEntry {
     pub workspace_id: WorkspaceId,
+    #[serde(default)] // Historical schemas are named by the v4 -> v5 migration.
+    pub display_name: String,
     pub display_path: PathBuf,
     pub validated_identity: PersistedWorkspaceIdentity,
     pub last_opened_at: u64,
@@ -63,9 +65,11 @@ impl WorkspaceEntry {
         validated: &ValidatedWorkspace,
         last_opened_at: u64,
     ) -> Result<Self, WorkspaceRegistryError> {
+        let display_path = display_path.into();
         let entry = Self {
             workspace_id,
-            display_path: display_path.into(),
+            display_name: default_project_name(&display_path),
+            display_path,
             validated_identity: PersistedWorkspaceIdentity::from_validated(validated),
             last_opened_at,
         };
@@ -79,9 +83,11 @@ impl WorkspaceEntry {
         identity_claim: impl Into<String>,
         last_opened_at: u64,
     ) -> Result<Self, WorkspaceRegistryError> {
+        let display_path = display_path.into();
         let entry = Self {
             workspace_id,
-            display_path: display_path.into(),
+            display_name: default_project_name(&display_path),
+            display_path,
             validated_identity: PersistedWorkspaceIdentity::from_persisted_claim(identity_claim)?,
             last_opened_at,
         };
@@ -90,6 +96,9 @@ impl WorkspaceEntry {
     }
 
     fn validate(&self) -> Result<(), WorkspaceRegistryError> {
+        if self.display_name.trim().is_empty() || self.display_name != self.display_name.trim() {
+            return Err(WorkspaceRegistryError::InvalidDisplayName);
+        }
         if self.display_path.as_os_str().is_empty() {
             return Err(WorkspaceRegistryError::EmptyDisplayPath);
         }
@@ -116,6 +125,28 @@ pub struct WorkspaceRegistry {
 }
 
 impl WorkspaceRegistry {
+    pub fn rename(&mut self, id: &WorkspaceId, name: &str) -> Result<(), WorkspaceRegistryError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(WorkspaceRegistryError::InvalidDisplayName);
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| &entry.workspace_id == id)
+            .ok_or(WorkspaceRegistryError::WorkspaceIdMissing)?;
+        entry.display_name = name.to_owned();
+        Ok(())
+    }
+
+    pub(crate) fn populate_display_names(&mut self) {
+        for entry in &mut self.entries {
+            if entry.display_name.trim().is_empty() {
+                entry.display_name = default_project_name(&entry.display_path);
+            }
+        }
+    }
+
     pub fn entries(&self) -> &[WorkspaceEntry] {
         &self.entries
     }
@@ -300,6 +331,7 @@ impl WorkspacePersistence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceRegistryError {
+    InvalidDisplayName,
     EmptyWorkspaceId,
     EmptyValidatedIdentity,
     EmptyDisplayPath,
@@ -314,4 +346,11 @@ pub enum WorkspaceRegistryError {
     WorkspaceNotDirectory,
     WorkspaceValidationWindowsApi { operation: &'static str, code: u32 },
     UnsupportedPlatform,
+}
+
+pub fn default_project_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "本地项目".to_owned())
 }

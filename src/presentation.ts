@@ -51,7 +51,8 @@ export function workspaceDisplayText(projection: MainProjection | null): string 
   if (projection.pathAuthority === "administrator") return "全目录访问";
   if (projection.workspaceStatus !== "ready") return projectionStatusText(projection.workspaceStatus);
   if (projection.workspace?.effective === "available") {
-    return projection.workspace.observedPath ?? projection.workspace.desiredPath ?? "未选择项目";
+    return projection.projects?.find((project) => project.active)?.name
+      ?? projection.workspace.observedPath ?? projection.workspace.desiredPath ?? "未选择项目";
   }
   if (projection.workspace?.desiredPath) return `${projection.workspace.desiredPath}（正在收敛）`;
   return "未选择项目";

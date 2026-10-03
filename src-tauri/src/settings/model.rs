@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::{PermissionMode, Settings};
 use crate::workspace::{WorkspacePersistence, WorkspaceRegistryError};
 
-pub const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoredPermissionMode {

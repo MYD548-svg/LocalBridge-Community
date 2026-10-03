@@ -147,6 +147,15 @@ select,input[type="text"],input[type="password"]{min-height:var(--control-height
 .saved{color:#248a3d;font-size:var(--font-body)}
 .error{color:#c9342f;font-size:var(--font-body);margin-top:10px}
 .project-list{display:grid;gap:8px;margin-top:12px}
+.project-active-name{max-width:330px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.project-empty,.local-connection-status{margin:10px 0;color:#6e6e73;font-size:var(--font-auxiliary);line-height:1.5}
+.local-connection-status p{margin:4px 0;overflow-wrap:anywhere}
+.project-description{display:grid;gap:4px;min-width:0;flex:1}
+.project-name{overflow-wrap:anywhere;text-align:left}
+.project-description .project-path{font-size:var(--font-auxiliary);color:#6e6e73}
+.project-item-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;flex-shrink:0}
+.project-form{margin-top:16px;padding-top:12px;border-top:1px solid rgba(0,0,0,.08)}
+.welcome-help{width:min(760px,100%)}
 .project-item{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#f5f5f7;border-radius:12px;padding:10px 12px}
 .project-path{overflow-wrap:anywhere;min-width:0;text-align:left}
 .project-select{flex:1;min-width:0;display:flex;align-items:center;justify-content:space-between;gap:10px}

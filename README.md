@@ -2,6 +2,8 @@
 
 当前源码包含 **尚未发布的 Codex 本地连接候选改造**：已安装并登录 Codex 的 Windows 用户可通过随包适配器接入 LocalBridge，连接与工具执行在本机完成，模型仍由 Codex 联网调用。保留 OpenAI Tunnel 高级兼容模式。
 
+2026-10-03 源码候选改为直接打开主界面、添加首个项目后自动本地接入，并支持可命名的多个项目记录及显式切换；旧测试配置升级一次后默认本地。源码候选按授权单次推送触发云端检查，Windows 新包与真实聊天调用仍待验收，原 10.03 测试版保留。
+
 本轮未生成新版安装包，完整 Windows 编译与实机验收仍受构建环境阻断，不能据此认定正式发布。参见 [本地连接使用说明](docs/LOCAL-CODEX-USAGE.md)、[来源与适配说明](docs/LOCAL-CODEX-ADAPTATION.md) 和 [本地验证报告](docs/LOCAL-CODEX-TEST-REPORT.md)。下文下载流程对应已发布的 Tunnel 版本。
 
 ## 让 ChatGPT 直接参与本地开发与 Windows 维护

@@ -29,6 +29,8 @@ pub enum StartupSuppression {
     ManualStopLatched,
     TunnelIdMissing,
     NoActiveWorkspace,
+    ClientDisconnected,
+    InvalidActiveWorkspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,15 +94,9 @@ pub fn configure_desktop_startup(
     lifecycle.set_close_window_continue_running(data.settings.close_window_continue_running);
     let profile_store = StartupProfileStore::new(app_data_dir.join(STARTUP_PROFILE_FILE_NAME));
     let profile = profile_store.load().map_err(DesktopStartupError::Profile)?;
-    let connection_settings = crate::local_connection::profile::ConnectionSettings::load(
-        app_data_dir,
-        data.settings.onboarding_complete
-            || profile
-                .validated_tunnel_id()
-                .map_err(DesktopStartupError::Profile)?
-                .is_some(),
-    )
-    .map_err(DesktopStartupError::AppDataIo)?;
+    let connection_settings =
+        crate::local_connection::profile::ConnectionSettings::load(app_data_dir, false)
+            .map_err(DesktopStartupError::AppDataIo)?;
     connection_settings
         .save(app_data_dir)
         .map_err(DesktopStartupError::AppDataIo)?;
@@ -135,13 +131,11 @@ pub fn configure_desktop_startup(
         SettingsProjection::from_app_data(&data, runtime_key_saved, runtime_key_length),
         settings_error,
     );
-    let desired_workspace = data
-        .workspace
-        .resolve_active(&WorkspaceValidator)
-        .map_err(DesktopStartupError::Workspace)?
-        .map(|workspace| {
-            DesiredWorkspace::new(workspace.workspace_id, workspace.validated.execution_path())
-        });
+    let resolved_workspace = data.workspace.resolve_active(&WorkspaceValidator);
+    let invalid_workspace = resolved_workspace.is_err();
+    let desired_workspace = resolved_workspace.ok().flatten().map(|workspace| {
+        DesiredWorkspace::new(workspace.workspace_id, workspace.validated.execution_path())
+    });
     let desired_connection =
         if connection_settings.mode == crate::local_connection::profile::ConnectionMode::Local {
             Some(ConnectionProfile::local())
@@ -161,6 +155,12 @@ pub fn configure_desktop_startup(
         services: ServiceIntent::Disabled,
         connection: desired_connection,
     });
+    if invalid_workspace {
+        lifecycle.record_startup_workspace_fault();
+        return Ok(DesktopStartupOutcome::ServicesSuppressed(
+            StartupSuppression::InvalidActiveWorkspace,
+        ));
+    }
     let install_root = production_install_root()?;
     if process_elevated {
         let broker = current_broker_executable()?;
@@ -224,25 +224,19 @@ fn build_background_resume_config(
     profile: &StartupProfile,
     install_root: PathBuf,
 ) -> Result<Result<ProductionRuntimeConfig, StartupSuppression>, DesktopStartupError> {
-    if !data.settings.onboarding_complete {
-        return Ok(Err(StartupSuppression::OnboardingIncomplete));
-    }
     if startup_mode == StartupMode::Background && !data.settings.auto_start_services {
         return Ok(Err(StartupSuppression::AutoStartDisabled));
     }
     if startup_mode == StartupMode::Background && profile.manual_stop_latched() {
         return Ok(Err(StartupSuppression::ManualStopLatched));
     }
-    let connection = crate::local_connection::profile::ConnectionSettings::load(
-        app_data_dir,
-        data.settings.onboarding_complete
-            || profile
-                .validated_tunnel_id()
-                .map_err(DesktopStartupError::Profile)?
-                .is_some(),
-    )
-    .map_err(DesktopStartupError::AppDataIo)?;
+    let connection =
+        crate::local_connection::profile::ConnectionSettings::load(app_data_dir, false)
+            .map_err(DesktopStartupError::AppDataIo)?;
     if connection.mode == crate::local_connection::profile::ConnectionMode::Local {
+        if !connection.auto_connect_enabled {
+            return Ok(Err(StartupSuppression::ClientDisconnected));
+        }
         if profile.manual_stop_latched() {
             return Ok(Err(StartupSuppression::ManualStopLatched));
         }
@@ -258,6 +252,9 @@ fn build_background_resume_config(
             workspace.validated.execution_path(),
             app_data_dir.join("health"),
         )));
+    }
+    if !data.settings.onboarding_complete {
+        return Ok(Err(StartupSuppression::OnboardingIncomplete));
     }
     let Some(tunnel_id) = profile
         .validated_tunnel_id()

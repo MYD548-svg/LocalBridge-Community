@@ -197,6 +197,7 @@ pub struct ConnectionProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectProjection {
     pub id: String,
+    pub name: String,
     pub display_path: String,
     pub accessible_path: Option<String>,
     pub active: bool,
@@ -246,6 +247,7 @@ impl SettingsProjection {
                     .map(|validated| validated.execution_path().to_string_lossy().into_owned());
                 ProjectProjection {
                     id: entry.workspace_id.as_str().to_owned(),
+                    name: entry.display_name.clone(),
                     display_path: entry.display_path.to_string_lossy().into_owned(),
                     accessible_path,
                     active: active_id == Some(&entry.workspace_id),

@@ -93,6 +93,7 @@ pub fn migrate_bytes(bytes: &[u8]) -> Result<MigrationOutcome, MigrationError> {
             1 => migrate_v1_to_v2(value)?,
             2 => migrate_v2_to_v3(value)?,
             3 => migrate_v3_to_v4(value)?,
+            4 => migrate_v4_to_v5(value)?,
             other => {
                 return Err(MigrationError::HistoricalSchemaInvalid {
                     version: other,
@@ -246,7 +247,7 @@ fn migrate_v3_to_v4(value: Value) -> Result<Value, MigrationError> {
         });
     }
     let current = AppData {
-        schema_version: CURRENT_SETTINGS_SCHEMA_VERSION,
+        schema_version: 4,
         settings: StoredSettings {
             permission_mode: old.settings.permission_mode,
             auto_start_services: old.settings.auto_start_services,
@@ -255,12 +256,23 @@ fn migrate_v3_to_v4(value: Value) -> Result<Value, MigrationError> {
         },
         workspace: old.workspace,
     };
-    current
-        .validate()
-        .map_err(|error| MigrationError::HistoricalSchemaInvalid {
-            version: 3,
-            detail: format!("migrated current data invalid: {error:?}"),
-        })?;
     serde_json::to_value(current)
+        .map_err(|error| MigrationError::MigrationSerialization(error.to_string()))
+}
+
+fn migrate_v4_to_v5(value: Value) -> Result<Value, MigrationError> {
+    let mut data: AppData =
+        serde_json::from_value(value).map_err(|error| MigrationError::HistoricalSchemaInvalid {
+            version: 4,
+            detail: error.to_string(),
+        })?;
+    data.schema_version = 5;
+    data.workspace.registry.populate_display_names();
+    data.validate()
+        .map_err(|error| MigrationError::HistoricalSchemaInvalid {
+            version: 4,
+            detail: format!("invalid migrated project data: {error:?}"),
+        })?;
+    serde_json::to_value(data)
         .map_err(|error| MigrationError::MigrationSerialization(error.to_string()))
 }

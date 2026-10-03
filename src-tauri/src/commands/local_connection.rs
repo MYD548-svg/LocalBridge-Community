@@ -25,6 +25,7 @@ pub struct ConnectionState {
     codex_detected: bool,
     service_ready: bool,
     configuration_complete: bool,
+    auto_connect_enabled: bool,
     connected_clients: usize,
     successful_calls: usize,
     affected_tasks: Vec<String>,
@@ -38,21 +39,8 @@ fn directory(app: &AppHandle) -> UiResult<PathBuf> {
 
 fn load(app: &AppHandle) -> UiResult<ConnectionSettings> {
     let directory = directory(app)?;
-    let data = SettingsStore::new(directory.join("settings.json"))
-        .load()
-        .map_err(|_| "无法读取设置".to_string())?;
-    let legacy = StartupProfileStore::new(directory.join(STARTUP_PROFILE_FILE_NAME))
-        .load()
-        .map_err(|_| "无法读取旧连接设置".to_string())?;
-    ConnectionSettings::load(
-        &directory,
-        data.settings.onboarding_complete
-            || legacy
-                .validated_tunnel_id()
-                .map_err(|_| "旧连接设置无效".to_string())?
-                .is_some(),
-    )
-    .map_err(|_| UiError::from("连接模式设置损坏或版本不支持"))
+    ConnectionSettings::load(&directory, false)
+        .map_err(|_| UiError::from("连接模式设置损坏或版本不支持"))
 }
 
 pub(crate) fn ensure_idle(lifecycle: &DesktopLifecycle, confirmed_cancel: bool) -> UiResult<()> {
@@ -84,6 +72,7 @@ pub async fn get_connection_state(app: AppHandle) -> UiResult<ConnectionState> {
             service_ready: ready,
             configuration_complete: registration::configured(&settings)
                 .map_err(|_| "无法核验 Codex 配置".to_string())?,
+            auto_connect_enabled: settings.auto_connect_enabled,
             connected_clients: if ready && settings.mode == ConnectionMode::Local {
                 runtime::connected_clients()
             } else {
@@ -111,6 +100,10 @@ pub async fn set_connection_mode(
         let _operation = CONNECTION_OPERATION
             .lock()
             .map_err(|_| UiError::from("连接设置正忙，请重试"))?;
+        // If both locks are needed, connection operations precede project operations.
+        let _project_operation = ui::PROJECT_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("项目设置正忙，请重试"))?;
         let mut settings = load(&app)?;
         if settings.mode == mode {
             return Ok(());
@@ -150,6 +143,9 @@ pub async fn set_connection_mode(
             let data = SettingsStore::new(directory(&app)?.join("settings.json"))
                 .load()
                 .map_err(|_| "无法读取项目".to_string())?;
+            if data.workspace.active_workspace_id.is_none() {
+                return Ok(());
+            }
             lifecycle.set_desired_services(ServiceIntent::Enabled);
             lifecycle
                 .start_production_runtime(ui::production_runtime_config_for_active_workspace(
@@ -187,7 +183,11 @@ pub async fn connect_codex(app: AppHandle) -> UiResult<()> {
             &ui::production_install_root()?,
             &mut settings,
         )
-        .map_err(|error| UiError::from(error.to_string()))
+        .map_err(|error| UiError::from(error.to_string()))?;
+        settings.auto_connect_enabled = true;
+        settings
+            .save(&directory(&app)?)
+            .map_err(|_| UiError::from("无法保存自动接入设置"))
     })
     .await
     .map_err(|_| UiError::from("Codex 接入后台任务异常"))?
@@ -203,6 +203,10 @@ pub async fn disconnect_codex(confirmed_cancel: bool, app: AppHandle) -> UiResul
         let lifecycle = app.state::<DesktopLifecycle>();
         if settings.mode == ConnectionMode::Local {
             ensure_idle(&lifecycle, confirmed_cancel)?;
+            settings.auto_connect_enabled = false;
+            settings
+                .save(&directory(&app)?)
+                .map_err(|_| "无法保存断开设置".to_string())?;
             lifecycle
                 .stop_runtime_for_control_plane()
                 .map_err(|_| "活动连接尚未关闭".to_string())?;
@@ -216,4 +220,37 @@ pub async fn disconnect_codex(confirmed_cancel: bool, app: AppHandle) -> UiResul
     })
     .await
     .map_err(|_| UiError::from("Codex 断开后台任务异常"))?
+}
+
+/// Automatic attempts must recheck the user's intent under the same lock as disconnect.
+#[tauri::command]
+pub async fn auto_connect_codex(app: AppHandle) -> UiResult<()> {
+    tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
+        let _operation = CONNECTION_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("连接设置正忙，请重试"))?;
+        let mut settings = load(&app)?;
+        let lifecycle = app.state::<DesktopLifecycle>();
+        if settings.mode != ConnectionMode::Local
+            || !settings.auto_connect_enabled
+            || !lifecycle
+                .control_plane_snapshot()
+                .runtime
+                .ready_value()
+                .is_some_and(|runtime| runtime.state == RuntimeState::Ready)
+        {
+            return Ok(());
+        }
+        if registration::configured(&settings).map_err(|error| UiError::from(error.to_string()))? {
+            return Ok(());
+        }
+        registration::connect(
+            &directory(&app)?,
+            &ui::production_install_root()?,
+            &mut settings,
+        )
+        .map_err(|error| UiError::from(error.to_string()))
+    })
+    .await
+    .map_err(|_| UiError::from("自动接入后台任务异常"))?
 }

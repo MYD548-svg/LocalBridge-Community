@@ -234,6 +234,9 @@ pub async fn prepare_onboarding_project(
 #[tauri::command]
 pub async fn complete_onboarding(app: AppHandle) -> UiResult<()> {
     tauri::async_runtime::spawn_blocking(move || -> UiResult<()> {
+        let _operation = ui::PROJECT_OPERATION
+            .lock()
+            .map_err(|_| UiError::from("设置正忙，请重试"))?;
         let lifecycle = app.state::<DesktopLifecycle>();
         let current = project_state(&lifecycle)?;
         if !current.readiness.all_ready() {

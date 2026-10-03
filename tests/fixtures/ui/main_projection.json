@@ -23,6 +23,7 @@
   "projects": [
     {
       "id": "workspace-1",
+      "name": "LocalBridge",
       "path": "D:/project/LocalBridge",
       "active": true
     }

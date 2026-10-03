@@ -983,6 +983,12 @@ impl DesktopLifecycle {
         })
     }
 
+    pub(crate) fn record_startup_workspace_fault(&self) {
+        let mut snapshot = DesktopRuntimeSnapshot::inactive();
+        snapshot.state = RuntimeState::Faulted(RuntimeFault::WorkspaceInvalid);
+        self.publish_runtime_observation(snapshot);
+    }
+
     pub fn publish_local_environment_observation(&self, available: bool) -> ControlPlaneSnapshot {
         self.snapshot_owner.update(|previous| SnapshotDraft {
             runtime: previous.runtime.clone().map(|mut runtime| {

@@ -96,3 +96,40 @@ fn failed_migration_preserves_original_data_and_does_not_reset() {
     assert!(!SettingsStore::new(&path).backup_path().exists());
     eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
 }
+
+#[test]
+fn v4_project_names_are_filled_once_without_changing_ids_paths_or_selection() {
+    let fixture = serde_json::json!({
+        "schema_version": 4,
+        "settings": { "permission_mode": "Edit", "auto_start_services": false,
+            "close_window_continue_running": true, "onboarding_complete": false },
+        "workspace": { "registry": { "entries": [
+            { "workspace_id": "one", "display_path": "D:/项目/毕业论文", "validated_identity": "identity-one", "last_opened_at": 1 },
+            { "workspace_id": "two", "display_path": "D:/项目/软件", "validated_identity": "identity-two", "last_opened_at": 2 }
+        ] }, "active_workspace_id": "one" }
+    }).to_string();
+    let (dir, path) = temp_file("settings.json", &fixture);
+    let store = SettingsStore::new(&path);
+    let mut data = store.load().unwrap();
+    let one = data.workspace.active_entry().unwrap();
+    assert_eq!(one.workspace_id.as_str(), "one");
+    assert_eq!(one.display_path, PathBuf::from("D:/项目/毕业论文"));
+    assert_eq!(one.display_name, "毕业论文");
+    let original_backup = dir.join("settings.json.schema-4.bak");
+    assert_eq!(fs::read_to_string(&original_backup).unwrap(), fixture);
+    let id = one.workspace_id.clone();
+    data.workspace.registry.rename(&id, "  论文研究  ").unwrap();
+    store.save(&data).unwrap();
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .workspace
+            .active_entry()
+            .unwrap()
+            .display_name,
+        "论文研究"
+    );
+    assert_eq!(fs::read_to_string(original_backup).unwrap(), fixture);
+    eprintln!("TEST_WORKSPACE_RETAINED path={}", dir.display());
+}

@@ -71,6 +71,37 @@ fn registry_deduplicates_by_validated_identity_not_display_path() {
 }
 
 #[test]
+fn project_names_preserve_identity_and_survive_duplicate_add_and_restart() {
+    let validator = WorkspaceValidator;
+    let one = TempWorkspace::new("中文项目一");
+    let two = TempWorkspace::new("中文项目二");
+    let mut state = WorkspacePersistence::default();
+    let first = add_validated(&mut state, &validator, "one", one.path().clone(), 1);
+    let second = add_validated(&mut state, &validator, "two", two.path().clone(), 2);
+    state.set_active_reference(first.clone()).unwrap();
+    let identity = state.active_entry().unwrap().validated_identity.clone();
+    let path = state.active_entry().unwrap().display_path.clone();
+    state.registry.rename(&first, "  毕业论文  ").unwrap();
+    state.registry.rename(&second, "毕业论文").unwrap();
+    assert_eq!(
+        state.registry.rename(&first, "  "),
+        Err(WorkspaceRegistryError::InvalidDisplayName)
+    );
+    assert_eq!(state.active_entry().unwrap().validated_identity, identity);
+    assert_eq!(state.active_entry().unwrap().display_path, path);
+    assert_eq!(
+        add_validated(&mut state, &validator, "duplicate", one.path().clone(), 3),
+        first
+    );
+    assert_eq!(state.active_entry().unwrap().display_name, "毕业论文");
+    let decoded: WorkspacePersistence =
+        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert_eq!(decoded.remembered_entries().len(), 2);
+    assert_eq!(decoded.active_entry().unwrap().display_name, "毕业论文");
+    assert!(decoded.resolve_active(&validator).unwrap().is_some());
+}
+
+#[test]
 fn remembered_registry_never_implies_multi_root_authorization() {
     let validator = WorkspaceValidator;
     let one = TempWorkspace::new("remembered-one");

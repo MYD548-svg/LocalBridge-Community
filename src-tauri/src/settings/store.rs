@@ -33,6 +33,19 @@ impl SettingsStore {
         let original = read_all(&self.path)?;
         let outcome = migrate_bytes(&original).map_err(SettingsStoreError::Migration)?;
         if outcome.migrated {
+            let backup = sibling_with_suffix(
+                &self.path,
+                &format!(".schema-{}.bak", outcome.original_version),
+            );
+            match OpenOptions::new().create_new(true).write(true).open(backup) {
+                Ok(mut file) => {
+                    file.write_all(&original)
+                        .and_then(|_| file.sync_all())
+                        .map_err(|error| io_error("backup_migration", error))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io_error("backup_migration", error)),
+            }
             self.save(&outcome.data)?;
         }
         Ok(outcome.data)
