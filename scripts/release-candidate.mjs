@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { applicationVersion, digest, readRequired, releaseConfiguration, releaseTag, verifyBundledExtension } from "./release-contract.mjs";
 import { verifyExtensionArchive } from "./test/browser-extension-package.mjs";
-import { CI_STAGES } from "./test/ci-gate.mjs";
+import { CI_STAGE_IDS } from "./test/ci-contract.mjs";
 
 export function stageReleaseCandidate(root, sourceCommit, installer) {
   const config = releaseConfiguration(root), version = applicationVersion(root), bundle = verifyBundledExtension(root);
@@ -39,8 +39,8 @@ export function verifyReleaseCandidate(directory, root, sourceCommit) {
   if (!/^[a-f0-9]{40}$/.test(sourceCommit ?? "") || manifest.schemaVersion !== 1 || manifest.repository !== config.repository
     || manifest.channel !== config.channel || manifest.applicationVersion !== version || manifest.tag !== releaseTag(config, version)
     || manifest.sourceCommit !== sourceCommit || report.commit !== sourceCommit || provenance.commit !== sourceCommit || provenance.profile !== "community"
-    || report.status !== "PASS" || report.profile !== "community" || report.stages?.length !== CI_STAGES.length
-    || stageIds.size !== CI_STAGES.length || !CI_STAGES.every(stage => stageIds.has(stage.id)) || report.stages.some(stage => stage.status !== "PASS")) {
+    || report.status !== "PASS" || report.profile !== "community" || report.stages?.length !== CI_STAGE_IDS.length
+    || stageIds.size !== CI_STAGE_IDS.length || !CI_STAGE_IDS.every(id => stageIds.has(id)) || report.stages.some(stage => stage.status !== "PASS")) {
     throw new Error("release source or complete community gate evidence mismatch");
   }
   if (manifest.installer?.name !== `LocalBridge_${version}_x64-setup.exe` || manifest.extension?.version !== version

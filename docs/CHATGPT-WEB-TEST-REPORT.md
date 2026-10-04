@@ -1,4 +1,51 @@
-# Action #82 修复实施检查报告
+# Action #83 产物交付修复实施检查报告
+
+日期：2026-10-04（UTC）。分支：codex/chatgpt-web-integration。代码基线：0de5101f91fbe3de9aa8332c53681ecc2d7f894a。最终提交与远端 SHA 核对结果在交付回复中记录，不为补写 SHA 再次推送。
+
+## 故障、修复与证据边界
+
+[CI #83 / run 37202090828](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/37202090828) 对应上述基线，十九阶段为 18 PASS、artifacts FAIL。该次 Windows 运行的 Node 91 项、前端 32 项、扩展 17 项、十项原生编译/lint 预检、鉴权重复检查、完整 Rust 542 PASS / 4 IGNORED、Clippy、NSIS 构建与安装资源实际提取校验均已通过。这些是旧提交的历史证据，不能继承为本次提交 PASS。最终入口输出 unsettled top-level await，完整候选及成功附件没有上传。
+
+根因是 build-evidence CLI 在 artifacts 中等待 release-candidate 动态导入，而候选模块静态导入 ci-gate，后者再导入尚未完成顶层 await 的 build-evidence。原函数级回归没有运行独立 CLI 入口，因此没有触发等待闭环。
+
+本轮新增无导入、无执行副作用的 ci-contract.mjs，集中声明十九个阶段 ID；门禁核对数量、顺序和唯一性，候选验证只导入这份合同。原执行器 API、全部命令、依赖、超时和完整 PASS 要求保留，artifacts 仍等待完整候选生成后结束。CLI 同时拒绝多余参数和对象原型上的非操作名。
+
+新增 artifacts-cli.test.mjs，接入原 test-base，在原生构建前运行。每个入口由新 Node 子进程执行复制后未改写的真实脚本，使用本地测试 Git 提交、合法扩展 ZIP 和明确标为模拟的非空二进制字节。两个 profile 均检查全部 26 个来源文件的哈希、原校验和、六份候选文件、大小和配套字节；独立 verify CLI 验证 ZIP 内来源、LICENSE 和指南，并拒绝 RUNNING、不完整/重复阶段、错误 profile 或替换的 ZIP。缺失/过期安装包、错误来源/协议/身份和非法参数也真实执行非零出口。子进程限时 30 秒，保留 stdout/stderr、退出码和输入哈希；预期拒绝的详细结果标记 expectedOutcome: REJECTION，不把模拟 PASS 当作 Windows 构建证据。夹具仓库位于诊断上传树外，文件保留。
+
+本机另以完整文件夹具运行基线中未改写的三个入口模块，复现退出码 13：原来源记录已写入，release 候选目录未生成。这比此前仅保留模块图的实验多覆盖实际 artifact IO。Windows 原日志未取得子命令结果 JSON，退出码 13 是本机复现值。
+
+## 本轮本地检查
+
+| 检查 | 状态 | 实际结果与范围 |
+| --- | --- | --- |
+| 跨平台 Node 门禁 | PASS | 99 项，0 FAIL / 0 SKIPPED，包含新增 9 项独立 CLI 合同检查及原投影编译检查 |
+| 投影辅助编译 | PASS | 实际运行 3 个 Rust 测试及 1 次预期 E0560 编译拒绝，不重复计入 Node 数量 |
+| 前端 / 扩展 | PASS | 32 / 17 项；生产 TypeScript 与 Vite 构建通过 |
+| 扩展 ZIP、复用与开发隔离 | PASS | 实际发行/开发 ZIP 校验通过；复用返回 REUSED；开发身份不同，发行 ZIP、内置 ZIP 和 bundle.json 字节哈希不变 |
+| 原平台无关 Rust 模块 | PASS | 21 项；Clippy --locked --all-targets -- -D warnings 通过 |
+| 格式、架构、公开范围 | PASS | 原 Rust 格式门禁、schema44、公开导出回归及三个新增脚本公开路径核对 |
+| 许可证与仓库内运行时 | PASS | npm 166 / Cargo 484；bundled-only 完整性通过，未修改应用依赖和锁文件 |
+| 冻结输入与暂存字节 | PASS | 代码冻结后仅重跑两个完整 profile 入口，共 2 PASS / 0 SKIPPED；每个 profile 的 29 份复制输入、3 份测试脚本与工作树及暂存字节哈希一致 |
+| 敏感信息与 diff | PASS | 暂存文件纳入扫描，高置信敏感信息为零；历史 69 提交、446 跟踪文件，4 项信息性提示；git diff --check 通过 |
+| 交付链与 workflow | PASS（静态及文件合同） | 三份 YAML、hook/资源映射、最终报告时序、release/ci 下载布局、always 诊断和 success 上传核对；发布仍为默认关闭的手动流程 |
+| Windows runtime-output | NOT_RUN（本轮本机） | Linux 批次仅排除此 Windows 专属入口；完整 Windows 门禁仍保留，该入口在 #83 已通过 |
+| 完整 Windows 编译 / 原生行为 / NSIS | NOT_RUN（本轮本机） | 模拟字节合同检查不执行 Windows EXE，也不代替真实安装包提取和哈希门禁 |
+| Edge/Chrome、真实 ChatGPT、干净安装 | NOT_RUN | 文件合同、单元测试和前端构建不覆盖实际浏览器/安装交互 |
+| 本次新 Actions | UNVERIFIED | 推送后仅核对远端 SHA，不查询或等待新运行状态 |
+
+平台无关 Rust harness 引用原发行、更新和扩展包模块，仅使用 Linux 临时目录与原子替换适配；它和投影辅助编译均不覆盖完整 Tauri、Windows MoveFileEx、宿主、注册表或原生管道。CLI 合同检查中的安装包和宿主字节是夹具。本机实际扩展构建来自基线 HEAD 的 dirty 工作树，不能作为本次提交的正式候选。
+
+原十九阶段、十项特性预检、--locked、-D warnings、全量 --no-fail-fast、鉴权与重复行为、NSIS 实际提取/哈希/重复条目校验均保留。此前产品下载来源、内置扩展、六步引导及执行确认行为保持既有实现。本轮没有新增原生产物缓存或改写资源 hook。
+
+## 一次上传边界
+
+上传前当前分支无开放 PR，远端仍为基线。main/release 与普通分支触发范围分开，预计一个普通分支推送触发一轮 CI、一个 Windows 作业。集中验证和此报告完成后创建一个普通提交，仅推送一次，用 git ls-remote 核对远端 SHA 并确认工作树干净后停止。不查询新 Action、不下载新产物、不 rerun、不补推报告、不创建 PR/tag/Release、不执行发布 workflow。
+
+本机日志：/workspace/scratch/action83-*.log；原入口完整复现：action83-full-cli-baseline.json；最终输入核对：action83-frozen-inputs.json。入口命令及哈希也保存在 tests/artifacts/ci/logs/artifacts-cli，原 UI 投影编译证据保留在 ci/ui-projection-probes。以下为历史记录，其计数与覆盖范围不代表本轮结果。
+
+---
+
+# 历史记录：Action #82 修复实施检查报告
 
 日期：2026-10-04（UTC）。分支：codex/chatgpt-web-integration。代码基线：33b96c773ede06e7c7603d6f649c5fa63f1d676c。最终提交与远端 SHA 核对结果在交付回复中记录，不为补写 SHA 再次推送。
 

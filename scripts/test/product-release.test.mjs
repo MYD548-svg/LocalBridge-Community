@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applicationVersion, releaseConfiguration, verifyBundledExtension } from "../release-contract.mjs";
 import { stageReleaseCandidate, verifyReleaseCandidate } from "../release-candidate.mjs";
-import { CI_STAGES } from "./ci-gate.mjs";
+import { CI_STAGE_IDS } from "./ci-contract.mjs";
 import { copyReleaseInputs, put, stageFixtureExtension } from "./product-release-fixture.mjs";
 
 function fixture() { const directory = mkdtempSync(join(tmpdir(), "localbridge-product-release-")); copyReleaseInputs(directory); return directory; }
@@ -41,7 +41,7 @@ test("publication reuses a complete matching pair and rejects partial evidence a
   assert.throws(() => stageReleaseCandidate(directory, "b".repeat(40), installer), /share/);
   const manifest = stageReleaseCandidate(directory, source, installer);
   const ci = join(directory, "tests/artifacts/ci"); mkdirSync(ci, { recursive: true });
-  const report = { status: "PASS", profile: "community", commit: source, stages: CI_STAGES.map(stage => ({ id: stage.id, status: "PASS" })) };
+  const report = { status: "PASS", profile: "community", commit: source, stages: CI_STAGE_IDS.map(id => ({ id, status: "PASS" })) };
   const provenance = { commit: source, profile: "community", hashes: {
     [`src-tauri/target/release/bundle/nsis/${manifest.installer.name}`]: manifest.installer.sha256,
     [`tests/artifacts/browser-extension/${manifest.extension.asset.name}`]: manifest.extension.asset.sha256,

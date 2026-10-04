@@ -6,6 +6,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path";
 import { command, evidenceRoot } from "./build-evidence.mjs";
 import { sha256 } from "./runtime-integrity.mjs";
+import { CI_STAGE_IDS } from "./ci-contract.mjs";
 
 export function cargoCommand(args, environment = process.env) {
   const targetDir = environment.LOCALBRIDGE_CARGO_TARGET_DIR?.trim();
@@ -44,6 +45,7 @@ export const CI_STAGES = validateStages([
       "scripts/test/adapter-client.test.mjs",
       "scripts/test/browser-extension-package.test.mjs",
       "scripts/test/product-release.test.mjs",
+      "scripts/test/artifacts-cli.test.mjs",
       "scripts/test/ui-projection-contract.test.mjs",
     ),
   },
@@ -134,6 +136,12 @@ export const CI_STAGES = validateStages([
   { id: "package-integrity", label: "post-build runtime integrity", ...node("scripts/test/runtime-integrity.mjs") },
   { id: "artifacts", label: "installer checksums and provenance", ...node("scripts/test/build-evidence.mjs", "artifacts") },
 ]);
+
+if (new Set(CI_STAGE_IDS).size !== CI_STAGE_IDS.length
+  || CI_STAGES.length !== CI_STAGE_IDS.length
+  || CI_STAGES.some((stage, index) => stage.id !== CI_STAGE_IDS[index])) {
+  throw new Error("CI executor stages differ from the shared evidence contract");
+}
 
 // Collect independent failures in the same job. Native tests require verified
 // staging; packaging requires every preceding mandatory gate to have passed.

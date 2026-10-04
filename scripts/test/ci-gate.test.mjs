@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { CI_STAGES, cargoCommand, parseGateArguments } from "./ci-gate.mjs";
+import { CI_STAGE_IDS } from "./ci-contract.mjs";
 import { selectStages, validateStages } from "./process.mjs";
 
 test("the shared local and CI gate has stable unique stages", () => {
+  assert.deepEqual(CI_STAGES.map(({ id }) => id), CI_STAGE_IDS);
+  assert.ok(Object.isFrozen(CI_STAGE_IDS));
   assert.deepEqual(
     CI_STAGES.map((stage) => stage.id),
     [
@@ -74,6 +77,7 @@ test("the full Rust gate collects independent target failures without weakening 
 test("the base gate compiles the real UI projection fixture before native resource builds", () => {
   const base = CI_STAGES.find(stage => stage.id === "test-base");
   assert.ok(base.args.includes("scripts/test/ui-projection-contract.test.mjs"));
+  assert.ok(base.args.includes("scripts/test/artifacts-cli.test.mjs"));
   assert.ok(CI_STAGES.find(stage => stage.id === "runtime-resources").needs.includes(base.id));
 });
 

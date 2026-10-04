@@ -67,6 +67,6 @@ export async function artifacts() {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const actions = { toolchains, "tunnel-source": tunnelSource, artifacts };
   const action = actions[process.argv[2]];
-  if (!action) throw new Error("Unknown evidence operation");
+  if (!Object.hasOwn(actions, process.argv[2]) || process.argv.length !== 3) throw new Error("Unknown evidence operation or arguments");
   await action();
 }
