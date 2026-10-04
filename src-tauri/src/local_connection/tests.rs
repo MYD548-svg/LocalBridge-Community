@@ -672,12 +672,13 @@ fn both_sides_reject_a_process_from_another_installation() {
 fn browser_authorization_actual_pipe_durable_dedup_and_revocation() {
     use crate::browser_connection::authority::{Authority, WorkspaceStamp};
     use std::sync::Arc;
-    let workspace = crate::mcp::test_support::temp_workspace()
-        .canonicalize()
-        .unwrap();
+    let candidate = crate::mcp::test_support::temp_workspace();
     let validated = crate::workspace::WorkspaceValidator
-        .validate(&workspace)
+        .validate(&candidate)
         .unwrap();
+    // Win32 canonicalize produces an identity-only \\?\ alias. Use the
+    // validator's ordinary, identity-checked execution path for both sides.
+    let workspace = validated.execution_path().to_path_buf();
     let stamp = WorkspaceStamp {
         path: workspace.to_string_lossy().into_owned(),
         identity: validated.identity().as_str().into(),
@@ -750,13 +751,36 @@ fn browser_authorization_actual_pipe_durable_dedup_and_revocation() {
     assert_eq!(super::runtime::successful_calls(), 0);
     send(
         &pipe,
-        &json!({"mcp":{"jsonrpc":"2.0","id":"browser-running","method":"tools/call","params":{"name":"exec_command","arguments":{"command":"Add-Content -LiteralPath browser-running.txt -Value once; Start-Sleep -Seconds 120","shell":"powershell","workdir":".","yield_time_ms":1000,"timeout_ms":180000,"max_output_bytes":65536}}},"observation":{"message":"assistant-running","branch":"user-two","index":0}}),
+        &json!({"mcp":{"jsonrpc":"2.0","id":"browser-running","method":"tools/call","params":{"name":"exec_command","arguments":{"command":"Add-Content -LiteralPath browser-running.txt -Value once; Start-Sleep -Seconds 120","shell":"windows_powershell","workdir":".","yield_time_ms":1000,"timeout_ms":180000,"max_output_bytes":65536}}},"observation":{"message":"assistant-running","branch":"user-two","index":0}}),
     );
     let running = response(&mut pipe, json!("browser-running"));
     assert_eq!(running["result"]["isError"], false, "{running}");
     assert!(
         running["result"]["structuredContent"]["data"]["session_id"].is_string(),
         "{running}"
+    );
+    // A yielded command may still be starting PowerShell. Observe its actual
+    // write before revocation; do not rerun a side effect to make the test pass.
+    let side_effect = workspace.join("browser-running.txt");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let contents = std::fs::read_to_string(&side_effect);
+        if contents
+            .as_ref()
+            .is_ok_and(|text| text.lines().collect::<Vec<_>>() == ["once"])
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "browser command did not reach its write: response={running}; file={contents:?}; active={:?}",
+            fixture.runtime().active_task_summaries()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !fixture.runtime().active_task_summaries().is_empty(),
+        "browser revocation must cancel an actually running command"
     );
     authority.revoke(instance).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);

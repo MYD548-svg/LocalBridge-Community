@@ -47,6 +47,19 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Cache Cargo downloads and compilation dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target/debug/deps
+            src-tauri/target/debug/build
+            src-tauri/target/debug/.fingerprint
+            src-tauri/target/release/deps
+            src-tauri/target/release/build
+            src-tauri/target/release/.fingerprint
+          key: cargo-${{ runner.os }}-1.85.0-x86_64-pc-windows-msvc-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml', 'src-tauri/build.rs', 'src-tauri/tauri.conf.json', '.cargo/config.toml', 'src-tauri/.cargo/config.toml') }}
       - name: Shared build and verification gate
         run: node scripts/test/ci-gate.mjs
       - name: Upload diagnostics
@@ -56,8 +69,11 @@ jobs:
           name: community-diagnostics
           path: |
             tests/artifacts/ci/
+            src-tauri/target/release-stage/*.json
+            src-tauri/target/local-mcp-stage/*.json
             src-tauri/target/browser-host-stage/*.json
             tests/artifacts/browser-extension/extension-build.json
+            tests/artifacts/browser-extension-dev/extension-build.json
           if-no-files-found: warn
       - name: Upload verified installer
         if: success()

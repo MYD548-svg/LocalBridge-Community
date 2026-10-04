@@ -567,6 +567,36 @@ mod tests {
     }
 
     #[test]
+    fn validated_workspace_execution_path_admits_runtime_and_rejects_verbatim_alias() {
+        let workspace = crate::mcp::test_support::temp_workspace();
+        let alias = workspace.canonicalize().unwrap();
+        assert!(is_verbatim_workspace_path(&alias));
+        let validated = crate::workspace::WorkspaceValidator
+            .validate(&alias)
+            .unwrap();
+        let root = crate::mcp::test_support::repo_root();
+        let config = CodingToolsRuntimeConfig::new(
+            &root,
+            validated.execution_path(),
+            12345,
+            CodingToolsPermissionMode::Trusted,
+        );
+        assert!(!is_verbatim_workspace_path(&config.workspace));
+        let authority = validated_workspace_authority(&config).unwrap();
+        assert_eq!(
+            authority.workspace_identity_token().as_deref(),
+            Some(validated.identity().as_str())
+        );
+        let unsafe_config =
+            CodingToolsRuntimeConfig::new(&root, &alias, 12345, CodingToolsPermissionMode::Trusted);
+        assert!(matches!(
+            validated_workspace_authority(&unsafe_config),
+            Err(CodingToolsRuntimeError::InvalidConfiguration)
+        ));
+        crate::mcp::test_support::cleanup_test_directory(&workspace);
+    }
+
+    #[test]
     fn frozen_workspace_identity_rejects_same_path_replacement_before_spawn() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

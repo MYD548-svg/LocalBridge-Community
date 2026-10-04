@@ -83,3 +83,12 @@ test("only the shared resource gate opts into compile preflight", () => {
   const resources = CI_STAGES.find((stage) => stage.id === "runtime-resources");
   assert.deepEqual(resources.args, ["scripts/prepare-lb018-resources.mjs", "--compile-preflight"]);
 });
+
+test("packaging requires all earlier gates and dependencies refer to earlier stages", () => {
+  const packageIndex = CI_STAGES.findIndex(({ id }) => id === "nsis-package");
+  assert.deepEqual(CI_STAGES[packageIndex].needs, CI_STAGES.slice(0, packageIndex).map(({ id }) => id));
+  for (const [index, stage] of CI_STAGES.entries()) {
+    assert.ok(stage.needs.every((id) => CI_STAGES.slice(0, index).some((item) => item.id === id)));
+    assert.ok(stage.timeoutMs > 0);
+  }
+});

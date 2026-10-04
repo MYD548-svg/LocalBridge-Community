@@ -1,61 +1,56 @@
-# ChatGPT 网页集成本机检查报告
+# ChatGPT 网页集成 Action 修复检查报告
 
-日期：2026-10-03。分支：codex/chatgpt-web-integration。本轮修复基线：368450fa2e3fd574e49d01dfa0ee36f06598109f。最终上传提交及远端核对结果以本次交付回复为准；本报告随同一提交上传，避免为补写提交 SHA 再推送。
+日期：2026-10-04（香港时间）。分支：codex/chatgpt-web-integration。修复基线：11f80f2617094ccba490131671f983c2d744bfbc。最终上传 SHA 与远端核对结果以本次交付回复为准；不为补写 SHA 再次推送。
 
-## 本轮修复与上一轮云端证据
+## 已确认的故障及修复
 
-[CI #79 / run 37125763660](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/37125763660) 的首次运行精确对应上述基线提交，结果为 FAIL：十九阶段中 11 PASS、1 FAIL、7 NOT_RUN。runtime-resources 内 test-compile 通过，但 test-clippy 在 mcp/server.rs 的浏览器授权初始化判断触发 clippy::nonminimal_bool；默认目标只完成测试编译，行为测试未执行，其他构建特性预检被前置失败遮住。该次只上传 ci-diagnostics，安装程序与扩展候选产物上传均被跳过。
+[CI #80 / run 37130983033](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/37130983033) 精确对应基线，十九阶段为 13 PASS、auth-repeat FAIL、5 NOT_RUN。十项 Windows 编译/lint 预检、三个原生 release 组件及 staging 完整性均通过，前端与发行扩展构建通过。十次鉴权及十次 stderr 回归全部通过。
 
-本轮将授权拒绝条件改为 is_none_or 配合 consume(...).is_err()，保留缺少授权服务、授权无效时拒绝，以及单次消费行为；没有放宽 -D warnings。编译预检保留原八项并增加开发宿主两项定向检查，十项顺序执行、逐项落盘，汇总失败后阻止 release 构建；源码 SHA 无法确认时立即停止。
+唯一失败是 local_connection::tests::browser_authorization_actual_pipe_durable_dedup_and_revocation：夹具对工作区使用 canonicalize()，产生 Windows 身份路径 \\?\ 前缀；CodingToolsRuntime 明确拒绝该类执行路径，因此在 bundled MCP 启动前返回 InvalidConfiguration。该测试后续授权、去重和撤销断言尚未执行，完整 Rust、NSIS 与最终证据阶段也未执行。上一轮授权条件 lint 已通过，不是这次故障。
 
-资源准备入口先失效三个原生组件的旧证据，各 staging 入口在检查额外文件、身份及编译前再次失效自身证据。扩展入口统一管理类型检查、Vite 加载、打包、ZIP 校验与校验和写入；发行版与开发版均先失效旧证据。任何失败记录 FAIL，全部检查成功后才写 PASS。额外文件、旧构建、测试夹具及备份保留，空扩展产物被拒绝。
+本轮夹具改用 WorkspaceValidator 的 execution_path()，把同一身份校验后的普通路径同时用于浏览器授权 stamp 和 MCP 工作区。生产代码继续拒绝 verbatim 输入、核验冻结的目录文件身份。新增 Windows 原生回归直接验证普通执行路径被接纳、同一目录的 verbatim 别名被拒绝，不启动 Python 或开放端口。
 
-## 修改与交付
+撤销测试现在先在六十秒固定期限内观察到命令的那一次真实文件写入，并确认任务仍在运行，再撤销授权、验证连接关闭及任务取消。命令只发送一次，断言和一次写入计数保留；不会用一秒 yield 响应冒充 PowerShell 已执行副作用。使用已有 windows_powershell 选择器保持测试环境明确。
 
-实现随 LocalBridge 安装的浏览器宿主和复用适配器的内部授权握手；独立配对、工作区/权限绑定、撤销取消、每聊天会话、四会话上限和持久请求去重。扩展仅适配 ChatGPT 顶层网页，在扩展自身窗口确认执行，再单独回填草稿并由用户发送。
+## 门禁、诊断和缓存
 
-新增固定身份的发行 ZIP、隔离开发身份、中文 HTML/SVG 图解、ZIP/目录校验和固定目录导入；备份受管理文件并支持失败及中断恢复。新增桌面连接卡片和四个不同状态；NSIS 资源、Edge/Chrome 注册归属及升级占用处理；现有十九阶段 CI 集中完成新代码 Windows 验证与打包。
+原十九个外层阶段、十项特性编译/lint、--locked、-D warnings、完整 Cargo --no-fail-fast，以及十次鉴权/十次 stderr/本地协议重复覆盖全部保留。顶层按依赖收集独立失败，依赖未满足标 BLOCKED 并说明 blockedBy；正式 NSIS 打包要求所有前序必需门禁通过，成功候选上传仍要求总门禁成功。
 
-## 本机结果
+每个阶段、编译检查和 auth-repeat 子命令记录实际命令、开始结束、耗时、退出码、执行 ID、stdout/stderr 和日志位置。独立执行文件保留，Tauri hook 再次运行同名资源命令时不覆盖前次日志。同步预检监督进程启动前先失效旧 PASS。启动异常、超时和清理失败落盘；超时仅清理本任务子进程及后代，不按进程名全局结束程序。行为过滤器必须实际执行测试，零测试不能 PASS。
 
-| 检查 | 状态 | 证据与边界 |
+历史成功 CI 的 Rust 全套约 17 分钟、NSIS 约 14 分钟；#80 的资源准备约 29 分钟、auth-repeat 约 17 分钟。外层普通阶段上限三十分钟，资源准备九十分钟、auth-repeat 六十分钟；特性预检单命令三十分钟，资源命令四十五分钟，行为子命令十分钟。超时不是失败重试，未执行或被阻断项目不标为通过。
+
+两个 Windows workflow 保留 npm 缓存，增加 Cargo registry/git 及 debug/release 编译依赖缓存；键包含 OS、Rust 1.85、MSVC 目标、Cargo.lock 和构建配置。安装包、staging、扩展 ZIP、测试报告和 PASS 证据均不缓存，每次仍执行 Cargo 校验和行为测试。always() 上传全部阶段日志及 broker、adapter、host、发行/开发扩展证据。Tauri 资源重建保留，未引入未经证明的产物复用协议；最终实际 NSIS 提取与哈希校验保留。
+
+release/no-console 测试需要 LOCALBRIDGE_RELEASE_EXE 才真正执行。当前 pre-package Rust 门禁未提供本轮发行 EXE，报告明确为 NOT_RUN；内部 SKIPPED 不视为新发行应用行为通过。真实 ChatGPT、UAC、干净安装等仍未验收。
+
+## 当前云工作区可运行的验证
+
+| 检查 | 状态 | 结果及边界 |
 | --- | --- | --- |
-| 桌面单元测试 | PASS | 29 项，包含既有前端回归和浏览器 API/状态解析、批准范围摘要 |
-| 扩展测试 | PASS | 11 项：协议、参数与来源、草稿保护、独立页面观察、模拟宿主确认、导航与未知结果恢复 |
-| TypeScript 与生产构建 | PASS | npm run build；桌面与发行扩展均成功，无需用户编译扩展 |
-| 开发版构建 | PASS | --development；不同公钥、ID、宿主名和输出目录，发行宿主不会接受开发 ID |
-| Node 基础与构建回归 | PASS | 77 项；另含 bundled Python 输出结算的 11 项真实本机测试。该部分不是新宿主实测 |
-| 扩展 ZIP | PASS | 发行版及开发版真实 ZIP 构建、解压读取与哈希核对；16 项包/构建回归覆盖固定 ID、CRC/哈希、入口、错误协议、路径、开发隔离及失败证据 |
-| 打包脚本 | PASS | 32 项构建回归覆盖十项预检的每个单项失败、多项失败、进程启动异常、源码身份错误、全通过才构建，以及各组件旧 PASS 失效、额外文件保留、空产物和宿主/模板哈希拒绝；未执行 NSIS |
-| 本机前端依赖 | PASS | npm ls --all --json，无缺失或无效依赖；package-lock.json 未修改。为遵守禁止批量删除，未在现有 node_modules 上运行 npm ci；云端保留 npm ci |
-| 格式及差异 | PASS | 任务 Rust 文件使用 Rust 1.85 rustfmt；git diff --check，无差异格式错误 |
-| 许可证 | PASS | 166 个 npm、484 个 Cargo 依赖；无新增外部运行时依赖；沿用既有适配器来源与 MIT 说明 |
-| 架构检查 | PASS | schema44 残留扫描；既有十九阶段顺序保留 |
-| 敏感信息及公开导出 | PASS | 任务文件扫描与公开导出规则测试；固定 RSA 公钥为公开身份信息，不保存私钥或真实凭据 |
-| Windows 编译预检 | BLOCKED | 一次 cargo +1.85.0 test --locked --features privileged-broker,mcp-adapter,browser-host --all-targets --no-run，使用隔离 target/local-web-repair-precheck；缺少 link.exe，依赖构建脚本停止。未安装 MSVC/SDK，未重复同一失败；十项矩阵本机未实际运行 |
-| 新 Rust/原生宿主/管道行为测试 | NOT_RUN | 测试源码与 CI 已接入，但本机二进制未产生，不能把 rustfmt、元数据或模拟测试视为 Rust 编译成功 |
-| 新 NSIS 安装程序 | NOT_RUN | 由云端同一 Windows 作业制作并检查，不使用旧 EXE 替代 |
+| 桌面测试 | PASS | 29 项，相关代码和输入自检查以来未变化 |
+| 扩展测试 | PASS | 11 项，执行确认、页面观察、草稿与未知结果恢复 |
+| TypeScript / 生产构建 | PASS | npm run build；桌面及发行扩展生成成功 |
+| 开发扩展构建 | PASS | --development；发行/开发实际 ZIP 哈希与各自本轮构建证据一致，身份与目录隔离 |
+| 跨平台 Node 回归 | PASS | 84 项，0 FAIL、0 SKIPPED；包含新增诊断执行器及原构建/协议回归 |
+| 执行器回归 | PASS | 独立多失败、依赖阻断、stdout/stderr、启动异常、超时及忽略 SIGTERM 的后代清理、零测试拒绝、旧 PASS 失效、重复执行日志保留 |
+| 运行时完整性 | PASS | bundled-only；固定 Python/MCP/Tunnel 供给与摘要不变 |
+| 许可证 | PASS | npm 166、Cargo 484；无新增应用运行时依赖 |
+| 架构/公开导出 | PASS | schema44 残留扫描、公开导出规则测试 |
+| 格式与敏感信息 | PASS | 两个修改 Rust 文件使用 1.85 rustfmt；任务文件无高风险敏感信息；git diff --check |
+| workflow | PASS（静态） | YAML 解析、事件过滤、缓存范围及诊断/产物路径核对；不是云端执行结果 |
+| Windows/MSVC | NOT_RUN | 当前 Linux 无完整原生 Windows 执行环境；历史基线的十项预检 PASS 不代表本轮新测试已通过 |
+| 新路径/浏览器管道回归 | NOT_RUN | Rust 源码和 CI 已接入；格式与静态审查不能替代原生执行 |
+| Windows 进程树超时清理 | NOT_RUN | Linux 子进程回归通过；taskkill 分支尚未在 Windows 实机执行 |
+| Windows embedded Python 包装 | NOT_RUN | 本机跨平台 Node 批次不包含仅支持 Windows 的包装入口 |
+| NSIS / 新 release EXE | NOT_RUN | 本机不以旧 EXE 替代；由本次 Windows Action 构建并校验 |
 
-本机结果对应最终提交前的工作树，日志保留在 .local-tmp/2026-10-03-chatgpt-web-repair/。在补充宿主/模板哈希拒绝场景后，32 项构建回归再次通过。扩展构建证据记录基线 HEAD、dirty 标志和源文件哈希；HEAD 未变不表示测试了旧提交。云端在精确上传提交上重新构建，并将宿主、扩展和安装包来源绑定同一 SHA。本机保留 ZIP、构建目录、测试夹具及备份；它们属于检查资料，不提交生成产物。
+npm/Cargo 依赖声明和锁文件未修改。原有夹具、备份、输出和未知用户文件保留。本机 ZIP 证据记录基线 HEAD 与 dirty 工作树；本机输出不作为最终云端候选。本机日志位于 /tmp/localbridge-*.log，生成证据位于忽略目录 tests/artifacts/。
 
-## 已加入云端的测试
+## 一次上传和验收边界
 
-- Rust 授权：配对确认、错误来源/凭据、单次授权、四会话容量、同聊天单会话、工作区/服务状态变化后旧授权不可恢复、重启未知记录和跨聊天去重隔离。
-- Rust 导入：路径、错误源码包、哈希、受管理升级备份、中断恢复及用户文件保留。
-- Rust 协议：中文大响应分片、帧上限、不完整/乱序/超限。
-- Windows 实际子进程：启动本提交宿主，拒绝错误来源，通过二进制 native stdio 返回保留 RPC ID 的错误，EOF 正常退出；生成固定来源的绝对宿主 manifest，拒绝错误模板。
-- Windows 实际管道和权限后端：可信浏览器握手初始化、文件写入后重复请求不再次执行、独立来源统计、授权撤销关闭会话并终止其已启动命令。既有身份、取消、输出引用及普通客户端回归继续运行。
+代码冻结前复核目标远端、开放 PR 与 workflow 事件。只在 codex/chatgpt-web-integration 普通推送一次，不强推、不推标签、不创建 PR 或 Release。此分支当前无开放 PR，另一分支的 PR #1 不修改；按现有事件过滤预期只触发一轮 bundled CI、一个 Windows 作业。
 
-以上 Rust 行为测试本机 NOT_RUN；基线提交的云端行为测试同样 NOT_RUN，新修复提交的云端结果 UNVERIFIED。扩展的模拟宿主响应只用于验证代码与交互状态，不作为真实工具成功证据。
+推送后仅以 git ls-remote 核对远端 SHA，然后停止；不查询新 Action 状态、不下载新产物、不 rerun、不补推报告。新提交的 Action 结果为 UNVERIFIED。预期成功候选仍为安装 EXE、发行扩展 ZIP、中文安装指引、校验和与 BUILD-PROVENANCE；失败保留完整诊断。
 
-## 一次上传和预期产物
-
-上传前已核对目标远端分支仍指向基线提交，未发现此分支开放 PR。继续使用现有分支，仅提交本任务明确文件；保留已有个人配置、未跟踪资料和测试目录。状态显示变化的十二个其他 Rust 文件与 HEAD 逐字节一致，不纳入修复。全部可运行检查通过后冻结修改，普通推送一次，只核对远端分支 SHA，随后停止。
-
-根据当前触发条件，无 PR 的 codex/chatgpt-web-integration 推送预期触发一轮 CI、一个 Windows 作业；Community 触发条件不变。预期成功产物为候选安装 EXE、发行扩展 ZIP、中文安装图解、SHA256SUMS、BUILD-PROVENANCE，以及十九阶段检查报告。失败保留诊断与编译预检记录。本次不创建 Release，不查询云端状态、不下载、不重跑或补推。
-
-## 留待后续的验收
-
-新修复提交的云端结果：UNVERIFIED，本次上传后不查询。真实 ChatGPT 普通网页调用：NOT_RUN。Edge/Chrome 当前页面兼容、干净安装、升级/注册归属、真实浏览器断线与休眠、三十分钟连续使用：NOT_RUN。尚未发布；需要本次提交的新安装包，已发布版本无法替代新增宿主。
-
-首版只识别符合固定标记的单个新助手 JSON 代码块；新聊天地址变化、刷新或切换后重新启用。复杂图片上传和自动发送不在首版范围。导入不清理未知文件或备份；升级占用时提示关闭后重新安装。配对最多保留 16 个浏览器实例，请求日志最多 10000 条，扩展历史最多保留 128 个聊天；达到上限会停止新增操作，不自动清理用户资料。
+真实 Edge/Chrome/ChatGPT 调用、干净安装与升级、注册归属、UAC、断线/刷新/休眠及长时间使用：NOT_RUN。Action 构建成功不能替代这些验收。

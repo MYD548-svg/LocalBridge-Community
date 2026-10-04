@@ -1,6 +1,7 @@
 import { pathToFileURL } from "node:url";
 
-import { runStage, selectStages, validateStages } from "./process.mjs";
+import { selectStages, validateStages } from "./process.mjs";
+import { runReportedStages } from "./stage-runner.mjs";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { command, evidenceRoot } from "./build-evidence.mjs";
@@ -36,6 +37,7 @@ export const CI_STAGES = validateStages([
       "tests/black-box/chatgpt/command_lifecycle.test.mjs",
       "tests/black-box/chatgpt/output_reference.test.mjs",
       "scripts/test/ci-gate.test.mjs",
+      "scripts/test/stage-runner.test.mjs",
       "scripts/test/structure.test.mjs",
       "scripts/test/build-regression.test.mjs",
       "scripts/test/runtime-output.test.mjs",
@@ -131,6 +133,30 @@ export const CI_STAGES = validateStages([
   { id: "artifacts", label: "installer checksums and provenance", ...node("scripts/test/build-evidence.mjs", "artifacts") },
 ]);
 
+// Collect independent failures in the same job. Native tests require verified
+// staging; packaging requires every preceding mandatory gate to have passed.
+const prerequisites = {
+  "tunnel-source": ["toolchains"],
+  "bundled-integrity": ["tunnel-source"],
+  "test-base": ["dependencies"],
+  format: ["toolchains"],
+  licenses: ["toolchains", "dependencies"],
+  "frontend-test": ["dependencies"],
+  "frontend-build": ["dependencies"],
+  "runtime-resources": ["toolchains", "bundled-integrity", "test-base"],
+  "staged-integrity": ["runtime-resources"],
+  "auth-repeat": ["staged-integrity"],
+  "rust-test": ["staged-integrity"],
+  "rust-clippy": ["runtime-resources"],
+  "nsis-package": CI_STAGES.slice(0, CI_STAGES.findIndex(({ id }) => id === "nsis-package")).map(({ id }) => id),
+  "package-integrity": ["nsis-package"],
+  artifacts: ["package-integrity"],
+};
+for (const stage of CI_STAGES) {
+  stage.needs = prerequisites[stage.id] ?? [];
+  stage.timeoutMs = stage.id === "runtime-resources" ? 90 * 60_000 : stage.id === "auth-repeat" ? 60 * 60_000 : 30 * 60_000;
+}
+
 export function parseGateArguments(args) {
   const options = {};
   for (let index = 0; index < args.length; index += 1) {
@@ -147,7 +173,7 @@ export function parseGateArguments(args) {
   return options;
 }
 
-export function main(args = process.argv.slice(2)) {
+export async function main(args = process.argv.slice(2)) {
   const options = parseGateArguments(args);
   const selected = selectStages(CI_STAGES, options);
   if (options.list) {
@@ -156,23 +182,12 @@ export function main(args = process.argv.slice(2)) {
   }
   if (![undefined, "bundled", "community"].includes(process.env.LOCALBRIDGE_BUILD_PROFILE)) throw new Error("Unknown build profile");
   process.env.RUSTUP_TOOLCHAIN = "1.85.0";
-  const report = { commit: command("git", ["rev-parse", "HEAD"]), profile: process.env.LOCALBRIDGE_BUILD_PROFILE ?? "bundled", startedAt: new Date().toISOString(), status: "RUNNING", upstreamSuite: "NOT_RUN_IN_WINDOWS_GATE; community Actions requires the separate Linux job", stages: CI_STAGES.map(({ id }) => ({ id, status: "NOT_RUN" })), environmentAcceptance: "NOT_RUN: live ChatGPT, UAC and clean Windows installation" };
+  const report = { commit: command("git", ["rev-parse", "HEAD"]), profile: process.env.LOCALBRIDGE_BUILD_PROFILE ?? "bundled", startedAt: new Date().toISOString(), status: "RUNNING", upstreamSuite: "NOT_RUN_IN_WINDOWS_GATE; community Actions requires the separate Linux job", releaseNoConsole: process.env.LOCALBRIDGE_RELEASE_EXE ? "EXTERNAL_INPUT: not attested as this gate's newly built EXE" : "NOT_RUN: pre-package Rust tests do not receive a newly built release EXE", stages: CI_STAGES.map(({ id, program, args, needs, timeoutMs }) => ({ id, program, args, needs, timeoutMs, status: "NOT_RUN", exitCode: null })), environmentAcceptance: "NOT_RUN: live ChatGPT, UAC and clean Windows installation" };
   mkdirSync(evidenceRoot, { recursive: true });
   const save = () => writeFileSync(join(evidenceRoot, "TEST-REPORT.json"), JSON.stringify(report, null, 2) + "\n");
   save();
   try {
-    for (const stage of selected) {
-      const entry = report.stages.find(({ id }) => id === stage.id);
-      entry.status = "RUNNING";
-      save();
-      try { runStage(stage); entry.status = "PASS"; }
-      catch (error) { entry.status = "FAIL"; entry.error = error.message; throw error; }
-      finally { save(); }
-    }
-    report.status = selected.length === CI_STAGES.length ? "PASS" : "PARTIAL";
-  } catch (error) {
-    report.status = "FAIL";
-    throw error;
+    await runReportedStages(selected, report, { reportPath: "tests/artifacts/ci/TEST-REPORT.json" });
   } finally {
     report.finishedAt = new Date().toISOString();
     save();
@@ -183,4 +198,4 @@ export function main(args = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

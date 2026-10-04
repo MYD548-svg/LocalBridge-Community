@@ -1,24 +1,26 @@
+import { pathToFileURL } from "node:url";
 import { cargoCommand } from "./ci-gate.mjs";
-import { runStage } from "./process.mjs";
+import { runReportedStages } from "./stage-runner.mjs";
 
-// Run output-read, exit and previously compiled configuration/pipe regressions
-// behavior first, without removing any original repetition or full-suite gate.
-for (const [id, filter] of [
-  ["output-read", "output_read_"],
-  ["policy-shutdown", "mcp::server::tests::policy_shutdown_"],
-  ["local-registration", "local_connection::registration::tests::"],
-  ["local-pipe-connect", "local_connection::pipe::tests::"],
-]) {
-  runStage({ id, label: "local lifecycle and connection behavior", ...cargoCommand(["test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "--lib", filter, "--", "--test-threads=1", "--nocapture"]) });
+export function authStages() {
+  const stage = (id, label, filter, exact = false) => ({ id, label, requireTests: true, timeoutMs: 10 * 60_000, ...cargoCommand(["test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "--lib", filter, "--", ...(exact ? ["--exact"] : []), "--test-threads=1", "--nocapture"]) });
+  return [
+    ...[
+      ["output-read", "output_read_"],
+      ["policy-shutdown", "mcp::server::tests::policy_shutdown_"],
+      ["local-registration", "local_connection::registration::tests::"],
+      ["local-pipe-connect", "local_connection::pipe::tests::"],
+    ].map(([id, filter]) => stage(id, "local lifecycle and connection behavior", filter)),
+    ...Array.from({ length: 10 }, (_, index) => stage(`auth-${index + 1}`, "strict authenticated MCP probe", "tunnel::runtime::tests::actual_tunnel_discovery_sends_the_authenticated_pep_header", true)),
+    ...Array.from({ length: 10 }, (_, index) => stage(`stderr-${index + 1}`, "retained stderr remains readable", "mcp::server::tests::busy_terminal_replay_retains_readable_stderr_and_its_owner", true)),
+    stage("local-protocol", "actual local pipe protocol, cancellation, permissions and ten output repetitions", "local_connection::tests::"),
+  ];
 }
 
-for (let attempt = 1; attempt <= 10; attempt++) {
-  runStage({ id: `auth-${attempt}`, label: "strict authenticated MCP probe", ...cargoCommand(["test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "--lib", "tunnel::runtime::tests::actual_tunnel_discovery_sends_the_authenticated_pep_header", "--", "--exact", "--test-threads=1", "--nocapture"]) });
+export async function main() {
+  const stages = authStages();
+  const report = { status: "RUNNING", startedAt: new Date().toISOString(), stages: stages.map(({ id }) => ({ id, status: "NOT_RUN" })) };
+  return runReportedStages(stages, report, { reportPath: "tests/artifacts/ci/AUTH-REPEAT.json", logDirectory: "tests/artifacts/ci/logs/auth" });
 }
 
-// Preserve the original ten authenticated Tunnel probes, then cover the retained
-// output regression through the permission service and the new local route.
-for (let attempt = 1; attempt <= 10; attempt++) {
-  runStage({ id: `stderr-${attempt}`, label: "retained stderr remains readable", ...cargoCommand(["test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "--lib", "mcp::server::tests::busy_terminal_replay_retains_readable_stderr_and_its_owner", "--", "--exact", "--test-threads=1", "--nocapture"]) });
-}
-runStage({ id: "local-protocol", label: "actual local pipe protocol, cancellation, permissions and ten output repetitions", ...cargoCommand(["test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "--lib", "local_connection::tests::", "--", "--test-threads=1", "--nocapture"]) });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

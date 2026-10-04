@@ -3,12 +3,16 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { rejectExtras, requiredFile, sha256 } from "./test/runtime-integrity.mjs";
+import { runLoggedStageSync } from "./test/stage-runner.mjs";
 const root = resolve(import.meta.dirname, "..");
 function run(program, args, repository = root) {
-  const result = spawnSync(program, args, { cwd: repository, stdio: "inherit", windowsHide: true });
-  if (result.status !== 0) throw new Error(`${program} failed (${result.status ?? result.error})`);
+  const binary = args.includes("--bin") ? args[args.indexOf("--bin") + 1] : "toolbox";
+  runLoggedStageSync({ id: `prepare-${binary}`, label: "pinned resource preparation", program, args, timeoutMs: 45 * 60_000 }, { root: repository, logDirectory: "tests/artifacts/ci/logs/resources" });
 }
-export function compilePreflight(repository, execute = (program, args) => spawnSync(program, args, { cwd: repository, stdio: "inherit", windowsHide: true }), checkout = () => {
+export function compilePreflight(repository, execute = (program, args, id) => {
+  const record = runLoggedStageSync({ id, label: "compile feature preflight", program, args }, { root: repository, logDirectory: "tests/artifacts/ci/logs/compile" });
+  return { status: record.exitCode, record };
+}, checkout = () => {
   const git = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8", windowsHide: true });
   if (git.status !== 0) throw new Error("cannot identify compile-preflight checkout");
   return git.stdout.trim();
@@ -29,7 +33,7 @@ export function compilePreflight(repository, execute = (program, args) => spawnS
   ].map(([id, args]) => ({ id, program: "cargo", args: ["+1.85.0", ...args], status: "NOT_RUN", exitCode: null }));
   const directory = resolve(repository, "tests/artifacts/ci");
   mkdirSync(directory, { recursive: true });
-  const report = { checkoutSha: null, status: "RUNNING", checks };
+  const report = { checkoutSha: null, status: "RUNNING", startedAt: new Date().toISOString(), checks };
   const save = () => writeFileSync(resolve(directory, "COMPILE-PREFLIGHT.json"), JSON.stringify(report, null, 2) + "\n");
   save();
   try {
@@ -37,16 +41,20 @@ export function compilePreflight(repository, execute = (program, args) => spawnS
     if (!/^[a-f0-9]{40}$/.test(report.checkoutSha ?? "")) throw new Error("invalid compile-preflight source SHA");
     for (const check of checks) {
       check.status = "RUNNING";
+      check.startedAt = new Date().toISOString();
+      const started = Date.now();
       save();
       try {
-        const result = execute(check.program, check.args);
+        const result = execute(check.program, check.args, check.id);
+        Object.assign(check, result.record);
         check.exitCode = result.status ?? null;
         if (result.status !== 0) throw new Error(`${check.id} failed (${result.status ?? result.error})`);
         check.status = "PASS";
       } catch (error) {
+        Object.assign(check, error.record);
         check.status = "FAIL";
         check.error = error.message;
-      } finally { save(); }
+      } finally { check.finishedAt = new Date().toISOString(); check.durationMs = Date.now() - started; save(); }
     }
     const failures = checks.filter((check) => check.status === "FAIL");
     if (failures.length) throw new Error(`compile preflight failed: ${failures.map((check) => check.id).join(", ")}`);
@@ -55,7 +63,7 @@ export function compilePreflight(repository, execute = (program, args) => spawnS
     report.status = "FAIL";
     report.error = error.message;
     throw error;
-  } finally { save(); }
+  } finally { report.finishedAt = new Date().toISOString(); save(); }
 }
 const nativeStages = [
   { directory: "release-stage", binary: "localbridge-privileged-broker.exe", evidence: "broker-build.json" },

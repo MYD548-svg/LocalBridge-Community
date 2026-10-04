@@ -1,6 +1,6 @@
 # LocalBridge 网页集成：实现方案与一次上传边界
 
-日期：2026-10-03。状态：集成基线 368450f 的 CI 已核验为 FAIL（11 PASS、1 FAIL、7 NOT_RUN），本轮集中修复授权判断与构建诊断/证据失效；新修复提交的云端结果及真实网页链路尚未验收。检查详情见 CHATGPT-WEB-TEST-REPORT.md。
+日期：2026-10-04（香港时间）。状态：基线 11f80f2 的 CI #80 已核验为 FAIL（13 PASS、auth-repeat FAIL、5 NOT_RUN），十项编译预检均通过。失败源于浏览器管道夹具将身份路径作为执行路径；本轮修复夹具与撤销观察边界，补齐依赖汇总、逐命令诊断和 Cargo 缓存。新修复提交的云端结果及真实网页链路尚未验收。详情见 CHATGPT-WEB-TEST-REPORT.md。
 
 ## 1. 目标与完成边界
 
@@ -74,7 +74,7 @@ ZIP 包含编译后的 content/background/popup、manifest、版本/协议/兼�
 | ZIP | 实际构建和解压读取、固定 ID、入口完整、哈希、版本/协议及坏包测试 |
 | 打包配置 | 十项编译/lint 预检汇总失败；保留夹具验证原生组件及两种扩展失败失效旧证据、资源映射、注册模板/归属、产物收集 |
 | 仓库 | Rust 格式、现有 Node/前端回归、许可证、敏感信息、公开导出、差异范围 |
-| Windows | 只做一次编译预检；缺 link.exe 记录 BLOCKED，二进制测试和 NSIS 本机 NOT_RUN |
+| Windows | 当前 Linux 无完整 MSVC/原生 Windows 环境；修改文件格式检查可运行，二进制行为与 NSIS 本机 NOT_RUN |
 
 分开运行可用检查，不让缺工具链阻断其余检查。真实代码失败必须修复后再上传。旧 EXE、历史 CI 成功或模拟响应不能充当新宿主验证。
 
@@ -89,7 +89,9 @@ ZIP 包含编译后的 content/background/popup、manifest、版本/协议/兼�
 - package-integrity：打开安装 EXE，核验新增文件及哈希，拒绝重复资源覆盖；
 - artifacts：同一源码 SHA 的安装 EXE、扩展 ZIP、中文指引、校验和来源报告；失败保留诊断。
 
-Community 工作流仅更新收集项，保留原 main、release/*、标签及 PR 触发条件。无 PR 的普通 codex/ 分支预期只触发一轮 CI、一个 Windows 作业。这轮仅产生候选产物；云端结果本次为 UNVERIFIED。
+独立检查汇总失败，前置失败使依赖阶段标 BLOCKED。正式打包要求所有前序必需门禁通过。十次鉴权及十次 stderr 重复不减，逐次记录日志、耗时和退出码，零行为测试拒绝 PASS。编译依赖缓存不包含 staging、安装包、ZIP 或测试成功证据；实际 NSIS 提取校验仍每次执行。需要发行 EXE 的 no-console 验证在未提供本轮二进制时明确 NOT_RUN。
+
+Community 工作流补齐诊断收集与编译依赖缓存，保留原 main、release/*、标签及 PR 触发条件。无 PR 的普通 codex/ 分支预期只触发一轮 CI、一个 Windows 作业。这轮仅产生候选产物；云端结果本次为 UNVERIFIED。
 
 ## 8. 一次上传及停止
 

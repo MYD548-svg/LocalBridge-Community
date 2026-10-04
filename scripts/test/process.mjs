@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 
 export const repositoryRoot = resolve(import.meta.dirname, "..", "..");
 
-const executableFor = (program, args) => {
+export const executableFor = (program, args) => {
   if (process.platform === "win32" && program === "npm") {
     return {
       executable: process.env.ComSpec || "cmd.exe",
