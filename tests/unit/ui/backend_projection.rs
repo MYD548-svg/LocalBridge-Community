@@ -114,7 +114,6 @@ fn main_projection_json_contract_matches_the_frontend_fixture() {
             category: "authorization",
             message: "Privilege broker is unavailable".into(),
             retryable: true,
-            failure_reason: None,
         }],
     };
     let backend = serde_json::to_value(projection).unwrap();

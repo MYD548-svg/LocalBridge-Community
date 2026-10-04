@@ -8,6 +8,8 @@ Windows x64, Git on PATH, Node.js 24 (minimum 22), Rust **1.85.0** with rustfmt/
 
 The only ordered gate is `scripts/test/ci-gate.mjs`. Both Windows workflows and the local wrapper call it. Never duplicate individual gate commands in a workflow.
 
+The base stage also runs `scripts/test/ui-projection-contract.test.mjs`. This portable Rust 1.85 check compiles the actual UI projection declarations and original JSON fixture, checks optional update failures, and verifies that an unrelated fault field is rejected by the compiler. Run it directly with `node --test scripts/test/ui-projection-contract.test.mjs` from the repository root. Its locked dependencies match the application lock; Cargo may fetch missing verified dependencies on a fresh runner. Source snapshots, hashes and compiler logs are retained with diagnostics; compiler outputs stay outside the diagnostics tree. An `EXPECTED_REJECTION` case records the intentional invalid temporary copy, not a product failure. Full Windows compilation and behavioral tests remain mandatory.
+
 ```powershell
 # Bundled Tunnel profile
 node scripts/test/ci-gate.mjs

@@ -1,4 +1,54 @@
-# 下载来源与扩展引导实施检查报告
+# Action #82 修复实施检查报告
+
+日期：2026-10-04（UTC）。分支：codex/chatgpt-web-integration。代码基线：33b96c773ede06e7c7603d6f649c5fa63f1d676c。最终提交与远端 SHA 核对结果在交付回复中记录，不为补写 SHA 再次推送。
+
+## 已确认问题与本轮修复
+
+[CI #82 / run 37195945769](https://github.com/MYD548-svg/LocalBridge-Community/actions/runs/37195945769) 的 Windows 日志确认：tests/unit/ui/backend_projection.rs 的 UiFaultProjection 夹具误加 failure_reason，产生 E0560。该字段属于 UpdateProjection。十九阶段为 11 PASS、runtime-resources FAIL、7 BLOCKED；十项特性编译/lint 预检中四项因同一字段失败，其他六项通过。Node 89 项、前端 32 项、扩展 17 项及生产前端/扩展构建在该次 Windows 运行中已通过；后续原生 release、staging、鉴权、Rust 行为、NSIS 和最终证据没有完成。
+
+本轮精确删除 UiFaultProjection 中误加的一行，保留两处 UpdateProjection 夹具及生产更新错误字段。没有修改通用故障类型或 JSON fixture。正常更新省略 failureReason，失败更新继续显示真实原因。
+
+新增 scripts/test/ui-projection-contract.test.mjs，直接提取当前生产投影声明和原 JSON 夹具测试，在独立临时 crate 中执行真实 Rust 编译。检查使用固定 Rust 1.85、小型锁文件，并核对全部依赖版本/校验和与应用锁文件一致；应用依赖和锁文件不变。提取边界、类型集合、实际执行数量和输入哈希均核验，检查结束时再次确认源文件未变化。
+
+该检查执行原 JSON 合同及两项错误字段序列化测试；另生成临时副本，验证误加字段必被编译器以 E0560 拒绝。反例在证据中标为 EXPECTED_REJECTION，其底层编译结果为 FAIL；它不表示产品代码失败或将未执行项计为通过。日志、输入哈希和生成源码保留在 tests/artifacts/ci/ui-projection-probes，编译产物放在该诊断树之外，避免上传编译缓存。每次重新生成源码，原有 PASS 不充当本次证据。
+
+新检查接入原 test-base 阶段。十九个外层阶段、十项特性预检、--locked、-D warnings、完整 --no-fail-fast、鉴权及原重复行为检查、超时与失败诊断全部保留，没有新增 workflow 或 Windows 作业。
+
+## 本轮集中验证
+
+| 检查 | 状态 | 结果及边界 |
+| --- | --- | --- |
+| 跨平台 Node 批次 | PASS | 90 项，0 FAIL、0 SKIPPED；包含新投影检查及门禁接入检查 |
+| 真实 UI 投影 Rust 检查 | PASS | 上述 Node 批次内实际执行 3 个 Rust 测试，另验证 1 次预期编译拒绝，不重复计入 Node 数量 |
+| 前端/扩展测试 | PASS | 32 / 17 项，均在本轮运行 |
+| TypeScript / 生产构建 | PASS | npm run build，实际发行 ZIP 校验成功 |
+| 发行 ZIP 复用与开发隔离 | PASS | 复用返回同份 ZIP；开发身份/目录不同，发行 ZIP 和描述哈希未变化 |
+| 原平台无关 Rust 模块 | PASS | 21 项；Clippy -D warnings 通过，包含发行、更新和包管理原模块 |
+| 格式/架构/公开导出 | PASS | Rust 1.85 格式检查；schema44、公开导出回归及新增检查/锁文件导出范围核对 |
+| 许可证 | PASS | npm 166、Cargo 484；没有新增应用运行时依赖 |
+| 敏感信息/提交格式 | PASS | 暂存文件及历史扫描高置信敏感信息为零，git diff --check 通过 |
+| 构建与上传链 | PASS（静态及合同） | 核对资源前置依赖、Tauri hook、同源 ZIP/宿主、NSIS 路径/哈希、最终报告写入及候选上传目录；配套候选回归通过 |
+| workflow | PASS（静态） | 三份 YAML、分支/tag 范围、always 诊断、success 候选上传、手动发布默认关闭及候选名称核对 |
+| Windows runtime-output 入口 | NOT_RUN（本轮本机） | 本轮 Linux 批次仅排除此 Windows 专属入口；它仍在完整 Windows 门禁，历史 #82 中已通过 |
+| 完整 Windows 应用编译/原生行为/NSIS | NOT_RUN | 本机 Linux 不能替代 Tauri/MSVC、Windows 管道/注册表及实际安装包提取验证 |
+| Edge/Chrome/真实 ChatGPT/干净安装 | NOT_RUN | 单元测试及文件校验不代表实际浏览器操作已验收 |
+| 本次新 Actions | UNVERIFIED | 本轮推送后仅核对远端 SHA，不查询或等待新的运行状态 |
+
+新投影检查只覆盖实际投影声明、原 JSON 合同和错误字段序列化；原平台无关 Rust harness 仅以 Linux 临时目录/原子替换适配平台差异。两者均不覆盖完整 UI 命令、Tauri、Windows MoveFileEx、宿主、注册表及原生管道，不能称为完整 Windows 应用测试。
+
+打包链审查没有发现新的确定故障，因此本轮没有改写既有资源、发行或工作流配置。仍要求扩展先构建、原生组件再暂存、完整门禁后 NSIS 打包、实际安装资源提取与哈希校验，最后生成同源安装 EXE/ZIP/清单/指南/来源记录。候选上传在最终报告完成后执行；失败继续上传诊断。独立辅助 crate 的编译不调用主应用构建，原完整 Windows 检查仍会执行。
+
+## 一次上传边界
+
+当前分支无开放 PR，main/release 与其他分支触发范围分开。实施集中检查和报告完成后只创建一个普通提交、推送一次，预期触发 CI 的一个 Windows 作业。随后以 git ls-remote 核对远端 SHA 并确认工作树干净，即停止。不查询新 Action、不下载新产物、不 rerun、不补推报告、不创建 PR/tag/Release。
+
+本地日志位于 /workspace/scratch/action82-*.log；构建输出来自基线 HEAD 的修改工作树，不能作为新提交的正式候选。新提交的完整 Windows 结果在本次交付中为 UNVERIFIED。
+
+以下为此前实施与修复的历史记录，其计数、失败尝试和当时的覆盖范围不代表本轮结果。
+
+---
+
+# 历史记录：下载来源与扩展引导实施检查报告
 
 日期：2026-10-04（UTC）。分支：codex/chatgpt-web-integration。代码基线：b67d03e430932d870589dd9aa9e11f234b196d1d。依据：[产品发行与引导说明](PRODUCT-DISTRIBUTION.md)。最终提交号和远端核对结果在交付回复中记录，不为补写 SHA 再次推送。
 

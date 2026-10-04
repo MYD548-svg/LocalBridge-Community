@@ -44,6 +44,7 @@ export const CI_STAGES = validateStages([
       "scripts/test/adapter-client.test.mjs",
       "scripts/test/browser-extension-package.test.mjs",
       "scripts/test/product-release.test.mjs",
+      "scripts/test/ui-projection-contract.test.mjs",
     ),
   },
   {

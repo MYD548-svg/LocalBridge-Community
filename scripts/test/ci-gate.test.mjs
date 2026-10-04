@@ -71,6 +71,12 @@ test("the full Rust gate collects independent target failures without weakening 
   assert.deepEqual(rust.args.slice(-2), ["--", "--test-threads=1"]);
 });
 
+test("the base gate compiles the real UI projection fixture before native resource builds", () => {
+  const base = CI_STAGES.find(stage => stage.id === "test-base");
+  assert.ok(base.args.includes("scripts/test/ui-projection-contract.test.mjs"));
+  assert.ok(CI_STAGES.find(stage => stage.id === "runtime-resources").needs.includes(base.id));
+});
+
 test("a running desktop binary can use the same Rust gate with an isolated target directory", () => {
   assert.deepEqual(cargoCommand(["test"], {}).args, ["+1.85.0", "test"]);
   assert.deepEqual(
