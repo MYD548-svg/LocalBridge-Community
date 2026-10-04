@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use super::OperationError;
 
 const GITHUB_REPOSITORY_MAX_BYTES: usize = 200;
-pub const OFFICIAL_GITHUB_REPOSITORY: &str = "zephyr7030/LocalBridge";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -67,7 +66,7 @@ impl GitHubRepository {
     }
 
     pub fn official() -> Self {
-        Self::new(OFFICIAL_GITHUB_REPOSITORY)
+        Self::new(&super::distribution::configuration().repository)
             .expect("the compile-time official GitHub repository must be valid")
     }
 
@@ -245,11 +244,11 @@ mod tests {
         assert!(GitHubRepository::new("owner/repo/extra").is_err());
         assert_eq!(
             GitHubRepository::official().as_str(),
-            OFFICIAL_GITHUB_REPOSITORY
+            super::super::distribution::configuration().repository
         );
         assert_eq!(
             GitHubRepository::official().releases_url(),
-            "https://github.com/zephyr7030/LocalBridge/releases"
+            "https://github.com/MYD548-svg/LocalBridge-Community/releases"
         );
     }
 }

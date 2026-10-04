@@ -1,5 +1,7 @@
 # Community build and CI
 
+Product distribution is configured in `product-release.json`. Installers now include the verified release extension ZIP. Main/release branches use Community Build; other branches use CI. Tag pushes do not rebuild or publish. A separate manual publication workflow reuses a successful Community Build candidate. See [paired distribution](PRODUCT-DISTRIBUTION.md).
+
 ## Requirements
 
 Windows x64, Git on PATH, Node.js 24 (minimum 22), Rust **1.85.0** with rustfmt/clippy and the MSVC target, Visual C++ build tools and Windows SDK. Community builds additionally require Go **1.26.2**. No administrator shell is required for building.
@@ -38,12 +40,12 @@ The MCP probe handles multiple connections and completes initialization. It chec
 
 Each invocation writes `tests/artifacts/ci/TEST-REPORT.json` with commit, profile and per-stage PASS/FAIL/NOT_RUN. A partial invocation cannot count as a full build. Successful packaging additionally generates `BUILD-PROVENANCE.json`, `toolchains.json` and `SHA256SUMS.txt` there, covering the installer, binaries, resources and evidence. An old installer cannot satisfy a new run. Root-level provenance/checksums are baseline information, not current release evidence.
 
-Diagnostics upload even on failure. Verified installer uploads run only after success. No Release is published automatically. Full acceptance requires both workflows succeeding for the same repaired commit; local edits alone do not establish this.
+Diagnostics upload even on failure. Verified installer uploads run only after success. No Release is published automatically. A formal release requires a successful Community Build for the exact source commit; CI supplies ordinary branch candidates. Local edits alone do not establish Windows packaging success.
 
 The same nineteen stages now include the ChatGPT extension tests/build/ZIP and the standalone browser host. Resource preflight compiles and lints the browser-host feature; the serial Rust stage also executes the new native-process and authenticated named-pipe tests. NSIS embeds the attested host and fixed-origin manifest template, writes an absolute manifest, and registers Edge/Chrome in both Windows registry views with ownership checks. Post-package verification extracts the host/template and checks their hashes as well as duplicate payload entries.
 
 Candidate artifacts include the installer, extension ZIP, Chinese HTML/SVG guide, checksums and provenance bound to the current checkout SHA. Development builds use node scripts/build-browser-extension.mjs --development and the browser-host-dev Cargo feature in an isolated target directory; their identity and host registration must remain separate. They are not bundled in release artifacts.
 
-For codex/chatgpt-web-integration without a PR, one ordinary push is expected to trigger CI only (one Windows job); Community keeps its main/release/tag/PR triggers. This task stops after the push and remote SHA comparison. Cloud results are UNVERIFIED and the two-workflow release acceptance above is deferred.
+For codex/chatgpt-web-integration without a PR, one ordinary push is expected to trigger CI only (one Windows job); Community handles main/release branches and PRs targeting them. Tags trigger neither build workflow. This task stops after the push and remote SHA comparison. Cloud results are UNVERIFIED and formal release acceptance is deferred.
 
 Live ChatGPT connection, interactive UAC and clean Windows installation remain separate NOT_RUN acceptance items. A successful NSIS build proves packaging only.

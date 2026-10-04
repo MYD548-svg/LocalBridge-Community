@@ -1,7 +1,13 @@
 name: CI
 on:
   push:
+    branches-ignore: [main, "release/**"]
+    tags-ignore: ["**"]
   pull_request:
+    branches-ignore: [main, "release/**"]
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -44,6 +50,7 @@ jobs:
             src-tauri/target/release-stage/*.json
             src-tauri/target/local-mcp-stage/*.json
             src-tauri/target/browser-host-stage/*.json
+            src-tauri/target/browser-extension-stage/bundle.json
             tests/artifacts/browser-extension/extension-build.json
             tests/artifacts/browser-extension-dev/extension-build.json
           if-no-files-found: warn
@@ -53,6 +60,16 @@ jobs:
         with:
           name: bundled-verified-installer
           path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+      - name: Upload complete release candidate
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundled-release-candidate
+          path: |
+            tests/artifacts/release/
+            tests/artifacts/ci/TEST-REPORT.json
+            tests/artifacts/ci/BUILD-PROVENANCE.json
           if-no-files-found: error
       - name: Upload browser extension candidate
         if: success()

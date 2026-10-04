@@ -95,6 +95,8 @@ pub struct UpdateProjection {
     operation_id: Option<String>,
     attempt: Option<u8>,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1505,6 +1507,7 @@ fn update_projection(state: Option<&UpdateLifecycle>) -> UpdateProjection {
             release_url: None,
             operation_id: None,
             attempt: None,
+            failure_reason: None,
             retryable: false,
         };
     };
@@ -1518,6 +1521,7 @@ fn update_projection(state: Option<&UpdateLifecycle>) -> UpdateProjection {
             release_url: None,
             operation_id: None,
             attempt: None,
+            failure_reason: None,
             retryable: false,
         },
         UpdateLifecycle::Idle {
@@ -1530,6 +1534,7 @@ fn update_projection(state: Option<&UpdateLifecycle>) -> UpdateProjection {
             release_url: Some(releases_url.clone()),
             operation_id: None,
             attempt: None,
+            failure_reason: None,
             retryable: true,
         },
         UpdateLifecycle::Checking {
@@ -1545,6 +1550,7 @@ fn update_projection(state: Option<&UpdateLifecycle>) -> UpdateProjection {
             release_url: Some(releases_url.clone()),
             operation_id: Some(operation_id.clone()),
             attempt: Some(*attempt),
+            failure_reason: None,
             retryable: false,
         },
         UpdateLifecycle::Current {
@@ -1559,6 +1565,7 @@ fn update_projection(state: Option<&UpdateLifecycle>) -> UpdateProjection {
             release_url: Some(releases_url.clone()),
             operation_id: Some(operation_id.clone()),
             attempt: None,
+            failure_reason: None,
             retryable: true,
         },
         UpdateLifecycle::Available {
@@ -1574,6 +1581,7 @@ fn update_projection(state: Option<&UpdateLifecycle>) -> UpdateProjection {
             release_url: Some(release_url.clone()),
             operation_id: Some(operation_id.clone()),
             attempt: None,
+            failure_reason: None,
             retryable: true,
         },
         UpdateLifecycle::Failed {
@@ -1590,6 +1598,7 @@ fn update_projection(state: Option<&UpdateLifecycle>) -> UpdateProjection {
             release_url: Some(releases_url.clone()),
             operation_id: Some(operation_id.clone()),
             attempt: Some(*attempts),
+            failure_reason: Some(error.message.clone()),
             retryable: error.retryable,
         },
     }

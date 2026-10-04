@@ -25,18 +25,18 @@ ChatGPT 顶层网页 → 内容适配器 → 扩展后台 → Native Messaging �
 | extensions/chatgpt-web | TypeScript 扩展、独立页面适配、协议与确认流程测试、中文 HTML/SVG 图解、固定身份 |
 | src-tauri/bin/browser-host、src-tauri/src/browser_connection | 宿主、分片协议、配对授权、导入事务、浏览器控制管道 |
 | local_connection/runtime、mcp/server、session_registry | 内部握手、会话授权、去重、撤销取消和来源统计 |
-| commands/browser_connection、BrowserConnectionPanel | 下载、选择 ZIP/目录、导入、复制地址与路径、打开目录、配对和检查连接 |
+| commands/browser_connection、BrowserConnectionPanel | 内置包准备、配套附件查询、选择 ZIP/目录、导入、逐步引导、复制地址与路径、配对和刷新实际状态 |
 | prepare-lb018-resources、tauri.conf、nsis-hooks | 独立宿主构建、资源映射、安装注册和升级占用处理 |
 | scripts/test、tests/integration/browser、workflows | 构建回归、ZIP 检查、真实 Windows 子进程及管道测试、产物收集 |
 
 ## 3. 普通用户的默认操作
 
 1. 安装同一候选提交产生的 LocalBridge 安装包，启动本地服务并选择工作区。
-2. 从 GitHub 下载该候选的扩展 ZIP。当前候选保存在 Actions 产物中；正式发布前不会创建 Release。应用的下载按钮是长期发行页入口，候选需要从对应提交的产物获取。
-3. 在“ChatGPT 网页”卡片选择 ZIP 或已解压目录，确认已停止工具并关闭扩展，点击导入。应用核验后准备到 %LOCALAPPDATA%\LocalBridge\browser-extension\current。
+2. 在“设置 → ChatGPT 网页”选择 Edge 或 Chrome，点击“准备配套扩展”。新安装包已内置同次构建的发行 ZIP，首次准备不需要 GitHub。独立下载只提供本项目中与当前版本、来源提交和协议匹配的具体附件；未发布时明确说明。
+3. 需要手动导入时选择发行 ZIP 或其解压目录。首次准备无需关闭尚未安装的扩展；替换现有文件前，停止并断开工具、关闭浏览器中的扩展开关并确认。应用核验后准备到 %LOCALAPPDATA%\LocalBridge\browser-extension\current。
 4. 复制 edge://extensions（或 chrome://extensions）到浏览器地址栏，开启开发者模式，选择“加载解压缩的扩展”，使用应用提供的固定目录。ZIP 中含编译产物，无需编译。
 5. 打开或刷新 ChatGPT，点击扩展图标连接；在 LocalBridge 核对浏览器实例、工作区和权限并批准配对，然后在扩展为当前聊天启用工具。
-6. 选择工具，填入说明，并在 ChatGPT 手动发送。仅将启用之后完成的新助手消息生成执行候选。
+6. 首次使用可点击扩展中的“准备首次只读调用”，填入 workspace_context 的说明与提示，并在 ChatGPT 手动发送。日常按需要选择工具。仅将启用之后完成的新助手消息生成执行候选。
 7. 在扩展自身窗口查看工具与参数并确认执行。实际结果需要另一次点击才能填入草稿，再由用户在 ChatGPT 点击发送。
 
 “文件已准备”“浏览器已连接”“聊天已启用”“真实调用成功”分别统计。注册表存在、文件存在或模拟结果都不等同于真实工具成功。临时新聊天生成持久聊天地址时，或切换聊天、刷新页面后，需要重新启用；旧结果可在原聊天查看和复制。

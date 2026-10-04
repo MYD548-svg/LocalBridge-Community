@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use serde::Deserialize;
+use crate::domain::distribution::{self, DistributionError, GitHubRelease, ReleaseManifest};
+use serde::de::DeserializeOwned;
 
 use crate::control_plane::update::{UpdateStartError, UpdateStateOwner};
 use crate::domain::{
@@ -45,17 +46,11 @@ impl Default for GitHubReleaseSource {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct GitHubLatestRelease {
-    tag_name: String,
-    html_url: String,
-}
-
-impl ReleaseSource for GitHubReleaseSource {
-    fn latest(&self, repository: &GitHubRepository) -> Result<ReleaseDiscovery, UpdateFetchError> {
+impl GitHubReleaseSource {
+    fn json<T: DeserializeOwned>(&self, url: &str) -> Result<T, UpdateFetchError> {
         let mut response = self
             .agent
-            .get(repository.latest_api_url())
+            .get(url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header(
@@ -70,12 +65,62 @@ impl ReleaseSource for GitHubReleaseSource {
             .limit(UPDATE_RESPONSE_MAX_BYTES)
             .read_to_string()
             .map_err(UpdateFetchError::from_transport)?;
-        let release: GitHubLatestRelease =
-            serde_json::from_str(&body).map_err(|_| UpdateFetchError::InvalidResponse)?;
-        let version = ProductVersion::parse(&release.tag_name)
-            .map_err(|_| UpdateFetchError::InvalidVersion)?;
-        ReleaseDiscovery::new(repository, version, release.html_url)
-            .map_err(|_| UpdateFetchError::ForeignReleaseUrl)
+        serde_json::from_str(&body).map_err(|_| UpdateFetchError::InvalidResponse)
+    }
+
+    fn published(
+        &self,
+        repository: &GitHubRepository,
+        api_url: &str,
+    ) -> Result<(GitHubRelease, ReleaseManifest), UpdateFetchError> {
+        let release: GitHubRelease = self.json(api_url)?;
+        let url = release
+            .manifest_url(repository)
+            .map_err(UpdateFetchError::from)?;
+        let manifest: ReleaseManifest = self.json(&url).map_err(|error| {
+            if error == UpdateFetchError::NoPublishedRelease {
+                UpdateFetchError::MissingAsset
+            } else {
+                error
+            }
+        })?;
+        manifest
+            .validate(repository, &release)
+            .map_err(UpdateFetchError::from)?;
+        Ok((release, manifest))
+    }
+
+    pub fn current_extension(&self) -> Result<ReleaseManifest, UpdateFetchError> {
+        let repository = GitHubRepository::official();
+        let version = ProductVersion::current().to_string();
+        let tag = distribution::release_tag(&version);
+        let (_, manifest) = self.published(
+            &repository,
+            &format!(
+                "https://api.github.com/repos/{}/releases/tags/{tag}",
+                repository.as_str()
+            ),
+        )?;
+        manifest
+            .require_current_extension(
+                &version,
+                env!("LOCALBRIDGE_SOURCE_COMMIT"),
+                crate::browser_connection::EXTENSION_ID.trim(),
+            )
+            .map_err(UpdateFetchError::from)?;
+        Ok(manifest)
+    }
+}
+
+impl ReleaseSource for GitHubReleaseSource {
+    fn latest(&self, repository: &GitHubRepository) -> Result<ReleaseDiscovery, UpdateFetchError> {
+        let (release, manifest) = self.published(repository, &repository.latest_api_url())?;
+        ReleaseDiscovery::new(
+            repository,
+            manifest.product_version().map_err(UpdateFetchError::from)?,
+            release.html_url,
+        )
+        .map_err(|_| UpdateFetchError::ForeignReleaseUrl)
     }
 }
 
@@ -88,9 +133,45 @@ pub enum UpdateFetchError {
     InvalidResponse,
     InvalidVersion,
     ForeignReleaseUrl,
+    MissingAsset,
+    Incompatible,
+}
+
+impl From<DistributionError> for UpdateFetchError {
+    fn from(error: DistributionError) -> Self {
+        match error {
+            DistributionError::Unpublished => Self::NoPublishedRelease,
+            DistributionError::MissingAsset => Self::MissingAsset,
+            DistributionError::Invalid => Self::InvalidResponse,
+            DistributionError::ForeignSource => Self::ForeignReleaseUrl,
+            DistributionError::Incompatible => Self::Incompatible,
+        }
+    }
 }
 
 impl UpdateFetchError {
+    pub fn user_message(self) -> &'static str {
+        match self {
+            Self::NoPublishedRelease => {
+                "本项目尚未发布此版本的配套下载。请使用安装包内置扩展，或手动导入同次构建的发行 ZIP。"
+            }
+            Self::MissingAsset => {
+                "此发行缺少配套清单或附件，请使用内置扩展，或联系项目维护者补齐发行文件。"
+            }
+            Self::Incompatible => {
+                "发行扩展与当前应用的版本、来源提交或协议不匹配。请使用内置扩展，或下载同次发行的新版安装包。"
+            }
+            Self::ForeignReleaseUrl => "发行文件不属于本项目，已拒绝打开。请使用本项目的配套下载。",
+            Self::Timeout | Self::Transport => {
+                "无法读取配套下载信息，请检查网络后重试；内置扩展仍可准备。"
+            }
+            Self::RateLimited => "GitHub 暂时限制查询次数，请稍后重试；内置扩展仍可准备。",
+            Self::InvalidResponse | Self::InvalidVersion => {
+                "发行清单损坏或格式不兼容，请使用内置扩展，或联系项目维护者。"
+            }
+        }
+    }
+
     fn from_transport(error: ureq::Error) -> Self {
         match error {
             ureq::Error::Timeout(_) => Self::Timeout,
@@ -119,7 +200,7 @@ impl UpdateFetchError {
             Self::NoPublishedRelease => (
                 "Update.NoPublishedRelease",
                 ErrorCategory::Unavailable,
-                "no published release is available",
+                self.user_message(),
             ),
             Self::RateLimited => (
                 "Update.RateLimited",
@@ -135,6 +216,16 @@ impl UpdateFetchError {
                 "Update.InvalidVersion",
                 ErrorCategory::Unavailable,
                 "latest release has an invalid version",
+            ),
+            Self::MissingAsset => (
+                "Update.MissingAsset",
+                ErrorCategory::Unavailable,
+                self.user_message(),
+            ),
+            Self::Incompatible => (
+                "Update.Incompatible",
+                ErrorCategory::Unavailable,
+                self.user_message(),
             ),
             Self::ForeignReleaseUrl => (
                 "Update.ForeignReleaseUrl",

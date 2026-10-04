@@ -323,7 +323,11 @@ mod tests {
         let owner = UpdateStateOwner::default();
         assert_eq!(
             owner.repository().as_ref().map(GitHubRepository::as_str),
-            Some(crate::domain::OFFICIAL_GITHUB_REPOSITORY)
+            Some(
+                crate::domain::distribution::configuration()
+                    .repository
+                    .as_str()
+            )
         );
         assert!(matches!(owner.snapshot(), UpdateLifecycle::Idle { .. }));
     }

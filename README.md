@@ -1,73 +1,45 @@
-# LocalBridge
+# LocalBridge Community
 
-当前源码包含 **尚未发布的 Codex 本地连接候选改造**：已安装并登录 Codex 的 Windows 用户可通过随包适配器接入 LocalBridge，连接与工具执行在本机完成，模型仍由 Codex 联网调用。保留 OpenAI Tunnel 高级兼容模式。
+本仓库为 `MYD548-svg/LocalBridge-Community`，产品更新、安装包与扩展下载统一使用本仓库的 **[Releases](https://github.com/MYD548-svg/LocalBridge-Community/releases)**。上游来源与第三方组件说明见 [来源与同步说明](docs/UPSTREAM-SYNC.md) 和 [许可证](THIRD_PARTY_NOTICES.md)。
 
-2026-10-03 源码候选改为直接打开主界面、添加首个项目后自动本地接入，并支持可命名的多个项目记录及显式切换；旧测试配置升级一次后默认本地。源码候选按授权单次推送触发云端检查，Windows 新包与真实聊天调用仍待验收，原 10.03 测试版保留。
+**当前发行状态：本仓库尚未发布正式 Release。** 源码包含桌面本地连接和 ChatGPT 网页集成候选。Actions 成功后输出同次构建的 Windows 安装包、扩展 ZIP、安装图解、校验和与来源记录；候选不等于正式发行，也不等于已完成干净 Windows 安装或真实 ChatGPT 验收。
 
-本轮未生成新版安装包，完整 Windows 编译与实机验收仍受构建环境阻断，不能据此认定正式发布。参见 [本地连接使用说明](docs/LOCAL-CODEX-USAGE.md)、[来源与适配说明](docs/LOCAL-CODEX-ADAPTATION.md) 和 [本地验证报告](docs/LOCAL-CODEX-TEST-REPORT.md)。下文下载流程对应已发布的 Tunnel 版本。
+## 安装与 ChatGPT 网页接入
 
-源码另包含 **ChatGPT 网页集成候选**：网关随 LocalBridge 安装，扩展以编译好的 ZIP 分发，首发采用 Edge/Chrome 开发者模式手动加载。应用准备固定目录，用户在应用确认配对、在扩展确认执行，并手动发送结果。此候选尚未发布；需要同一提交构建的新安装包和扩展 ZIP，现有安装包不能代替新增宿主。参见 [集成方案](docs/CHATGPT-WEB-INTEGRATION-PLAN.md)、[安装图解](extensions/chatgpt-web/INSTALL.html) 和 [本机检查报告](docs/CHATGPT-WEB-TEST-REPORT.md)。
+当前目标为 Windows 11 x64、Edge/Chrome（Chromium 120+）。安装包携带 Python、工具运行时、浏览器宿主及配套扩展；普通用户无需安装 Node.js、Rust、MSVC 或额外代理。
 
-## 让 ChatGPT 直接参与本地开发与 Windows 维护
+1. 使用本项目同次构建的 Windows 安装包。正式发行可从本仓库 Releases 获取；发布前候选在对应提交的 Actions 产物中。
+2. 打开 LocalBridge，选择允许使用的项目文件夹，并启动本地服务，使用本地连接模式。
+3. 打开“设置 → ChatGPT 网页”，选择 Edge 或 Chrome，点击“准备配套扩展（推荐）”。文件已准备后，还需浏览器手动加载。
+4. 在地址栏打开 `edge://extensions` 或 `chrome://extensions`，开启开发者模式，点击加载解压目录的按钮，选择应用提供的固定目录。
+5. 打开或刷新 ChatGPT，固定并点击 LocalBridge 扩展图标，选择“连接这台电脑”。回到应用核对项目与权限，批准配对，再返回扩展启用当前聊天。
+6. 点击扩展中的“准备首次只读调用”，检查填入内容并手动发送；核对助手请求后确认执行，看到真实结果再回填并发送。
 
-LocalBridge 将 ChatGPT 插件与 Windows 本地环境连接起来。无需反复上传文件或复制命令，就能让 ChatGPT 阅读和修改项目、运行开发任务，并协助完成常见的系统检查与维护工作。
+网页接入无需 API Key、Tunnel ID 或 Codex 桌面程序。详细操作与故障处理见 [中文安装图解](extensions/chatgpt-web/INSTALL.html) 和 [发行与下载说明](docs/PRODUCT-DISTRIBUTION.md)。
 
-已发布的 Tunnel 安装包约 **21 MB**，内置 Python、Coding Runtime、Tunnel 和常用工具，无需另外配置系统 Python、Node.js、Rust 或 Docker。候选本地连接版的安装包大小尚未验证。
+## 单独导入与更新
 
----
+新安装包已携带配套扩展，通常不必单独下载。需要手动导入时，请选择 `LocalBridge-ChatGPT-Web-v<版本>.zip`，不要选择 Source code ZIP 或 Actions 附件的外层 ZIP。扩展下载入口按应用版本、来源提交、协议和附件清单核验配套关系，没有可用发行时会明确说明。
 
-## 一个插件，连接完整的本地工作流
+更新扩展前，先在所有扩展窗口停止并断开，在浏览器管理页关闭 LocalBridge，再到应用确认替换文件。完成后重新启用/重新加载扩展、刷新 ChatGPT，并重新启用当前聊天。固定目录 `%LOCALAPPDATA%\LocalBridge\browser-extension\current` 请保留。
 
-- 阅读、搜索和修改项目文件
-- 运行测试、构建及开发命令
-- 查看 Git 状态、提交记录和代码差异
-- 管理后台命令与长时间任务
-- 检查 Windows 服务、日志和运行环境
-- 执行常见系统诊断与管理员维护操作
+## 其他连接方式
 
-无论是修复 Bug、重构项目、排查构建问题，还是检查 Windows 运行状态，都可以直接在 ChatGPT 对话中继续完成。
+- **Codex 桌面接入**：需安装并登录 Codex，在应用的“Codex 桌面连接”中设置；参见 [本地连接说明](docs/LOCAL-CODEX-USAGE.md)。
+- **OpenAI Tunnel 兼容连接**：作为单独的高级模式使用，需要该模式的连接配置；它不属于网页扩展的首次安装流程。
 
-## 轻量安装，工具内置
+本地工具用于读取、搜索和修改项目、执行开发命令、查看 Git 状态及 Windows 维护。权限范围由应用中的项目和编辑/完整/管理员模式决定；管理员操作需要明确确认与 UAC。网页工具执行和结果发送分别由用户确认。回填并发送的内容会进入在线聊天，输入框有草稿时暂停回填，未知结果不会自动重发。详见 [安全与权限说明](SECURITY.md)。
 
-LocalBridge 将运行所需的工具统一放入安装包，不依赖系统 PATH，也不会在使用过程中临时安装 Python 包。
+## 构建、验证与正式发行
 
-- 内置固定版本的 Python Embedded Runtime
-- 内置 Coding Runtime 和 OpenAI Tunnel 客户端
-- 不需要安装 pip、venv 或 Docker
-- 运行工具随 LocalBridge 版本统一更新，避免环境漂移
-- 无遥测、无使用统计、无崩溃信息上传
-
-当前提供 Windows 安装版。“自包含”表示无需额外准备开发运行环境，不代表免安装 Portable 版本。
-
----
-
-## 下载与使用
-
-当前支持 **Windows 11 x64**。
-
-1. 前往 **[Releases](../../releases)**，下载 `LocalBridge_0.1.5_x64-setup.exe`。
-2. 安装后选择本地项目并完成连接设置。
-3. 根据应用引导创建 **Local Bridge** ChatGPT 插件连接。
-4. 回到 ChatGPT，开始处理本地开发或系统维护任务。
-
-## 权限与安全
-
-LocalBridge 提供编辑、完整和管理员三种权限模式。管理员操作通过明确确认和 Windows UAC 启用；Tunnel 模式的 Runtime API Key 保存在 Windows 安全凭据中，不写入普通配置文件。本地模式不需要 Tunnel ID 或 Runtime API Key。
-
-完整的权限边界和安全设计见 [SECURITY.md](SECURITY.md)。
-
----
-
-## 从源码构建
-
-开发者需要 Git、Node.js 24、Rust 1.85.0、MSVC 构建工具及 Windows SDK；社区源码构建还需要 Go 1.26.2。完整流程见 [社区构建说明](docs/COMMUNITY-BUILD.md)：
+开发者需要 Node.js 24、Rust 1.85.0、MSVC 与 Windows SDK；社区源码构建另需 Go 1.26.2。锁文件与校验保留：
 
 ```powershell
 node scripts/test/ci-gate.mjs
 ```
 
----
+安装包与扩展必须来自同次验证。正式发布使用成功 Community Build 的现有产物，不再次执行 Windows 编译；工作流不会随普通推送或标签自动发布。详见 [社区构建说明](docs/COMMUNITY-BUILD.md)、[配套发行说明](docs/PRODUCT-DISTRIBUTION.md) 和 [网页检查报告](docs/CHATGPT-WEB-TEST-REPORT.md)。
 
 ## License
 
-LocalBridge 自有源码使用 [MIT License](LICENSE)。第三方组件保持各自许可证，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+自有源码采用 [MIT License](LICENSE)。上游与第三方组件保留原版权和许可证，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

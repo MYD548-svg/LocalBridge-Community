@@ -13,7 +13,7 @@ fn production_update_projection_exposes_the_official_release_source() {
     assert_eq!(projection.current_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(
         projection.release_url.as_deref(),
-        Some("https://github.com/zephyr7030/LocalBridge/releases")
+        Some("https://github.com/MYD548-svg/LocalBridge-Community/releases")
     );
     assert!(projection.retryable);
     let serialized = serde_json::to_value(&projection).expect("update command result serializes");
@@ -21,18 +21,18 @@ fn production_update_projection_exposes_the_official_release_source() {
     assert_eq!(serialized["currentVersion"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
         serialized["releaseUrl"],
-        "https://github.com/zephyr7030/LocalBridge/releases"
+        "https://github.com/MYD548-svg/LocalBridge-Community/releases"
     );
 
     let release = release_projection(&crate::domain::GitHubRepository::official(), &lifecycle)
         .expect("the fixed official release URL must be allowed");
     assert_eq!(
         release.release_url,
-        "https://github.com/zephyr7030/LocalBridge/releases"
+        "https://github.com/MYD548-svg/LocalBridge-Community/releases"
     );
     assert_eq!(
         serde_json::to_value(&release).expect("open-release command result serializes")["releaseUrl"],
-        "https://github.com/zephyr7030/LocalBridge/releases"
+        "https://github.com/MYD548-svg/LocalBridge-Community/releases"
     );
 }
 
@@ -101,16 +101,20 @@ fn main_projection_json_contract_matches_the_frontend_fixture() {
             state: "current",
             current_version: "0.1.4".into(),
             latest_version: None,
-            release_url: Some("https://github.com/zephyr7030/LocalBridge/releases".into()),
+            release_url: Some(
+                "https://github.com/MYD548-svg/LocalBridge-Community/releases".into(),
+            ),
             operation_id: Some("update-1".into()),
             attempt: None,
             retryable: true,
+            failure_reason: None,
         }),
         active_faults: vec![UiFaultProjection {
             code: "Authority.BrokerUnavailable".into(),
             category: "authorization",
             message: "Privilege broker is unavailable".into(),
             retryable: true,
+            failure_reason: None,
         }],
     };
     let backend = serde_json::to_value(projection).unwrap();
@@ -272,6 +276,7 @@ fn presentation_codes_are_stable_and_never_direct_internal_enum_names() {
             operation_id: Some("update-1".into()),
             attempt: None,
             retryable: true,
+            failure_reason: None,
         }),
         active_faults: vec![],
     })

@@ -10,6 +10,7 @@ import { verifyRuntime, verifyHash, sha256, rejectExtras, installerEntryPaths, r
 import { runStages } from "./process.mjs";
 import { validateCheckout } from "./source-check.mjs";
 
+import { copyReleaseInputs, stageFixtureExtension } from "./product-release-fixture.mjs";
 const root = resolve(import.meta.dirname, "../..");
 // Fixtures are retained: this repository forbids automatic bulk deletion.
 // Runners expose %TEMP% in 8.3 short form; canonicalize so fixture paths and
@@ -106,6 +107,8 @@ test("complete bundled trees pass; changed runtime source fails", () => {
     mkdirSync(dirname(join(directory, path)), { recursive: true });
     cpSync(join(root, path), join(directory, path), { recursive: true });
   }
+  copyReleaseInputs(directory);
+  stageFixtureExtension(directory);
   assert.throws(() => verifyRuntime(directory), /missing/); // no staged toolbox
   const lock = JSON.parse(readFileSync(join(directory, "provenance/runtime-lock.json"), "utf8"));
   let manifest = readFileSync(join(directory, "runtime-manifest.toml"), "utf8");
@@ -140,10 +143,10 @@ test("complete bundled trees pass; changed runtime source fails", () => {
   assert.throws(() => verifyRuntime(directory), /missing/);
   put(directory, evidencePath, evidenceJson);
   assert.equal(verifyRuntime(directory).status, "PASS");
-  for (const path of ["src-tauri/target/browser-host-stage/localbridge-browser-host.exe", "src-tauri/target/browser-host-stage/native-host-template.json"]) {
+  for (const path of ["src-tauri/target/browser-host-stage/localbridge-browser-host.exe", "src-tauri/target/browser-host-stage/native-host-template.json", "src-tauri/target/browser-extension-stage/extension.zip"]) {
     const original = readFileSync(join(directory, path));
     put(directory, path, "tampered-browser-payload");
-    assert.throws(() => verifyRuntime(directory), /SHA256 mismatch/);
+    assert.throws(() => verifyRuntime(directory), /SHA256 mismatch|bundled extension/);
     put(directory, path, original);
   }
   const aria = "src-tauri/target/toolbox-stage/bin/aria2c.exe";

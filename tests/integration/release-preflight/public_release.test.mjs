@@ -12,6 +12,9 @@ assert.equal(isPublicPath("src/App.tsx"), true);
 assert.equal(isPublicPath("src-tauri/src/lib.rs"), true);
 assert.equal(isPublicPath("README.md"), true);
 assert.equal(isPublicPath("scripts/prepare-lb018-resources.mjs"), true);
+for (const path of ["product-release.json", "scripts/release-contract.mjs", "scripts/release-candidate.mjs", "docs/PRODUCT-DISTRIBUTION.md"]) {
+  assert.equal(isPublicPath(path), true, `paired release input must survive public export: ${path}`);
+}
 assert.equal(isPrivatePath("compatibility/coding-tools/0.2.2/tools-list.json"), false);
 assert.equal(isPublicPath("compatibility/coding-tools/0.2.2/tools-list.json"), true);
 assert.equal(isPrivatePath("compatibility/coding-tools/0.2.2/run-help.txt"), true);

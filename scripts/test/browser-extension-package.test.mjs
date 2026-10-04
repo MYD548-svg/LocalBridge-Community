@@ -4,7 +4,9 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { extensionId, makeZip, readStoredZip, safePackageName, sha256, verifyExtensionFiles, verifyExtensionArchive } from "./browser-extension-package.mjs";
-import { buildBrowserExtension } from "../build-browser-extension.mjs";
+import { copyReleaseInputs } from "./product-release-fixture.mjs";
+import { verifyBundledExtension } from "../release-contract.mjs";
+import { buildBrowserExtension, ensureBrowserExtension } from "../build-browser-extension.mjs";
 test("stored release ZIP roundtrips Unicode and rejects corruption and aliases", () => {
   const files = new Map([["manifest.json", Buffer.from("{}")], ["图解.txt", Buffer.from("中文 空格")]]);
   const archive = makeZip(files), read = readStoredZip(archive);
@@ -21,6 +23,7 @@ for (const development of [false, true]) {
   for (const failure of ["identity", "source", "typecheck", "bundle", "empty", "hash"]) {
     test(`${development ? "development" : "release"} extension failure invalidates old PASS: ${failure}`, async () => {
       const repository = mkdtempSync(join(tmpdir(), "localbridge-extension-build-regression-"));
+      copyReleaseInputs(repository);
       const source = join(repository, "extensions/chatgpt-web");
       const evidence = join(repository, development ? "tests/artifacts/browser-extension-dev" : "tests/artifacts/browser-extension");
       const put = (path, bytes) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, bytes); };
@@ -36,6 +39,7 @@ for (const development of [false, true]) {
       };
       const old = await buildBrowserExtension(options);
       assert.equal(old.status, "PASS");
+      if (!development) assert.equal(verifyBundledExtension(repository).extension.asset.sha256, old.sha256);
       assert.equal(verifyExtensionArchive(old.archive, repository, development).extensionId, old.extensionId);
       put(join(evidence, "user.txt"), "preserved");
       let checked = 0;
@@ -57,6 +61,7 @@ for (const development of [false, true]) {
       await assert.rejects(buildBrowserExtension(next));
       const failed = JSON.parse(readFileSync(evidencePath));
       assert.equal(failed.status, "FAIL");
+      if (!development) assert.throws(() => verifyBundledExtension(repository));
       assert.equal(failed.development, development);
       assert.equal(failed.sha256, undefined);
       if (failure === "identity" || failure === "source") assert.equal(checked, 0);
@@ -89,4 +94,23 @@ test("package metadata rejects tampering, missing entrypoints and a wrong protoc
   files.set("background.js",Buffer.from("tampered")); assert.throws(() => verifyExtensionFiles(files,identity), /hash/);
   files.set("background.js",Buffer.from("fixture")); metadata.protocol=2; stamp(); assert.throws(() => verifyExtensionFiles(files,identity), /metadata/);
   metadata.protocol=1; metadata.files["background.js"] = sha256("fixture"); files.delete("background.js"); stamp(); assert.throws(() => verifyExtensionFiles(files,identity));
+});
+
+test("unchanged verified ZIP is reused, and source or staged corruption forces rebuilding", async () => {
+  const repository = mkdtempSync(join(tmpdir(), "localbridge-extension-reuse-"));
+  copyReleaseInputs(repository);
+  for (const name of ["popup.html", "popup.css"]) writeFileSync(join(repository, "extensions/chatgpt-web", name), "fixture asset");
+  let builds = 0;
+  const options = { repository, checkout: () => "a".repeat(40), worktree: () => false,
+    typecheck: () => { builds++; },
+    bundle: async config => { mkdirSync(config.build.outDir, { recursive: true }); writeFileSync(join(config.build.outDir, config.build.lib.fileName()), "fixture compiled script"); } };
+  const first = await ensureBrowserExtension(options);
+  const reused = await ensureBrowserExtension(options);
+  assert.equal(builds, 1); assert.equal(reused.sha256, first.sha256); assert.equal(reused.directory, first.directory);
+  writeFileSync(join(repository, "extensions/chatgpt-web/popup.css"), "changed source");
+  const changed = await ensureBrowserExtension(options);
+  assert.equal(builds, 2); assert.notEqual(changed.sha256, first.sha256);
+  writeFileSync(join(repository, "src-tauri/target/browser-extension-stage/extension.zip"), "corrupt");
+  const repaired = await ensureBrowserExtension(options);
+  assert.equal(builds, 3); assert.equal(verifyBundledExtension(repository).extension.asset.sha256, repaired.sha256);
 });

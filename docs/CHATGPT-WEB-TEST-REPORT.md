@@ -1,4 +1,41 @@
-# ChatGPT 网页集成 Action 修复检查报告
+# 下载来源与扩展引导实施检查报告
+
+日期：2026-10-04（UTC）。分支：codex/chatgpt-web-integration。代码基线：b67d03e430932d870589dd9aa9e11f234b196d1d。依据：[产品发行与引导说明](PRODUCT-DISTRIBUTION.md)。最终提交号和远端核对结果在交付回复中记录，不为补写 SHA 再次推送。
+
+## 本轮修改与检查结论
+
+产品更新和扩展附件统一使用本仓库。主程序更新按发行清单中的数字版本比较；当前版本扩展另行校验来源提交、身份、协议和兼容范围，不用当前扩展的限制误挡未来主程序升级。没有正式 Release 时如实返回无发布状态，不回退到上游。
+
+构建链将同一份已验证发行 ZIP 用于安装资源和独立附件。应用核对内置描述、包哈希与编译提交后准备固定目录；首次安装、重复准备、替换及较旧内置包分别处理。六步引导、扩展弹窗与安装图解同步更新，文件准备、配对、当前聊天启用和真实工具成功分别呈现。操作错误不会被成功轮询清掉，首次只读调用只填入说明，仍需用户发送和确认执行。
+
+| 检查 | 状态 | 结果及边界 |
+| --- | --- | --- |
+| 桌面前端测试 | PASS | 32 项，包含接口状态、精确附件归属与向导前置条件 |
+| 扩展测试 | PASS | 17 项，包含按状态提示、首次只读说明、不自动执行及保留待处理请求 |
+| TypeScript / 生产构建 | PASS | npm run build；桌面及发行扩展生成成功，实际 ZIP 校验通过 |
+| 扩展资源复用 | PASS | 第二次 build:extension 返回 REUSED；提交、构建输入、ZIP 和内置描述一致才复用 |
+| 开发包隔离 | PASS | 实际开发构建成功；发行 ZIP 和 bundle.json 哈希未改变，开发身份与输出目录不同 |
+| 跨平台 Node 检查 | PASS | 88 项，0 FAIL、0 SKIPPED；包含发行候选来源/附件、资源复用、旧 PASS 失效及原构建回归 |
+| 平台无关 Rust 模块 | PASS | 21 项；原发行/更新/包管理模块通过，Clippy -D warnings 通过 |
+| 许可证 | PASS | npm 166、Cargo 484；扩展 ZIP 纳入原 LICENSE，依赖锁文件不变 |
+| 架构/公开导出 | PASS | schema44 残留扫描、公开导出规则检查 |
+| 格式与敏感信息 | PASS | 修改的 Rust 文件格式检查、git diff --check；高置信敏感信息为零 |
+| workflow | PASS（静态） | 三份 YAML 解析；主分支/普通分支触发范围分开，tag 不构建；发布仅手动、默认关闭 |
+| Windows Python 包装入口 | UNVERIFIED | 完整 Node 批次为 88 PASS、1 FAIL；失败为 Linux 无法执行 Windows python.exe（EACCES）。该项仍在 Windows CI 中，未删减门禁 |
+| Windows/MSVC/Tauri/原生管道 | NOT_RUN | 未在当前 Linux 工作区执行完整应用编译与原生行为测试 |
+| 实际 NSIS 安装资源 | NOT_RUN | 新 ZIP/描述提取与哈希核验已接入原 Windows 门禁，本机未以旧 EXE 替代 |
+| Edge/Chrome/真实 ChatGPT/干净安装 | NOT_RUN | 需实际浏览器和 Windows 环境验收，单元测试与构建不能代替 |
+| 新 GitHub Actions / 正式发布 | UNVERIFIED / NOT_RUN | 本轮不查询新 Action 状态，不创建 tag 或 Release，不执行发布 workflow |
+
+Rust 检查采用临时 Linux harness，按路径引用仓库原模块；仅临时目录前缀和 Windows 原子替换适配为 Linux 实现。它不覆盖 Windows MoveFileEx、Tauri 命令、注册表、宿主及管道行为，不能视为完整 Windows 应用测试。
+
+本地构建包含基线 HEAD 与未提交改动，生成文件保留在忽略目录，不作为最终正式发行证据。最终云端候选必须在新提交上重新经过既有十九阶段门禁；安装 EXE、ZIP、宿主与清单要求同源。新增手动发布配置只复用成功 Community Build 的配套候选，不重编译、不覆盖旧发行。
+
+交付边界：一次普通提交和推送，仅用 git ls-remote 核对远端 SHA，随后停止。不强推、不 rerun、不监控新 Actions、不创建 PR/tag/Release。以下保留此前 Action 修复的历史记录，其计数和当时的构建行为不代表本轮结果。
+
+---
+
+# 历史记录：ChatGPT 网页集成 Action 修复检查报告
 
 日期：2026-10-04（香港时间）。分支：codex/chatgpt-web-integration。修复基线：11f80f2617094ccba490131671f983c2d744bfbc。最终上传 SHA 与远端核对结果以本次交付回复为准；不为补写 SHA 再次推送。
 

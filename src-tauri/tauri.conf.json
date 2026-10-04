@@ -5,7 +5,7 @@
   "identifier": "com.localbridge.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "node scripts/prepare-lb018-resources.mjs && npm run build",
+    "beforeBuildCommand": "npm run build && node scripts/prepare-lb018-resources.mjs",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../tests/artifacts/frontend-dist"
   },
@@ -37,6 +37,8 @@
       "target/local-mcp-stage/localbridge-mcp.exe": "localbridge-mcp.exe",
       "target/browser-host-stage/localbridge-browser-host.exe": "localbridge-browser-host.exe",
       "target/browser-host-stage/native-host-template.json": "native-host-template.json",
+      "target/browser-extension-stage/extension.zip": "browser-extension/extension.zip",
+      "target/browser-extension-stage/bundle.json": "browser-extension/bundle.json",
       "../docs/licenses/mcp-proxy-MIT.txt": "licenses/mcp-proxy-MIT.txt"
     },
     "windows": {

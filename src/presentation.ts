@@ -65,6 +65,6 @@ export function updateStatusText(update: UpdateProjection | null, status: Projec
     case "checking": return `当前版本 ${update.currentVersion} · 正在检查更新`;
     case "current": return `当前版本 ${update.currentVersion} · 已是最新版本`;
     case "available": return `发现新版本 ${update.latestVersion ?? ""}`.trim();
-    case "failed": return `当前版本 ${update.currentVersion} · 检查失败`;
+    case "failed": return `当前版本 ${update.currentVersion} · ${update.failureReason || "检查失败"}`;
   }
 }

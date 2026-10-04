@@ -1,9 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="860" height="280" viewBox="0 0 860 280">
-<rect width="860" height="280" rx="20" fill="#e9f0fb"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="610" viewBox="0 0 960 610" role="img" aria-labelledby="title desc">
+<title id="title">LocalBridge 网页扩展六步操作示意</title><desc id="desc">从应用准备配套扩展，分别在 Edge 或 Chrome 加载固定目录，再连接、批准配对、启用当前聊天并确认首次只读调用。</desc>
+<rect width="960" height="610" rx="20" fill="#e9f0fb"/>
 <g font-family="Microsoft YaHei,system-ui,sans-serif" fill="#17345a">
-<text x="28" y="42" font-size="23" font-weight="bold">首次连接：四步准备</text>
-<g fill="white" stroke="#bdd0ea"><rect x="25" y="65" width="185" height="170" rx="15"/><rect x="235" y="65" width="185" height="170" rx="15"/><rect x="445" y="65" width="185" height="170" rx="15"/><rect x="655" y="65" width="180" height="170" rx="15"/></g>
-<g font-size="19" font-weight="bold"><text x="42" y="100">① 安装应用</text><text x="251" y="100">② 导入扩展 ZIP</text><text x="462" y="100">③ 浏览器加载</text><text x="672" y="100">④ 确认连接</text></g>
-<g font-size="15"><text x="42" y="138">网关随应用安装</text><text x="42" y="168">启动本地服务</text><text x="42" y="198">选择工作区</text><text x="251" y="138">应用校验并准备</text><text x="251" y="168">固定加载目录</text><text x="251" y="198">复制目录路径</text><text x="462" y="138">开启开发者模式</text><text x="462" y="168">加载解压缩扩展</text><text x="462" y="198">选择复制的目录</text><text x="672" y="138">打开 ChatGPT</text><text x="672" y="168">本机确认配对</text><text x="672" y="198">启用当前聊天</text></g>
-<text x="28" y="262" font-size="14">工具执行和结果发送均由你确认。首次加载后，日常使用只需连接与启用聊天。</text>
+<text x="28" y="42" font-size="25" font-weight="bold">按顺序完成：每一步都有下一项操作</text>
+<g fill="white" stroke="#bdd0ea"><rect x="24" y="65" width="292" height="150" rx="14"/><rect x="334" y="65" width="292" height="150" rx="14"/><rect x="644" y="65" width="292" height="150" rx="14"/><rect x="24" y="375" width="292" height="155" rx="14"/><rect x="334" y="375" width="292" height="155" rx="14"/><rect x="644" y="375" width="292" height="155" rx="14"/></g>
+<g font-size="20" font-weight="bold"><text x="40" y="101">① 准备本机</text><text x="350" y="101">② 准备配套扩展</text><text x="660" y="101">③ 浏览器手动加载</text><text x="40" y="411">④ 连接并批准配对</text><text x="350" y="411">⑤ 启用当前聊天</text><text x="660" y="411">⑥ 首次只读调用</text></g>
+<g font-size="16"><text x="40" y="139">安装同次构建的 LocalBridge</text><text x="40" y="167">选择项目 · 启动本地服务</text><text x="40" y="195">网页接入使用本地连接模式</text><text x="350" y="139">设置 → ChatGPT 网页</text><text x="350" y="167">点击“准备配套扩展”</text><text x="350" y="195">文件准备后还需浏览器加载</text><text x="660" y="139">开启“开发者模式”</text><text x="660" y="167">手动加载应用提供的固定目录</text><text x="660" y="195">选择含 manifest.json 的目录</text></g>
+<rect x="24" y="233" width="912" height="122" rx="12" fill="#f6f9ff" stroke="#b6cce8"/>
+<g font-size="16"><text x="40" y="266" font-weight="bold">Edge</text><text x="125" y="266">地址栏：edge://extensions → 开发者模式 → 加载解压缩的扩展</text><text x="40" y="301" font-weight="bold">Chrome</text><text x="125" y="301">地址栏：chrome://extensions → 开发者模式 → 加载已解压的扩展程序</text><text x="40" y="334" font-size="14">浏览器加载请选择固定目录；下载的 ZIP 用于在 LocalBridge 中导入。</text></g>
+<g font-size="16"><text x="40" y="449">ChatGPT → 扩展 → 连接</text><text x="40" y="477">回 LocalBridge 核对项目与权限</text><text x="40" y="505">点击“批准配对”</text><text x="350" y="449">回扩展点击“启用此聊天”</text><text x="350" y="477">看到“当前聊天已启用”</text><text x="350" y="505">刷新或切换聊天后重新启用</text><text x="660" y="449">点击“准备首次只读调用”</text><text x="660" y="477">手动发送 · 核对请求 · 确认执行</text><text x="660" y="505">查看真实结果，回填后手动发送</text></g>
+<text x="28" y="565" font-size="15">升级：停止并断开 → 关闭浏览器扩展 → 应用准备新版 → 重新启用/加载 → 刷新 ChatGPT</text>
+<text x="28" y="592" font-size="14">这是操作示意。当前聊天状态看扩展窗口；按钮名称可能随浏览器版本或语言略有变化。</text>
 </g></svg>

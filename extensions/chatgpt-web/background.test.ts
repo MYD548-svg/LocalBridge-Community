@@ -41,7 +41,8 @@ beforeEach(async () => {
         else if (message.type === "mcp" && message.payload.id) {
           const method = message.payload.method;
           const result = method === "initialize" ? { protocolVersion: "2025-11-25" } : method === "tools/list"
-            ? { tools: [{ name: "filesystem", description: "read", inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } }] }
+            ? { tools: [{ name: "filesystem", description: "read", inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } },
+              { name: "workspace_context", description: "read project context", inputSchema: { type: "object", properties: {}, additionalProperties: false } }] }
             : { isError: false, content: [{ type: "text", text: "实际结果" }], structuredContent: { output_refs: { stdout: "retained" } } };
           response = { version: 1, type: "mcp", payload: { jsonrpc: "2.0", id: message.payload.id,
             ...(unknown && method === "tools/call" ? { error: { code: -32011, message: "unknown" } } : { result }) } };
@@ -61,6 +62,21 @@ describe("mock native host and extension confirmation flow", () => {
   async function enabled(): Promise<void> { expect((await action("enable")).ok).toBe(true); }
   async function observed(): Promise<void> { expect((await action("observe", { chat: binding, ...candidate }, sender)).ok).toBe(true); }
   const calls = () => requests.filter(request => request.payload?.method === "tools/call");
+  it("first-use guidance fills only read-only instructions and never executes or sends", async () => {
+    expect((await action("first_call")).ok).toBe(false);
+    await enabled();
+    const response = await action("first_call");
+    expect(response.ok).toBe(true);
+    expect(response.value.selected).toEqual(["workspace_context"]);
+    expect(pageRequest.mock.calls.find(([, request]) => request.type === "fill")?.[1].text).toContain("workspace_context");
+    expect(calls()).toHaveLength(0);
+  });
+  it("first-use guidance cannot discard a request already waiting for confirmation", async () => {
+    await enabled(); await observed();
+    expect((await action("first_call")).ok).toBe(false);
+    expect((await action("read")).value.status).toBe("pending");
+    expect(calls()).toHaveLength(0);
+  });
   it("does not execute observations or fill results until separate popup confirmations", async () => {
     await enabled(); await observed(); expect(calls()).toHaveLength(0);
     expect((await action("execute")).value.status).toBe("succeeded"); expect(calls()).toHaveLength(1);

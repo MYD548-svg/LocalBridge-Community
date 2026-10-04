@@ -17,6 +17,10 @@ pub struct Metadata {
     pub protocol: u32,
     pub application: String,
     pub extension_id: String,
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub source_commit: Option<String>,
     pub files: BTreeMap<String, String>,
 }
 pub fn directory() -> io::Result<PathBuf> {
@@ -79,7 +83,7 @@ fn safe_existing_path(path: &Path) -> io::Result<()> {
 fn validate(files: &BTreeMap<String, Vec<u8>>) -> io::Result<Metadata> {
     let bytes = files
         .get(METADATA)
-        .ok_or_else(|| io::Error::other("请选择发行扩展 ZIP，源码包不能直接加载"))?;
+        .ok_or_else(|| io::Error::other("这不是可导入的扩展包。请在 Actions 附件解压后选择 LocalBridge-ChatGPT-Web-v…zip；不要选择 Source code ZIP 或外层附件 ZIP。"))?;
     let metadata: Metadata =
         serde_json::from_slice(bytes).map_err(|_| io::Error::other("扩展包说明损坏"))?;
     let app = semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(io::Error::other)?;
@@ -88,11 +92,27 @@ fn validate(files: &BTreeMap<String, Vec<u8>>) -> io::Result<Metadata> {
         || metadata.protocol != super::PROTOCOL_VERSION
         || !compatible.matches(&app)
         || metadata.extension_id != super::EXTENSION_ID.trim()
-        || metadata.application != ">=0.1.5, <0.2.0"
+        || metadata.application
+            != crate::domain::distribution::configuration().application_compatibility
         || metadata.files.len() > MAX_FILES
         || metadata.files.len() + 1 != files.len()
     {
-        return Err(io::Error::other("扩展版本、身份或文件清单不兼容"));
+        return Err(io::Error::other(format!(
+            "扩展 {} 与当前应用 {} 的身份、协议或文件清单不兼容。请使用内置扩展，或下载同次构建的安装包与 ZIP。",
+            metadata.version, app
+        )));
+    }
+    if !crate::domain::distribution::numeric_version(&metadata.version)
+        || metadata.repository.as_ref().is_some_and(|repository| {
+            repository != &crate::domain::distribution::configuration().repository
+        })
+        || metadata.source_commit.as_ref().is_some_and(|source| {
+            source.len() != 40 || !source.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(io::Error::other(
+            "扩展版本或产品来源说明错误，请选择本项目的发行 ZIP",
+        ));
     }
     for (name, digest) in &metadata.files {
         if !safe_name(name)
@@ -245,6 +265,105 @@ pub fn installed(target: &Path) -> io::Result<Option<Metadata>> {
     }
     let files = read_package(target)?;
     validate(&files).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Bundle {
+    pub schema_version: u32,
+    pub status: String,
+    pub repository: String,
+    pub channel: String,
+    pub application_version: String,
+    pub source_commit: String,
+    pub extension: crate::domain::distribution::ReleaseExtension,
+}
+
+pub fn bundled(source: &Path) -> io::Result<Bundle> {
+    safe_existing_path(source)?;
+    let description = source.join("bundle.json");
+    safe_existing_path(&description)?;
+    if fs::metadata(&description)?.len() > 64 * 1024 {
+        return Err(io::Error::other("内置扩展说明过大"));
+    }
+    let bundle: Bundle =
+        serde_json::from_slice(&fs::read(description)?).map_err(io::Error::other)?;
+    let config = crate::domain::distribution::configuration();
+    let archive = source.join("extension.zip");
+    safe_existing_path(&archive)?;
+    let size = fs::metadata(&archive)?.len();
+    if size == 0 || size > MAX_PACKAGE || size != bundle.extension.asset.size {
+        return Err(io::Error::other("内置扩展大小校验失败"));
+    }
+    if bundle.schema_version != 1
+        || bundle.status != "PASS"
+        || bundle.repository != config.repository
+        || bundle.channel != config.channel
+        || bundle.application_version != env!("CARGO_PKG_VERSION")
+        || bundle.source_commit != env!("LOCALBRIDGE_SOURCE_COMMIT")
+        || hash(&fs::read(&archive)?) != bundle.extension.asset.sha256
+    {
+        return Err(io::Error::other(
+            "内置扩展与当前应用来源或校验和不匹配，请获取本项目的配套安装包",
+        ));
+    }
+    let metadata = inspect(&archive)?;
+    if metadata.version != bundle.extension.version
+        || metadata.protocol != bundle.extension.protocol
+        || metadata.extension_id != bundle.extension.extension_id
+        || metadata.application != bundle.extension.application
+        || metadata.repository.as_deref() != Some(bundle.repository.as_str())
+        || metadata.source_commit.as_deref() != Some(bundle.source_commit.as_str())
+        || bundle.extension.asset.name
+            != format!("LocalBridge-ChatGPT-Web-v{}.zip", metadata.version)
+    {
+        return Err(io::Error::other("内置扩展元数据不一致"));
+    }
+    Ok(bundle)
+}
+
+pub fn inspect(source: &Path) -> io::Result<Metadata> {
+    validate(&read_package(source)?)
+}
+
+pub fn prepare(
+    source: &Path,
+    target: &Path,
+    confirmed_disabled: bool,
+    active_connections: usize,
+    bundled: bool,
+) -> io::Result<(Metadata, bool)> {
+    if active_connections != 0 {
+        return Err(io::Error::other(
+            "仍有浏览器连接，请先在所有 LocalBridge 扩展窗口点击‘停止并断开’，再关闭浏览器中的扩展开关",
+        ));
+    }
+    recover(target)?;
+    let previous = installed(target)?;
+    if previous.is_some() && !confirmed_disabled {
+        return Err(io::Error::other(
+            "更新扩展前，请停止并断开工具，在浏览器扩展管理页关闭 LocalBridge，再勾选确认",
+        ));
+    }
+    let metadata = inspect(source)?;
+    if let Some(previous) = previous {
+        if bundled
+            && semver::Version::parse(&metadata.version).map_err(io::Error::other)?
+                < semver::Version::parse(&previous.version).map_err(io::Error::other)?
+        {
+            return Err(io::Error::other(
+                "已准备的扩展版本更新，不能用较旧的内置包覆盖。请保留现有版本或明确选择配套 ZIP",
+            ));
+        }
+        if metadata.version == previous.version
+            && metadata.files == previous.files
+            && metadata.source_commit == previous.source_commit
+            && metadata.repository == previous.repository
+        {
+            return Ok((metadata, true));
+        }
+    }
+    import(source, target).map(|metadata| (metadata, false))
 }
 fn transaction(target: &Path, value: &Value) -> io::Result<()> {
     let parent = target
@@ -440,6 +559,8 @@ mod tests {
             protocol: 1,
             application: ">=0.1.5, <0.2.0".into(),
             extension_id: super::super::EXTENSION_ID.trim().into(),
+            repository: None,
+            source_commit: None,
             files: files
                 .iter()
                 .map(|(name, bytes)| (name.clone(), hash(bytes)))
@@ -491,6 +612,48 @@ mod tests {
             b"preserved"
         );
     }
+    #[test]
+    fn preparation_distinguishes_first_install_replacement_and_active_connections() {
+        let source = fixture("first");
+        let target = source.join("managed/current");
+        let (_, unchanged) = prepare(&source, &target, false, 0, false).unwrap();
+        assert!(!unchanged);
+        let next = fixture("next");
+        assert!(prepare(&next, &target, false, 0, false).is_err());
+        assert!(prepare(&next, &target, true, 1, false).is_err());
+        assert_eq!(fs::read(target.join("background.js")).unwrap(), b"first");
+        prepare(&next, &target, true, 0, false).unwrap();
+        assert_eq!(fs::read(target.join("background.js")).unwrap(), b"next");
+        assert!(prepare(&next, &target, true, 0, false).unwrap().1);
+    }
+
+    #[test]
+    fn older_bundled_files_do_not_silently_replace_newer_managed_extension() {
+        let old = fixture("old");
+        let newer = fixture("newer");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(newer.join("manifest.json")).unwrap()).unwrap();
+        manifest["version"] = Value::String("0.1.6".into());
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(newer.join("manifest.json"), &bytes).unwrap();
+        let mut metadata = inspect(&old).unwrap();
+        metadata.version = "0.1.6".into();
+        metadata.files = read_package(&newer)
+            .unwrap()
+            .into_iter()
+            .filter(|(name, _)| name != METADATA)
+            .map(|(name, bytes)| (name, hash(&bytes)))
+            .collect();
+        fs::write(newer.join(METADATA), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let target = old.join("managed/current");
+        prepare(&newer, &target, false, 0, false).unwrap();
+        assert!(prepare(&old, &target, true, 0, true).is_err());
+        assert_eq!(installed(&target).unwrap().unwrap().version, "0.1.6");
+        prepare(&old, &target, true, 0, false).unwrap();
+        assert_eq!(installed(&target).unwrap().unwrap().version, "0.1.5");
+        assert!(bundled(&old.join("missing-resources")).is_err());
+    }
+
     #[test]
     fn zip_path_traversal_and_unmanaged_directory_are_preserved_and_rejected() {
         use std::io::Write;

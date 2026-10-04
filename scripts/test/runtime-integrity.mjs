@@ -4,6 +4,8 @@ import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync } from "n
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { verifyBundledExtension } from "../release-contract.mjs";
+import { verifyExtensionArchive } from "./browser-extension-package.mjs";
 
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 export function requiredFile(path) {
@@ -72,7 +74,7 @@ function resolveInstallerSevenZip(root) {
   }
   throw new Error("no 7-Zip installation available for installer payload verification");
 }
-function verifyInstallerPayload(root, evidence, adapterEvidence, hostEvidence) {
+function verifyInstallerPayload(root, evidence, adapterEvidence, hostEvidence, extensionBundle) {
   const bundleDir = join(root, "src-tauri/target/release/bundle/nsis");
   if (!existsSync(bundleDir)) return;
   const installers = filesBelow(bundleDir).filter((name) => name.endsWith("-setup.exe"));
@@ -93,18 +95,23 @@ function verifyInstallerPayload(root, evidence, adapterEvidence, hostEvidence) {
   const hostEntry = paths.find((path) => path.toLowerCase() === "localbridge-browser-host.exe");
   const templateEntry = paths.find((path) => path.toLowerCase() === "native-host-template.json");
   if (!hostEntry || !templateEntry) throw new Error("installer browser gateway or manifest missing");
+  const extensionEntry = paths.find(path => path.replaceAll("\\", "/").toLowerCase() === "browser-extension/extension.zip");
+  const bundleEntry = paths.find(path => path.replaceAll("\\", "/").toLowerCase() === "browser-extension/bundle.json");
+  if (!extensionEntry || !bundleEntry) throw new Error("installer bundled extension missing");
   // Extraction is retained: this repository forbids automatic bulk deletion.
   const extraction = mkdtempSync(join(tmpdir(), "localbridge-installer-verify-"));
   const unpacked = spawnSync(sevenZip, ["x", "-y", `-o${extraction}`, installer, brokerEntry, adapterEntry, licenseEntry], { windowsHide: true });
   if (unpacked.status !== 0) throw new Error(`installer broker extraction failed (${unpacked.status ?? unpacked.error})`);
   verifyHash(join(extraction, brokerEntry), evidence.sha256);
   verifyHash(join(extraction, adapterEntry), adapterEvidence.sha256);
-  for (const entry of [hostEntry, templateEntry]) {
+  for (const entry of [hostEntry, templateEntry, extensionEntry, bundleEntry]) {
     const extracted = spawnSync(sevenZip, ["x", "-y", "-o" + extraction, installer, entry], { windowsHide: true });
     if (extracted.status !== 0) throw new Error("browser payload extraction failed");
   }
   verifyHash(join(extraction, hostEntry), hostEvidence.sha256);
   verifyHash(join(extraction, templateEntry), hostEvidence.templateSha256);
+  verifyHash(join(extraction, extensionEntry), extensionBundle.extension.asset.sha256);
+  verifyHash(join(extraction, bundleEntry), sha256(requiredFile(join(root, "src-tauri/target/browser-extension-stage/bundle.json"))));
   verifyHash(join(extraction, licenseEntry), sha256(requiredFile(join(root, "docs/licenses/mcp-proxy-MIT.txt"))));
   console.log(`installer payload verified; broker extraction retained at ${extraction}`);
 }
@@ -197,7 +204,15 @@ export function verifyRuntime(root, { bundledOnly = false, lockFile = "provenanc
   if (template.name !== identity.host || template.path !== "localbridge-browser-host.exe" || template.type !== "stdio" || JSON.stringify(template.allowed_origins) !== JSON.stringify(["chrome-extension://" + identity.id + "/"])) throw new Error("browser host registration template drift");
   if (config?.bundle?.resources?.["target/browser-host-stage/localbridge-browser-host.exe"] !== "localbridge-browser-host.exe" || config?.bundle?.resources?.["target/browser-host-stage/native-host-template.json"] !== "native-host-template.json") throw new Error("installer must embed the attested browser gateway");
   rejectExtras(dirname(host), ["localbridge-browser-host.exe", "browser-host-build.json", "native-host-template.json"]);
-  verifyInstallerPayload(root, evidence, adapterEvidence, hostEvidence);
+  const extensionBundle = verifyBundledExtension(root);
+  const extensionDirectory = join(root, "src-tauri/target/browser-extension-stage");
+  const extension = verifyExtensionArchive(join(extensionDirectory, "extension.zip"), root);
+  if (extensionBundle.sourceCommit !== hostEvidence.sourceSha || extension.version !== extensionBundle.extension.version
+    || extension.repository !== extensionBundle.repository || extension.sourceCommit !== extensionBundle.sourceCommit) throw new Error("bundled extension source or version mismatch");
+  if (config?.bundle?.resources?.["target/browser-extension-stage/extension.zip"] !== "browser-extension/extension.zip"
+    || config?.bundle?.resources?.["target/browser-extension-stage/bundle.json"] !== "browser-extension/bundle.json") throw new Error("installer must embed the verified extension ZIP and bundle descriptor");
+  rejectExtras(extensionDirectory, ["extension.zip", "bundle.json"]);
+  verifyInstallerPayload(root, evidence, adapterEvidence, hostEvidence, extensionBundle);
   rejectExtras(dirname(broker), ["localbridge-privileged-broker.exe", "broker-build.json"]);
   }
   return { status: "PASS", coverage: bundledOnly ? "bundled-only" : "bundled-and-staged" };

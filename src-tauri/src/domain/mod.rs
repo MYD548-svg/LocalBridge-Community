@@ -1,3 +1,4 @@
+pub mod distribution;
 pub mod error;
 pub mod execution;
 pub mod identity;
@@ -16,6 +17,5 @@ pub use lifecycle::{LifecycleState, TerminalOutcome};
 pub use session::McpSessionState;
 pub use task::{SafeTaskSummary, TaskKind, TaskRecord};
 pub use update::{
-    GitHubRepository, OFFICIAL_GITHUB_REPOSITORY, ProductVersion, ReleaseDiscovery,
-    UpdateCheckTrigger, UpdateLifecycle,
+    GitHubRepository, ProductVersion, ReleaseDiscovery, UpdateCheckTrigger, UpdateLifecycle,
 };

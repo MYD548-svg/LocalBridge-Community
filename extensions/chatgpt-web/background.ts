@@ -1,3 +1,4 @@
+declare const __LOCALBRIDGE_VERSION__: string;
 import identity from "./identity";
 import { Candidate, Observation, Reassembler, Tool, canonical, fragments, instructions, parseCandidate, record, resultText, validPageSender } from "./core";
 interface ChatState { chat: string; status: string; enabled: boolean; tools: Tool[]; selected: string[]; candidate?: Candidate; result?: unknown; error?: string; activeId?: string }
@@ -140,9 +141,9 @@ async function uiAction(tab: number, request: Record<string, unknown>): Promise<
     const response = await native.request({ version: 1, type: request.type === "connect" ? "pair" : "enable", requestId,
       ...await credentials(), chat: binding.chat, startApp: request.type === "connect" }, requestId);
     chat.status = response?.approved ? "paired" : "awaiting_pairing";
-    chat.error = response?.approved ? undefined : "请在 LocalBridge 的 ChatGPT 网页卡片确认工作区与权限，然后点击启用";
+    chat.error = response?.approved ? undefined : "请回到 LocalBridge → 设置 → ChatGPT 网页，核对项目与权限并批准配对，再返回扩展启用当前聊天";
     if (request.type === "enable" && response?.approved) {
-      const initialized = await native.rpc("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "LocalBridge ChatGPT Web", version: "0.1.5" } });
+      const initialized = await native.rpc("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "LocalBridge ChatGPT Web", version: __LOCALBRIDGE_VERSION__ } });
       if (initialized.error) throw new Error(JSON.stringify(initialized.error));
       native.send({ version: 1, type: "mcp", payload: { jsonrpc: "2.0", method: "notifications/initialized" } });
       const catalog = await native.rpc("tools/list");
@@ -158,6 +159,15 @@ async function uiAction(tab: number, request: Record<string, unknown>): Promise<
   if (request.type === "select") {
     if (!Array.isArray(request.names) || !request.names.every(name => typeof name === "string" && chat!.tools.some(tool => tool.name === name))) throw new Error("工具选择无效");
     chat.selected = request.names as string[]; chat.candidate = undefined; await persist(); return chat;
+  }
+  if (request.type === "first_call") {
+    if (!chat.enabled || chat.candidate || ["running", "unknown", "pending"].includes(chat.status)) throw new Error("请先启用聊天并处理当前请求，再准备首次只读调用");
+    const tool = chat.tools.find(tool => tool.name === "workspace_context");
+    if (!tool) throw new Error("当前工具目录没有 workspace_context，请检查配套应用和扩展版本");
+    chat.selected = [tool.name];
+    await persist();
+    await page(tab, { type: "fill", chat: chat.chat, text: instructions([tool]) + "\n首次连接测试：请仅使用 workspace_context 读取当前项目的基本信息，不修改任何文件。生成请求后，我会在扩展核对并确认执行。" });
+    return chat;
   }
   if (request.type === "instructions") {
     if (!chat.enabled || !chat.selected.length) throw new Error("请启用聊天并选择工具");

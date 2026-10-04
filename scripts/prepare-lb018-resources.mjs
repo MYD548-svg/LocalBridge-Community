@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { rejectExtras, requiredFile, sha256 } from "./test/runtime-integrity.mjs";
 import { runLoggedStageSync } from "./test/stage-runner.mjs";
+import { verifyBundledExtension } from "./release-contract.mjs";
 const root = resolve(import.meta.dirname, "..");
 function run(program, args, repository = root) {
   const binary = args.includes("--bin") ? args[args.indexOf("--bin") + 1] : "toolbox";
@@ -125,6 +126,7 @@ export function prepareResources({ compile = false, repository = root } = {}) {
     }
     for (const path of ["runtime/python/python.exe", "runtime/coding-tools-mcp/coding_tools_mcp/__init__.py", "runtime/tunnel-client/tunnel-client.exe", "runtime-manifest.toml", "runtime-policy.toml", "LICENSE", "THIRD_PARTY_NOTICES.md"]) requiredFile(resolve(repository, path));
     if (/cloudflared|cloudflare managed/i.test(readFileSync(resolve(repository, "runtime-manifest.toml"), "utf8"))) throw new Error("obsolete runtime manifest");
+    verifyBundledExtension(repository);
     run(process.execPath, ["scripts/prepare-toolbox.mjs"], repository);
     const adapterStage = resolve(repository, "src-tauri/target/local-mcp-stage");
     mkdirSync(adapterStage, { recursive: true });

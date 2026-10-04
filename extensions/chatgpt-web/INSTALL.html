@@ -1,6 +1,21 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LocalBridge 扩展安装</title>
-<style>body{max-width:860px;margin:40px auto;padding:0 24px;font:17px/1.8 system-ui;color:#193456;background:#f4f7fc}img{width:100%}li{margin:15px 0}code{background:white;padding:3px 8px;border-radius:6px}</style>
-<h1>把 LocalBridge 接到 ChatGPT 网页</h1><p>首发从 GitHub 下载扩展压缩包。网关已随 LocalBridge 安装，无需启动其他代理或填写密钥。</p><img src="INSTALL.svg" alt="安装 LocalBridge、导入 ZIP、浏览器加载、确认连接四步图解">
-<ol><li>安装 LocalBridge 并启动本地服务，选择允许使用的工作区。</li><li>在“ChatGPT 网页”卡片导入此 ZIP，或选择此解压目录。应用会准备固定加载目录，并提供复制路径按钮。</li><li>Edge 地址栏输入 <code>edge://extensions</code>；Chrome 输入 <code>chrome://extensions</code>。开启“开发者模式”，点击“加载解压缩的扩展”，选择应用提供的目录，目录内应有 manifest.json。</li><li>打开或刷新 ChatGPT 网页，点击工具栏 LocalBridge 图标，选择“连接这台电脑”，在 LocalBridge 确认工作区与权限，再“为此聊天启用工具”。</li><li>选择本轮工具，填入说明并手动发送。助手生成工具请求后，在扩展内检查参数、确认执行、填入实际结果并手动发送。</li></ol>
-<h2>更新与恢复</h2><p>先停止工具并关闭扩展，在 LocalBridge 导入新版 ZIP，再启用扩展、点击“重新加载”并刷新 ChatGPT。固定加载目录请保留；无需保留下载的 ZIP。输入框有草稿时先保存或发送，再回填结果。</p>
-<p>配对撤销后，重置扩展配对身份再申请。企业策略禁止手动加载时，请联系设备管理员。结果未知的请求不会自动重发。回填内容会进入在线聊天。</p></html>
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LocalBridge 网页扩展安装与更新</title>
+<style>body{max-width:960px;margin:32px auto;padding:0 24px;font:17px/1.8 system-ui;color:#193456;background:#f4f7fc}img{width:100%;height:auto}li{margin:12px 0}code{background:white;padding:3px 7px;border-radius:6px;overflow-wrap:anywhere}h2{font-size:23px;margin-top:32px}.notice{padding:14px 18px;border:1px solid #bfd3ef;border-radius:12px;background:#e9f2ff}table{width:100%;border-collapse:collapse;background:white}th,td{padding:10px;border:1px solid #d8e3ef;text-align:left}a{color:#215b98}</style></head>
+<body><h1>把当前 ChatGPT 聊天接到这台电脑</h1><p class="notice">安装包已携带配套扩展。首次安装在 LocalBridge 点击“准备配套扩展”，无需去 GitHub 找 ZIP，也无需填写 API Key、Tunnel ID 或安装 Codex 桌面程序。</p>
+<img src="INSTALL.svg" alt="六步操作示意：准备本机、准备扩展、浏览器加载、批准配对、启用聊天、首次只读调用">
+<h2>按顺序完成六步</h2><ol>
+<li><strong>准备本机。</strong>安装同次构建的 LocalBridge 安装包，打开应用，选择允许使用的项目文件夹，并启动本地服务。网页接入使用“本地连接”模式。</li>
+<li><strong>准备扩展文件。</strong>打开 <code>设置 → ChatGPT 网页 → 开始设置</code>，选择 Edge 或 Chrome，点击 <strong>准备配套扩展（推荐）</strong>。看到文件准备完成后继续；这时浏览器尚需手动加载。</li>
+<li><strong>在浏览器加载。</strong>复制下面的管理页地址，粘贴到浏览器地址栏并按回车。开启“开发者模式”，点击对应加载按钮，选择应用提供的固定加载目录。目录内应有 <code>manifest.json</code>；不要选择下载的 ZIP、下载目录或其上一级文件夹。</li>
+</ol>
+<table><thead><tr><th>浏览器</th><th>地址栏输入</th><th>加载按钮</th></tr></thead><tbody><tr><td>Microsoft Edge</td><td><code>edge://extensions</code></td><td>加载解压缩的扩展</td></tr><tr><td>Google Chrome</td><td><code>chrome://extensions</code></td><td>加载已解压的扩展程序</td></tr></tbody></table><p>按钮名称可能随浏览器版本或语言略有变化；选择手动加载解压目录的按钮。</p>
+<ol start="4">
+<li><strong>连接并批准配对。</strong>打开或刷新 <code>https://chatgpt.com</code> 并登录。点击浏览器工具栏“扩展”，找到 LocalBridge 并固定；点击 LocalBridge →“连接这台电脑”。回到 <code>LocalBridge → 设置 → ChatGPT 网页</code>，核对请求中的项目文件夹与权限，再点击“批准配对”。</li>
+<li><strong>启用当前聊天。</strong>返回扩展，点击“为此聊天启用工具”（等待配对时为“我已批准，启用此聊天”）。看到 <strong>当前聊天已启用</strong> 才完成这一步。刷新或切换聊天后重新启用；切换项目后重新核对授权。</li>
+<li><strong>完成首次只读调用。</strong>在扩展点击“准备首次只读调用”。检查聊天输入框中的工具说明和测试提示，再手动发送。助手产生请求后，核对工具为 <code>workspace_context</code> 及其参数，点击“确认执行以上请求”。看到实际结果与“已完成真实调用”后，点击“填入结果”，检查内容并手动发送。</li>
+</ol>
+<p class="notice">文件已准备、浏览器已连接、配对已批准、当前聊天已启用、工具实际成功是不同阶段。当前聊天的状态以扩展窗口为准，应用里的数量是本机总计。</p>
+<h2>单独下载或手动导入</h2><p>本项目发行源为 <a href="https://github.com/MYD548-svg/LocalBridge-Community/releases">MYD548-svg/LocalBridge-Community Releases</a>。下载 <code>LocalBridge-ChatGPT-Web-v&lt;版本&gt;.zip</code> 并在应用导入。不要下载 Source code ZIP；Actions 候选附件解压后再选择里面真正的扩展 ZIP。</p><p>本版本尚未正式发布、附件缺失或与当前应用不匹配时，应用会说明原因。使用内置包即可首次准备；不要用其他项目的扩展替代。</p>
+<h2>升级：先关闭，导入后重新加载</h2><ol><li>在所有扩展窗口点击“停止并断开”，等待执行停止。</li><li>在浏览器扩展管理页关闭 LocalBridge 开关。</li><li>回到应用，明确确认替换扩展文件，再准备新版或导入配套 ZIP。较旧内置包不能覆盖已准备的新版。</li><li>回到浏览器管理页，重新启用/重新加载 LocalBridge，刷新 ChatGPT。</li><li>重新连接并启用当前聊天；项目或授权发生变化时重新核对配对。</li></ol>
+<p>固定目录 <code>%LOCALAPPDATA%\LocalBridge\browser-extension\current</code> 请保留。导入成功后，下载的 ZIP 可以不再保留。应用保留更新备份。</p>
+<h2>遇到问题时</h2><ul><li><strong>没有配对请求：</strong>浏览器加载后，还需要到 ChatGPT 点击扩展里的“连接这台电脑”。检查应用已选择项目、服务就绪且使用本地连接。</li><li><strong>提示宿主缺失或版本不兼容：</strong>安装本项目的配套新版安装包。只导入 ZIP 无法补齐旧安装包缺少的浏览器宿主。</li><li><strong>输入框有草稿：</strong>先保存或发送草稿，再填入说明或结果。应用不会覆盖原草稿。</li><li><strong>配对已撤销：</strong>在扩展帮助中重置配对身份，再申请并核对授权。</li><li><strong>企业策略禁止手动加载：</strong>联系设备管理员。</li><li><strong>执行结果未知：</strong>先核查实际结果；扩展不会自动重发该请求。</li></ul><p>工具在本机执行；你确认回填并发送的内容会进入在线聊天。</p></body></html>

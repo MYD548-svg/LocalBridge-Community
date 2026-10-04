@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { numericVersion, releaseConfiguration } from "../release-contract.mjs";
 export const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
 export function extensionId(key) {
   return Array.from(createHash("sha256").update(Buffer.from(key, "base64")).digest().subarray(0, 16))
@@ -74,12 +75,14 @@ export function readStoredZip(archive) {
     || archive.readUInt32LE(offset + 16) !== centralStart) throw new Error("ZIP end directory mismatch");
   return files;
 }
-export function verifyExtensionFiles(files, identity) {
+export function verifyExtensionFiles(files, identity, config = releaseConfiguration(resolve(import.meta.dirname, "../.."))) {
   const metadata = JSON.parse(files.get("localbridge-extension.json") || "null");
   const manifest = JSON.parse(files.get("manifest.json") || "null");
   if (!metadata || metadata.schemaVersion !== 1 || metadata.protocol !== 1 || metadata.extensionId !== identity.id
     || extensionId(identity.key) !== identity.id || metadata.version !== manifest?.version || manifest?.manifest_version !== 3
-    || manifest?.key !== identity.key || metadata.application !== ">=0.1.5, <0.2.0" || files.size !== Object.keys(metadata.files || {}).length + 1) throw new Error("extension identity or metadata mismatch");
+    || manifest?.key !== identity.key || metadata.application !== config.applicationCompatibility
+    || !numericVersion(metadata.version) || (metadata.repository !== undefined && metadata.repository !== config.repository)
+    || (metadata.sourceCommit !== undefined && !/^[a-f0-9]{40}$/.test(metadata.sourceCommit)) || files.size !== Object.keys(metadata.files || {}).length + 1) throw new Error("extension identity or metadata mismatch");
   if (JSON.stringify(manifest.content_scripts?.[0]?.matches) !== JSON.stringify(["https://chatgpt.com/*"])
     || manifest.externally_connectable || JSON.stringify(manifest.host_permissions) !== JSON.stringify(["https://chatgpt.com/*"])
     || JSON.stringify(manifest.permissions) !== JSON.stringify(["nativeMessaging","storage","clipboardWrite"])
@@ -95,5 +98,5 @@ export function verifyExtensionFiles(files, identity) {
 }
 export function verifyExtensionArchive(path, root = resolve(import.meta.dirname, "../.."), development = false) {
   return verifyExtensionFiles(readStoredZip(readFileSync(path)),
-    JSON.parse(readFileSync(resolve(root, development ? "extensions/chatgpt-web/identity.dev.json" : "extensions/chatgpt-web/identity.json"), "utf8")));
+    JSON.parse(readFileSync(resolve(root, development ? "extensions/chatgpt-web/identity.dev.json" : "extensions/chatgpt-web/identity.json"), "utf8")), releaseConfiguration(root));
 }

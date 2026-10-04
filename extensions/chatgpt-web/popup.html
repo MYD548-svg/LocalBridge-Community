@@ -1,9 +1,11 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LocalBridge 网页工具</title><link rel="stylesheet" href="popup.css"></head>
-<body><h1>LocalBridge 网页工具</h1><p>本机执行；回填结果会进入在线聊天。</p><p id="status" role="status">正在检查当前聊天…</p><p id="error" role="alert"></p>
-<div class="actions"><button id="connect">连接这台电脑</button><button id="enable">为此聊天启用工具</button><button id="disconnect">停止并断开</button></div>
-<details><summary>选择本轮工具</summary><div id="tools"></div></details><button id="instructions">填入工具说明，随后手动发送</button>
-<h2>待确认请求</h2><pre id="candidate">等待新的助手工具请求</pre><div class="actions"><button id="execute">确认执行以上请求</button><button id="cancel">取消当前执行</button></div>
-<h2>实际结果</h2><pre id="result">尚未执行</pre><div class="actions"><button id="fill">填入结果，随后手动发送</button><button id="copy">复制结果</button></div>
-<details><summary>连接帮助</summary><p>先安装 LocalBridge 并启动本地服务。扩展从 GitHub 下载 ZIP，在应用内导入后，开启浏览器开发者模式，加载应用显示的固定目录。</p><p>首次配对请在 LocalBridge 确认。切换工作区后重新授权；刷新或切换聊天后重新启用。输入框有草稿时会暂停回填。</p><button id="reset">重置扩展配对身份</button></details>
+<body><h1>LocalBridge 网页工具</h1><p>本机执行；回填结果会进入在线聊天。</p><p id="status" role="status">正在检查当前聊天…</p>
+<div class="next-step"><strong>下一步</strong><p id="guidance">先打开并登录 ChatGPT，再点击这个扩展。</p></div><p id="error" role="alert"></p><p id="action-notice" role="status"></p>
+<div class="actions"><button id="connect" disabled>连接这台电脑</button><button id="enable" disabled>为此聊天启用工具</button><button id="disconnect" disabled>停止并断开</button></div>
+<button id="first-call" disabled>准备首次只读调用</button><p class="hint">将 workspace_context 的说明与测试提示填入聊天；检查后手动发送，不会自动执行。</p>
+<details><summary>选择本轮工具</summary><div id="tools"></div></details><button id="instructions" disabled>填入工具说明，随后手动发送</button>
+<h2>待确认请求</h2><pre id="candidate">等待新的助手工具请求</pre><div class="actions"><button id="execute" disabled>确认执行以上请求</button><button id="cancel" disabled>取消当前执行</button></div>
+<h2>实际结果</h2><pre id="result">尚未执行</pre><div class="actions"><button id="fill" disabled>填入结果，随后手动发送</button><button id="copy" disabled>复制结果</button></div>
+<details><summary>安装、更新与恢复</summary><ol><li>LocalBridge → 设置 → ChatGPT 网页 → 准备配套扩展。</li><li>在 Edge/Chrome 扩展管理页开启开发者模式，加载应用提供的固定目录；导入 ZIP 只是准备文件。</li><li>到 ChatGPT 点击“连接这台电脑”，回应用批准配对，再回来启用当前聊天。</li></ol><p>首次安装无需 API Key、Tunnel ID 或 Codex 桌面程序。找不到图标时在浏览器“扩展”菜单固定 LocalBridge。</p><p>升级前停止并断开工具、关闭浏览器中的扩展开关。在应用准备新版后，重新启用/重新加载扩展并刷新 ChatGPT。</p><p>刷新或切换聊天后重新启用；切换项目后重新核对授权。撤销配对后重置身份再申请。企业策略禁止手动加载时联系设备管理员。</p><p><a id="release-link" target="_blank" rel="noreferrer">本项目配套发行与安装包</a></p><button id="reset">重置扩展配对身份</button></details>
 <script type="module" src="popup.js"></script></body></html>

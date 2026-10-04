@@ -1,10 +1,12 @@
 name: LocalBridge Community Build
 on:
   push:
-    branches: [main, "release/*"]
-    tags: ["v*.*.*-community.*"]
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
+concurrency:
+  group: community-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -72,6 +74,7 @@ jobs:
             src-tauri/target/release-stage/*.json
             src-tauri/target/local-mcp-stage/*.json
             src-tauri/target/browser-host-stage/*.json
+            src-tauri/target/browser-extension-stage/bundle.json
             tests/artifacts/browser-extension/extension-build.json
             tests/artifacts/browser-extension-dev/extension-build.json
           if-no-files-found: warn
@@ -81,6 +84,16 @@ jobs:
         with:
           name: community-verified-installer
           path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+      - name: Upload complete release candidate
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: community-release-candidate
+          path: |
+            tests/artifacts/release/
+            tests/artifacts/ci/TEST-REPORT.json
+            tests/artifacts/ci/BUILD-PROVENANCE.json
           if-no-files-found: error
       - name: Upload browser extension candidate
         if: success()

@@ -26,7 +26,7 @@ export function tunnelSource() {
   const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/build-tunnel-client.ps1", "-UpdateBundleRs", "-SkipTests"], { cwd: root, stdio: "inherit", windowsHide: true });
   if (result.status !== 0) throw new Error(`Tunnel source build failed: ${result.status ?? result.error}`);
 }
-export function artifacts() {
+export async function artifacts() {
   const bundleRoot = join(root, "src-tauri/target/release/bundle/nsis");
   const installers = filesBelow(bundleRoot).filter((name) => name.endsWith("-setup.exe"));
   if (installers.length !== 1) throw new Error("Expected exactly one NSIS installer; remove stale artifacts manually");
@@ -49,6 +49,7 @@ export function artifacts() {
     "src-tauri/target/browser-host-stage/localbridge-browser-host.exe",
     "src-tauri/target/browser-host-stage/browser-host-build.json",
     "src-tauri/target/browser-host-stage/native-host-template.json",
+    "product-release.json", "src-tauri/target/browser-extension-stage/extension.zip", "src-tauri/target/browser-extension-stage/bundle.json",
     extension, "tests/artifacts/browser-extension/extension-build.json", "tests/artifacts/browser-extension/SHA256SUMS.txt",
     "extensions/chatgpt-web/INSTALL.html", "extensions/chatgpt-web/INSTALL.svg",
     "provenance/tunnel-client.json", "src-tauri/target/release-stage/broker-build.json",
@@ -60,10 +61,12 @@ export function artifacts() {
   mkdirSync(evidenceRoot, { recursive: true });
   writeFileSync(join(evidenceRoot, "SHA256SUMS.txt"), Object.entries(hashes).map(([name, hash]) => `${hash}  ${name}`).join("\n") + "\n");
   writeFileSync(join(evidenceRoot, "BUILD-PROVENANCE.json"), JSON.stringify({ commit: command("git", ["rev-parse", "HEAD"]), dirty: Boolean(command("git", ["status", "--porcelain"])), profile: process.env.LOCALBRIDGE_BUILD_PROFILE ?? "bundled", generatedAt: new Date().toISOString(), toolchains: JSON.parse(readFileSync(join(evidenceRoot, "toolchains.json"), "utf8")), hashes }, null, 2));
+  const { stageReleaseCandidate } = await import("../release-candidate.mjs");
+  stageReleaseCandidate(root, sourceSha, join(bundleRoot, installers[0]));
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const actions = { toolchains, "tunnel-source": tunnelSource, artifacts };
   const action = actions[process.argv[2]];
   if (!action) throw new Error("Unknown evidence operation");
-  action();
+  await action();
 }

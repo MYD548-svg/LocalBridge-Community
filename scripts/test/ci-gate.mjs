@@ -43,6 +43,7 @@ export const CI_STAGES = validateStages([
       "scripts/test/runtime-output.test.mjs",
       "scripts/test/adapter-client.test.mjs",
       "scripts/test/browser-extension-package.test.mjs",
+      "scripts/test/product-release.test.mjs",
     ),
   },
   {
@@ -143,7 +144,7 @@ const prerequisites = {
   licenses: ["toolchains", "dependencies"],
   "frontend-test": ["dependencies"],
   "frontend-build": ["dependencies"],
-  "runtime-resources": ["toolchains", "bundled-integrity", "test-base"],
+  "runtime-resources": ["toolchains", "bundled-integrity", "test-base", "frontend-build"],
   "staged-integrity": ["runtime-resources"],
   "auth-repeat": ["staged-integrity"],
   "rust-test": ["staged-integrity"],

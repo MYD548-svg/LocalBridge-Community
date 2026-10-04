@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "repository": "MYD548-svg/LocalBridge-Community",
+  "channel": "community",
+  "tagSuffix": "-community.1",
+  "manifestAsset": "localbridge-release.json",
+  "applicationCompatibility": ">=0.1.5, <0.2.0"
+}
